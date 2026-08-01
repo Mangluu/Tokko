@@ -1,5 +1,7 @@
 # Tokko
 
+**Live app:** [tokko-drab.vercel.app](https://tokko-drab.vercel.app)
+
 Tokko is a warm, agentic family-care assistant for health, wellness and everyday
 essentials. Family members ask through a familiar messaging channel; Tokko
 understands the request, checks family context and payment rules, and pauses for
