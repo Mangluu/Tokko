@@ -1,8 +1,30 @@
-# Trakko Assist
+# Tokko
 
-This is the sanitized standalone source copy of the current Trakko/Tokko
-assistant application. Local credentials, deployment linkage, generated test
-reports, and installed dependencies are intentionally excluded.
+Tokko is a warm, agentic family-care assistant for health, wellness and everyday
+essentials. Family members ask through a familiar messaging channel; Tokko
+understands the request, checks family context and payment rules, and pauses for
+human judgment when needed.
+
+This private hackathon repository combines the Tokko onboarding/dashboard UI
+with the standalone Node/Postgres backend from `feat/backend-integ`. Local
+credentials, deployment linkage, generated test reports and installed
+dependencies are intentionally excluded.
+
+## Integrated web experience
+
+The React frontend is connected to the backend's real contracts:
+
+- email/password login and Clerk email-code signup
+- opaque HttpOnly website sessions
+- `/api/me` account hydration
+- family profile and merchant-consent persistence
+- Prava mandate summaries
+- Zepto order history and checkout activity
+- honest loading, empty and service-error states
+
+The current backend exposes Hermes through Telegram and LINQ/service adapters.
+The UI keeps the broader family-messaging product language; a native iMessage
+transport adapter is not yet implemented and should not be represented as live.
 
 This Node application supports two onboarding channels:
 

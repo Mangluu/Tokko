@@ -6,7 +6,9 @@ export default defineConfig({
   publicDir: "frontend-public",
   build: {
     outDir: "public",
-    emptyOutDir: false,
+    // `public` is generated output. Start clean so stale bundles from earlier
+    // prototypes are never shipped with the hackathon build.
+    emptyOutDir: true,
   },
   server: {
     proxy: {

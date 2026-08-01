@@ -20,3 +20,4 @@ cookies*.txt
 .DS_Store
 .vercel
 .env*
+!.env.example
