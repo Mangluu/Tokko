@@ -70,8 +70,8 @@ For example:
 | `GET` | `/api/auth/session` | Website | Validate the current session |
 | `POST` | `/api/auth/logout` | Public | Revoke the supplied session |
 | `GET` | `/api/me` | Website | Read consolidated account state |
-| `PUT` | `/api/onboarding/profile` | Website | Replace family and dependent information |
-| `PUT` | `/api/onboarding/merchant-consent` | Website | Grant or revoke selected-phone consent |
+| `PUT` | `/api/onboarding/profile` | Website | Reconcile active family members; omitted members are archived |
+| `PUT` | `/api/onboarding/merchant-consent` | Website | Legacy: grant or revoke selected-phone merchant consent |
 | `POST` | `/api/payments/tokenization-session` | Website | Create a Prava tokenization session |
 | `POST` | `/api/payments/payment-methods` | Website | Store a completed tokenized card |
 | `GET` | `/api/payments/payment-methods?familyPhone=...` | Website | List masked family cards; optional phone must belong to the signed-in family |
@@ -86,8 +86,16 @@ For example:
 | `POST` | `/api/merchant/zepto/connect/start` | Website | Send or resend a Zepto OTP |
 | `POST` | `/api/merchant/zepto/connect/verify` | Website | Verify Zepto OTP and store connection |
 | `GET` | `/api/addresses` | Website | List addresses stored directly in Tokko |
-| `POST` | `/api/addresses` | Website | Add a Tokko-owned address without merchant APIs or geolocation |
+| `POST` | `/api/addresses` | Website | Add a Tokko-owned address and assign family members |
+| `PUT` | `/api/addresses/:id` | Website | Edit an owned address and its member assignments |
+| `DELETE` | `/api/addresses/:id` | Website | Remove an owned address and safely select a remaining default |
 | `POST` | `/api/addresses/select` | Website | Select a Tokko-owned delivery address |
+| `GET`, `PUT` | `/api/care-rules` | Website | Read or update approval mode, caps, categories, and blocked items |
+| `GET`, `PUT` | `/api/preferences` | Website | Read or update decision, delivery, and digest notifications |
+| `GET` | `/api/decisions` | Website | List the family's pending or historical decision requests |
+| `POST` | `/api/decisions/:id/resolve` | Website | Idempotently approve or decline one pending request |
+| `GET` | `/api/activity` | Website | Read the family control-plane audit timeline |
+| `POST` | `/api/v1/decisions` | Service | Create a family decision request from an agent or messaging adapter |
 | `POST` | `/api/location/serviceability` | Website + Zepto | Check coordinates and select a store |
 | `GET` | `/api/search?q=milk&pageNumber=0` | Website + Zepto | Search one Zepto result page |
 | `GET` | `/api/product/:id` | Website + Zepto | Get product details |
