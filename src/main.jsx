@@ -154,6 +154,42 @@ async function verifyClerkEmail(signUpId, code) {
   }
 }
 
+async function startGoogleOAuth() {
+  const clerk = await browserClerk();
+  const origin = window.location.origin;
+  try {
+    await clerk.client.signIn.authenticateWithRedirect({
+      strategy: 'oauth_google',
+      redirectUrl: `${origin}/sso-callback`,
+      redirectUrlComplete: `${origin}/?clerk_oauth=complete`,
+    });
+  } catch (error) {
+    throw new Error(clerkErrorMessage(error));
+  }
+}
+
+async function completeGoogleOAuthCallback() {
+  const clerk = await browserClerk();
+  const completeUrl = `${window.location.origin}/?clerk_oauth=complete`;
+  await clerk.handleRedirectCallback({
+    signInFallbackRedirectUrl: completeUrl,
+    signUpFallbackRedirectUrl: completeUrl,
+    signInForceRedirectUrl: completeUrl,
+    signUpForceRedirectUrl: completeUrl,
+  });
+}
+
+async function exchangeClerkSession() {
+  const clerk = await browserClerk();
+  const token = await clerk.session?.getToken();
+  if (!token) throw new Error('Google sign-in did not create an active session. Please try again.');
+  await api('/api/auth/clerk/session', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  return api('/api/me');
+}
+
 function compactPhone(value = '') {
   return String(value).replace(/[()\s.-]/g, '');
 }
@@ -399,14 +435,14 @@ function AiPreview({ step }) {
   );
 }
 
-function AccountAccess({ onAuthenticated, initialEmail = '' }) {
+function AccountAccess({ onAuthenticated, initialEmail = '', initialStatus = '' }) {
   const pendingChallengeRef = useRef(null);
   const [mode, setMode] = useState('login');
   const [email, setEmail] = useState(initialEmail);
   const [password, setPassword] = useState('');
   const [signupChallenge, setSignupChallenge] = useState(null);
   const [emailOtp, setEmailOtp] = useState('');
-  const [status, setStatus] = useState('');
+  const [status, setStatus] = useState(initialStatus);
   const [busy, setBusy] = useState(false);
   const verifyingSignup = mode === 'signup' && Boolean(signupChallenge);
 
@@ -415,6 +451,17 @@ function AccountAccess({ onAuthenticated, initialEmail = '' }) {
     setSignupChallenge(null);
     setEmailOtp('');
     setStatus('');
+  };
+
+  const signInWithGoogle = async () => {
+    setBusy(true);
+    setStatus('Opening secure Google sign-in…');
+    try {
+      await startGoogleOAuth();
+    } catch (error) {
+      setStatus(error.message);
+      setBusy(false);
+    }
   };
 
   const submit = async (event) => {
@@ -464,6 +511,12 @@ function AccountAccess({ onAuthenticated, initialEmail = '' }) {
 
   return (
     <form className="tokko-auth-form" onSubmit={submit}>
+      <button className="tokko-google-button" type="button" onClick={signInWithGoogle} disabled={busy}>
+        <span aria-hidden="true">G</span>
+        Continue with Google
+        {busy ? <LoaderCircle className="tokko-spinner" size={17} /> : <ArrowRight size={17} />}
+      </button>
+      <div className="tokko-auth-divider"><span>or use email</span></div>
       <div className="tokko-auth-modes" aria-label="Account access method">
         <button className={mode === 'login' ? 'is-active' : ''} type="button" onClick={() => changeMode('login')}>Sign in</button>
         <button className={mode === 'signup' ? 'is-active' : ''} type="button" onClick={() => changeMode('signup')}>Create account</button>
@@ -492,7 +545,7 @@ function AccountAccess({ onAuthenticated, initialEmail = '' }) {
         {!busy && <ArrowRight size={17} />}
       </button>
       {status && <p className={/sent to|signing|verifying|sending/i.test(status) ? 'tokko-form-status' : 'tokko-form-status is-error'} role="status">{status}</p>}
-      <div className="tokko-safe-note"><ShieldCheck size={16} /><span>Authentication uses an HttpOnly server session. Tokko never stores your password in the browser.</span></div>
+      <div className="tokko-safe-note"><ShieldCheck size={16} /><span>Google identity stays with Clerk. Tokko uses a separate HttpOnly session and never stores your password in the browser.</span></div>
     </form>
   );
 }
@@ -796,6 +849,7 @@ function App() {
   const [profile, setProfile] = useState(savedState.profile);
   const [members, setMembers] = useState(savedState.members);
   const [sessionStatus, setSessionStatus] = useState('checking');
+  const [authNotice, setAuthNotice] = useState('');
   const [backendState, setBackendState] = useState(null);
   const [merchantConsent, setMerchantConsent] = useState(true);
   const [saveStatus, setSaveStatus] = useState('');
@@ -821,7 +875,21 @@ function App() {
 
   useEffect(() => {
     let active = true;
-    api('/api/me')
+    const bootSession = async () => {
+      const url = new URL(window.location.href);
+      if (url.pathname === '/sso-callback') {
+        setStep(2);
+        await completeGoogleOAuthCallback();
+        const state = await exchangeClerkSession();
+        window.history.replaceState({}, '', '/');
+        return state;
+      }
+      const googleCallback = url.searchParams.get('clerk_oauth') === 'complete';
+      const state = googleCallback ? await exchangeClerkSession() : await api('/api/me');
+      if (googleCallback) window.history.replaceState({}, '', '/');
+      return state;
+    };
+    bootSession()
       .then((state) => {
         if (!active) return;
         const ui = stateToUi(state);
@@ -834,7 +902,14 @@ function App() {
       })
       .catch((error) => {
         if (!active) return;
-        setSessionStatus(error?.status === 401 ? 'guest' : 'guest');
+        const url = new URL(window.location.href);
+        const googleCallback = url.pathname === '/sso-callback' || url.searchParams.get('clerk_oauth') === 'complete';
+        if (googleCallback) {
+          setAuthNotice(error.message || 'Google sign-in could not be completed.');
+          setStep(2);
+          window.history.replaceState({}, '', '/');
+        }
+        setSessionStatus('guest');
       });
     return () => { active = false; };
   }, []);
@@ -893,6 +968,7 @@ function App() {
     const ui = stateToUi(state);
     setBackendState(state);
     setSessionStatus('authenticated');
+    setAuthNotice('');
     setMerchantConsent(state.merchantConsent?.consented ?? true);
     setProfile((current) => ({ ...current, ...ui.profile }));
     setMembers(ui.members);
@@ -927,6 +1003,12 @@ function App() {
       await api('/api/auth/logout', { method: 'POST' });
     } catch {
       // Clearing local state still returns the user to sign in if the network dropped.
+    }
+    try {
+      const clerk = await browserClerk();
+      if (clerk.session) await clerk.signOut();
+    } catch {
+      // Email/password accounts do not require a Clerk browser session.
     }
     localStorage.removeItem(STORAGE_KEY);
     setBackendState(null);
@@ -971,7 +1053,7 @@ function App() {
 
       {step === 2 && (
         <FormShell step={step} eyebrow="Private by design" title="One account. Your family’s care circle." copy="Sign in to the secure Tokko backend—the account that receives decisions, alerts and the occasional ‘are you sure?’" icon={ShieldCheck} onHome={() => go(0)} theme={theme} onTheme={toggleTheme}>
-          {sessionStatus === 'checking' ? <div className="tokko-loading-panel"><LoaderCircle className="tokko-spinner" size={19} /> Checking your Tokko session…</div> : <AccountAccess onAuthenticated={handleAuthenticated} initialEmail={profile.email} />}
+          {sessionStatus === 'checking' ? <div className="tokko-loading-panel"><LoaderCircle className="tokko-spinner" size={19} /> Checking your Tokko session…</div> : <AccountAccess onAuthenticated={handleAuthenticated} initialEmail={profile.email} initialStatus={authNotice} />}
           <NavActions onBack={() => go(1)} />
         </FormShell>
       )}

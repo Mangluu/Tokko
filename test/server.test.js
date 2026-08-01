@@ -23,6 +23,7 @@ test("server.js exports the HTTP server expected by Vercel", () => {
 test("email OTP verification is a public signup route", () => {
   assert.ok(server.matchRoute("POST", "/api/auth/signup"));
   assert.ok(server.matchRoute("POST", "/api/auth/signup/verify"));
+  assert.ok(server.matchRoute("POST", "/api/auth/clerk/session"));
   assert.ok(server.matchRoute("POST", "/api/auth/login"));
 });
 

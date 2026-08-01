@@ -640,6 +640,31 @@ a {
   margin-left: auto;
 }
 
+.tokko-google-button:disabled {
+  cursor: wait;
+  opacity: 0.7;
+  transform: none;
+}
+
+.tokko-auth-divider {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  color: var(--faint);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.tokko-auth-divider::before,
+.tokko-auth-divider::after {
+  height: 1px;
+  flex: 1;
+  background: var(--line);
+  content: '';
+}
+
 .tokko-auth-form {
   display: grid;
   gap: 14px;

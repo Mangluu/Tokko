@@ -129,6 +129,7 @@ function routeAuth(pattern) {
     pattern === "/api/config" ||
     pattern === "/api/auth/signup" ||
     pattern === "/api/auth/signup/verify" ||
+    pattern === "/api/auth/clerk/session" ||
     pattern === "/api/auth/login" ||
     pattern === "/api/auth/logout" ||
     pattern === "/api/payments/return" ||
@@ -3313,6 +3314,12 @@ route("POST", "/api/auth/login", async (req, res) => {
   await createBrowserSession(req, res, user);
 });
 
+route("POST", "/api/auth/clerk/session", async (req, res) => {
+  const { identity, email } = await auth.authenticateClerkUser(req);
+  const user = await db.getOrCreateWebsiteUser(identity.userId, email);
+  await createBrowserSession(req, res, user);
+});
+
 route("GET", "/api/auth/session", async (req, res) => {
   const user = await auth.requireUser(req);
   sendJson(res, 200, { account: publicAccount(user) });
@@ -3338,7 +3345,8 @@ route("GET", "/api/config", async (_req, res) => {
   const emailConfiguration = emailVerification.configuration();
   const hermesConfiguration = hermes.configuration();
   sendJson(res, 200, {
-    websiteAuthentication: "email_or_phone_password",
+    websiteAuthentication: "google_or_email_password",
+    googleOAuthConfigured: emailConfiguration.configured,
     signupEmailVerification: "otp",
     signupEmailVerificationConfigured: emailConfiguration.configured,
     clerkPublishableKey: emailConfiguration.publishableKey || null,
