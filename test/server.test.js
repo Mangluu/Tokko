@@ -27,6 +27,40 @@ test("email OTP verification is a public signup route", () => {
   assert.ok(server.matchRoute("POST", "/api/auth/login"));
 });
 
+test("functional family dashboard routes are registered", () => {
+  assert.ok(server.matchRoute("PUT", "/api/onboarding/profile"));
+  assert.ok(server.matchRoute("GET", "/api/addresses"));
+  assert.ok(server.matchRoute("PUT", "/api/addresses/42"));
+  assert.ok(server.matchRoute("DELETE", "/api/addresses/42"));
+  assert.ok(server.matchRoute("PUT", "/api/care-rules"));
+  assert.ok(server.matchRoute("PUT", "/api/preferences"));
+  assert.ok(server.matchRoute("GET", "/api/decisions"));
+  assert.ok(server.matchRoute("POST", "/api/decisions/request-id/resolve"));
+  assert.ok(server.matchRoute("POST", "/api/v1/decisions"));
+  assert.ok(server.matchRoute("GET", "/api/activity"));
+});
+
+test("care rules enforce bounded automatic spending", () => {
+  const rules = server.careRulesInput({
+    approvalMode: "auto_essentials",
+    monthlyCap: 5000,
+    perOrderCap: 1200,
+    allowedCategories: ["medicines", "wellness"],
+    repeatKnownEssentials: true,
+  });
+  assert.equal(rules.approvalMode, "auto_essentials");
+  assert.equal(rules.perOrderCap, 1200);
+  assert.throws(
+    () => server.careRulesInput({
+      approvalMode: "auto_essentials",
+      monthlyCap: 500,
+      perOrderCap: 1000,
+      allowedCategories: ["medicines"],
+    }),
+    /cannot exceed/
+  );
+});
+
 test("Hermes chat is a website-session route", () => {
   const matched = server.matchRoute("POST", "/api/hermes/chat");
   assert.ok(matched);
@@ -132,6 +166,25 @@ test("Tokko-native addresses do not require merchant coordinates", () => {
   assert.equal(address.countryCode, "IN");
   assert.equal("latitude" in address, false);
   assert.equal("longitude" in address, false);
+});
+
+test("website delivery addresses require a real delivery contact", () => {
+  assert.throws(
+    () => server.familyAddressInput(
+      { formattedAddress: "12 Park Street, Kolkata 700016" },
+      { requireContact: true }
+    ),
+    /contact name and phone number/
+  );
+  const address = server.familyAddressInput(
+    {
+      formattedAddress: "12 Park Street, Kolkata 700016",
+      contactName: "Asha",
+      contactPhone: "+919876543210",
+    },
+    { requireContact: true }
+  );
+  assert.equal(address.contactPhone, "+919876543210");
 });
 
 test("mandate presentation shows five records and keeps one month of history", () => {

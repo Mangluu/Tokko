@@ -1,5 +1,7 @@
 # Tokko
 
+**Live app:** [tokko-drab.vercel.app](https://tokko-drab.vercel.app)
+
 Tokko is a warm, agentic family-care assistant for health, wellness and everyday
 essentials. Family members ask through a familiar messaging channel; Tokko
 understands the request, checks family context and payment rules, and pauses for
@@ -17,10 +19,12 @@ The React frontend is connected to the backend's real contracts:
 - email/password login and Clerk email-code signup
 - opaque HttpOnly website sessions
 - `/api/me` account hydration
-- family profile and merchant-consent persistence
-- Prava mandate summaries
-- Zepto order history and checkout activity
-- honest loading, empty and service-error states
+- phone-first family onboarding with stable member IDs and archival removal
+- assigned delivery addresses with explicit country and contact details
+- ask-every-time or bounded automatic care rules
+- masked Prava cards and standing mandate summaries
+- a persisted **Needs You** decision inbox and activity timeline
+- notification preferences and honest empty/provider-error states
 
 The current backend exposes Hermes through Telegram and LINQ/service adapters.
 The UI keeps the broader family-messaging product language; a native iMessage
@@ -32,9 +36,11 @@ This Node application supports two onboarding channels:
 - LINQ: an authenticated external service creates a family profile, receives one of the
   partner's provisioned LINQ numbers, and can use the service APIs on that family's behalf.
 
-Both channels store the same family profile, a list of dependents and their relationships
-to the account holder, explicit consent for one selected account-holder or dependent phone,
-Prava-tokenized payment method, and Zepto connection state in PostgreSQL.
+Both channels store the same family profile and a list of members with their
+relationships to the account holder. The website additionally persists address
+assignments, care rules, notification preferences, decision requests and activity.
+Legacy merchant-consent and Zepto routes remain available for integration
+compatibility but are not part of the Tokko web onboarding or dashboard.
 
 ## Security model
 
@@ -49,6 +55,12 @@ Prava-tokenized payment method, and Zepto connection state in PostgreSQL.
 - Card setup opens Prava's hosted page in a separate tab. Card number and CVC
   never enter Tokko's page or backend.
   PostgreSQL stores only the Prava enrollment ID, brand, last four digits, and expiry.
+- An account-holder phone is optional. Each active family member needs a distinct
+  E.164 messaging number, and removing a member archives the record and revokes
+  new phone-based access without erasing the audit trail.
+- Website delivery addresses require a country, contact name and contact phone.
+  Automatic care is never inferred from a saved card alone: Tokko still verifies
+  an active Prava mandate and the current care-rule limits at order time.
 - Zepto OTP can only be requested after an explicit, versioned consent record authorizes
   use of the currently selected phone. Revoking consent removes the Zepto token.
 - Card saving is optional. When Prava keys are blank, the browser explains that
