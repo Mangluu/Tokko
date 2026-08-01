@@ -96,8 +96,10 @@ Open `http://localhost:3456`.
 
 ## Deploy to Vercel
 
-1. Import this directory as a Vercel project. `server.js` is the Vercel Node-server
-   entrypoint; `server.js` remains the local entrypoint.
+1. Import this directory as a Vercel project. Vercel serves the Vite build from
+   `public` and routes `/api/*` through `api/server.js`, which adapts the existing
+   Node HTTP handler without changing its API contracts. `server.js` remains the
+   local entrypoint.
 2. Add a Postgres provider from the Vercel Marketplace (Neon is one option) and ensure it
    injects `DATABASE_URL`.
 3. Add all required values from `.env.example` to the project environment variables.
