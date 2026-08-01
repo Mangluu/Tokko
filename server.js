@@ -297,13 +297,14 @@ function publicFamilyAddress(address) {
     countryCode: address.country_code || "IN",
     contactName: address.contact_name || null,
     contactPhone: address.contact_phone || null,
+    memberIds: (address.member_ids || []).map(String),
     selected: address.is_selected === true,
     createdAt: address.created_at || null,
     updatedAt: address.updated_at || null,
   };
 }
 
-function familyAddressInput(value = {}) {
+function familyAddressInput(value = {}, { requireContact = false } = {}) {
   const field = (key, max = 300) => {
     const result = String(value[key] || "").trim();
     return result ? result.slice(0, max) : null;
@@ -339,6 +340,16 @@ function familyAddressInput(value = {}) {
       status: 400,
     });
   }
+  const contactName = field("contactName", 160);
+  const contactPhone = value.contactPhone || value.contactNumber
+    ? validation.e164(value.contactPhone || value.contactNumber, "contactPhone")
+    : null;
+  if (requireContact && (!contactName || !contactPhone)) {
+    throw Object.assign(
+      new Error("A delivery contact name and phone number are required"),
+      { status: 400 }
+    );
+  }
   return {
     label,
     formattedAddress,
@@ -348,10 +359,8 @@ function familyAddressInput(value = {}) {
     state,
     postalCode,
     countryCode,
-    contactName: field("contactName", 160),
-    contactPhone: value.contactPhone || value.contactNumber
-      ? validation.e164(value.contactPhone || value.contactNumber, "contactPhone")
-      : null,
+    contactName,
+    contactPhone,
   };
 }
 
@@ -360,6 +369,228 @@ function familyAddressPayload(rows) {
   return {
     addresses,
     selectedAddress: addresses.find((address) => address.selected) || null,
+  };
+}
+
+const CARE_APPROVAL_MODES = new Set(["ask_every_time", "auto_essentials"]);
+const CARE_CATEGORIES = new Set([
+  "medicines",
+  "wellness",
+  "personal_care",
+  "devices",
+  "nutrition",
+]);
+
+function optionalMoney(value, field) {
+  if (value === undefined || value === null || value === "") return null;
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+    throw Object.assign(new Error(`${field} must be between 0 and 1,000,000`), {
+      status: 400,
+    });
+  }
+  return Math.round(amount * 100) / 100;
+}
+
+function careRulesInput(value = {}) {
+  const approvalMode = String(value.approvalMode || "ask_every_time").trim();
+  if (!CARE_APPROVAL_MODES.has(approvalMode)) {
+    throw Object.assign(new Error("Choose a valid purchase approval mode"), {
+      status: 400,
+    });
+  }
+  const currency = String(value.currency || "INR").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw Object.assign(new Error("currency must use a three-letter code"), {
+      status: 400,
+    });
+  }
+  const monthlyCap = optionalMoney(value.monthlyCap, "monthlyCap");
+  const perOrderCap = optionalMoney(value.perOrderCap, "perOrderCap");
+  if (approvalMode === "auto_essentials" && (!monthlyCap || !perOrderCap)) {
+    throw Object.assign(
+      new Error("Automatic essentials need both monthly and per-order limits"),
+      { status: 400 }
+    );
+  }
+  if (monthlyCap && perOrderCap && perOrderCap > monthlyCap) {
+    throw Object.assign(
+      new Error("The per-order limit cannot exceed the monthly limit"),
+      { status: 400 }
+    );
+  }
+  const allowedCategories = [...new Set(
+    (Array.isArray(value.allowedCategories) ? value.allowedCategories : [])
+      .map((item) => String(item).trim().toLowerCase())
+      .filter((item) => CARE_CATEGORIES.has(item))
+  )];
+  const blockedItems = [...new Set(
+    (Array.isArray(value.blockedItems) ? value.blockedItems : [])
+      .map((item) => String(item).trim().slice(0, 80))
+      .filter(Boolean)
+  )].slice(0, 30);
+  if (approvalMode === "auto_essentials" && allowedCategories.length === 0) {
+    throw Object.assign(
+      new Error("Choose at least one category for automatic essentials"),
+      { status: 400 }
+    );
+  }
+  return {
+    approvalMode,
+    monthlyCap: approvalMode === "auto_essentials" ? monthlyCap : null,
+    perOrderCap: approvalMode === "auto_essentials" ? perOrderCap : null,
+    currency,
+    repeatKnownEssentials:
+      approvalMode === "auto_essentials" && value.repeatKnownEssentials === true,
+    allowedCategories:
+      approvalMode === "auto_essentials" ? allowedCategories : [],
+    blockedItems,
+  };
+}
+
+function publicCareRules(rules) {
+  if (!rules) return null;
+  const numberOrNull = (value) =>
+    value === null || value === undefined ? null : Number(value);
+  return {
+    approvalMode: rules.approval_mode,
+    monthlyCap: numberOrNull(rules.monthly_cap),
+    perOrderCap: numberOrNull(rules.per_order_cap),
+    currency: rules.currency || "INR",
+    repeatKnownEssentials: rules.repeat_known_essentials === true,
+    allowedCategories: rules.allowed_categories || [],
+    blockedItems: rules.blocked_items || [],
+    updatedAt: rules.updated_at || null,
+  };
+}
+
+function preferenceInput(value = {}, current = null) {
+  const pick = (key, column, fallback) =>
+    typeof value[key] === "boolean" ? value[key] : current?.[column] ?? fallback;
+  return {
+    decisionAlerts: pick("decisionAlerts", "decision_alerts", true),
+    deliveryUpdates: pick("deliveryUpdates", "delivery_updates", true),
+    weeklyDigest: pick("weeklyDigest", "weekly_digest", false),
+  };
+}
+
+function publicPreferences(preferences) {
+  const values = preferenceInput({}, preferences);
+  return {
+    ...values,
+    updatedAt: preferences?.updated_at || null,
+  };
+}
+
+function decisionRequestInput(value = {}) {
+  const requiredText = (key, max) => {
+    const text = String(value[key] || "").trim();
+    if (!text) {
+      throw Object.assign(new Error(`${key} is required`), { status: 400 });
+    }
+    return text.slice(0, max);
+  };
+  const optionalText = (key, max) => {
+    const text = String(value[key] || "").trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const requestType = String(value.requestType || "purchase_approval").trim();
+  if (!new Set([
+    "purchase_approval",
+    "substitution",
+    "address_confirmation",
+    "safety_stop",
+  ]).has(requestType)) {
+    throw Object.assign(new Error("requestType is invalid"), { status: 400 });
+  }
+  const numericId = (key) => {
+    if (value[key] === undefined || value[key] === null || value[key] === "") {
+      return null;
+    }
+    const id = Number(value[key]);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      throw Object.assign(new Error(`${key} is invalid`), { status: 400 });
+    }
+    return id;
+  };
+  const amount = optionalMoney(value.amount, "amount");
+  const currency = String(value.currency || "INR").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw Object.assign(new Error("currency must use a three-letter code"), {
+      status: 400,
+    });
+  }
+  let expiresAt = null;
+  if (value.expiresAt) {
+    const parsed = new Date(value.expiresAt);
+    if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+      throw Object.assign(new Error("expiresAt must be in the future"), {
+        status: 400,
+      });
+    }
+    expiresAt = parsed.toISOString();
+  }
+  const jsonObject = (key) =>
+    value[key] && typeof value[key] === "object" && !Array.isArray(value[key])
+      ? value[key]
+      : {};
+  return {
+    id: nodeCrypto.randomUUID(),
+    memberId: numericId("memberId"),
+    addressId: numericId("addressId"),
+    requestType,
+    title: requiredText("title", 180),
+    originalRequest: optionalText("originalRequest", 1_000),
+    merchantName: optionalText("merchantName", 160),
+    product: jsonObject("product"),
+    amount,
+    currency,
+    reasonCode: optionalText("reasonCode", 60),
+    reasonText: requiredText("reasonText", 1_000),
+    paymentContext: jsonObject("paymentContext"),
+    actionContext: jsonObject("actionContext"),
+    expiresAt,
+  };
+}
+
+function publicDecision(decision) {
+  if (!decision) return null;
+  return {
+    id: decision.id,
+    memberId: decision.member_id ? String(decision.member_id) : null,
+    memberName: decision.member_name || null,
+    requestType: decision.request_type,
+    status: decision.status,
+    title: decision.title,
+    originalRequest: decision.original_request || null,
+    merchantName: decision.merchant_name || null,
+    product: decision.product || {},
+    amount: decision.amount === null ? null : Number(decision.amount),
+    currency: decision.currency,
+    addressId: decision.address_id ? String(decision.address_id) : null,
+    addressLabel: decision.address_label || null,
+    formattedAddress: decision.formatted_address || null,
+    reasonCode: decision.reason_code || null,
+    reasonText: decision.reason_text,
+    resolution: decision.resolution || null,
+    resolutionNote: decision.resolution_note || null,
+    expiresAt: decision.expires_at || null,
+    resolvedAt: decision.resolved_at || null,
+    createdAt: decision.created_at,
+    updatedAt: decision.updated_at,
+  };
+}
+
+function publicActivity(event) {
+  return {
+    id: String(event.id),
+    eventType: event.event_type,
+    title: event.title,
+    detail: event.detail || null,
+    entityType: event.entity_type || null,
+    entityId: event.entity_id || null,
+    metadata: event.metadata || {},
+    createdAt: event.created_at,
   };
 }
 
@@ -635,33 +866,37 @@ async function assertFamilyPhoneForUser(userId, phone) {
 }
 
 async function getUserState(userId, clerkUserId = null) {
-  const [user, profile, paymentMethods, paymentCustomer, zepto, familyAddresses] =
-    await Promise.all([
+  const [
+    user,
+    profile,
+    paymentMethods,
+    paymentCustomer,
+    familyAddresses,
+    careRules,
+    preferences,
+    pendingDecisions,
+  ] = await Promise.all([
     db.getUserById(userId),
     db.getProfile(userId),
     db.getPaymentMethods(userId, "prava"),
     db.getPaymentCustomer(userId),
-    db.getPlatformBySlug("zepto"),
     db.getFamilyAddresses(userId),
+    db.getCareRules(userId),
+    db.getUserPreferences(userId),
+    db.getDecisionRequests(userId, { status: "pending", limit: 100 }),
   ]);
-  const merchantConsent = zepto
-    ? await db.getMerchantAuthConsent(
-        userId,
-        Number(zepto.id),
-        auth.MERCHANT_AUTH_PURPOSE
-      )
-    : null;
-  const merchantToken = zepto
-    ? await db.getToken(userId, Number(zepto.id))
-    : null;
-  const consented =
-    merchantConsent?.consented === true &&
-    merchantConsent.subject_phone ===
-      (profile?.merchant_auth_phone || profile?.offspring_phone);
-  const tokenMatchesSelectedPhone =
-    merchantToken?.authenticated_phone ===
-    (profile?.merchant_auth_phone || profile?.offspring_phone);
   const paymentConfigured = payments.configuration().configured;
+  const publicAddresses = familyAddressPayload(familyAddresses);
+  const publicRules = publicCareRules(careRules);
+  const familyComplete = Boolean(
+    profile && Array.isArray(profile.dependents) && profile.dependents.length > 0
+  );
+  const deliveryComplete = Boolean(publicAddresses.selectedAddress);
+  const spendingComplete = Boolean(publicRules);
+  const cardReady = paymentMethods.length > 0;
+  // Mandates live at Prava and are checked at order time. Do not claim that
+  // automatic ordering is ready from a saved card alone.
+  const autoOrderReady = false;
   const state = {
     userId: Number(user.id),
     clerkUserId,
@@ -670,11 +905,12 @@ async function getUserState(userId, clerkUserId = null) {
       paymentCustomer?.provider_customer_id
       || canonicalPravaCustomerId(userId),
     profile: publicProfile(profile),
-    profileComplete: Boolean(profile),
+    profileComplete: familyComplete,
+    familyComplete,
     merchantConsent: {
       merchant: "zepto",
-      consented: Boolean(consented),
-      policyVersion: merchantConsent?.policy_version || CONSENT_POLICY_VERSION,
+      consented: false,
+      policyVersion: CONSENT_POLICY_VERSION,
     },
     paymentMethods: paymentMethods.map(publicPaymentMethod),
     hasPaymentMethod: paymentMethods.length > 0,
@@ -682,15 +918,32 @@ async function getUserState(userId, clerkUserId = null) {
     paymentProvider: "prava",
     paymentRequired: false,
     paymentComplete: true,
-    merchantConnected: Boolean(
-      consented && tokenMatchesSelectedPhone && merchantToken?.access_token
-    ),
-    deliveryPreference: publicFamilyAddress(
-      familyAddresses.find((address) => address.is_selected) || null
-    ),
+    merchantConnected: false,
+    ...publicAddresses,
+    deliveryPreference: publicAddresses.selectedAddress,
+    deliveryComplete,
+    careRules: publicRules,
+    spendingComplete,
+    preferences: publicPreferences(preferences),
+    pendingDecisionCount: pendingDecisions.length,
+    cardReady,
+    autoOrderReady,
+    automaticPayments: {
+      cardReady,
+      mandateStatus: publicRules?.approvalMode === "auto_essentials"
+        ? "check_required"
+        : "not_required",
+    },
+    setup: {
+      familyComplete,
+      deliveryComplete,
+      spendingComplete,
+      approvalMode: publicRules?.approvalMode || null,
+      cardReady,
+      autoOrderReady,
+    },
   };
-  state.onboardingComplete =
-    state.profileComplete && state.merchantConsent.consented;
+  state.onboardingComplete = familyComplete && deliveryComplete && spendingComplete;
   return state;
 }
 
@@ -761,7 +1014,7 @@ function pravaReturnCallback(flow, returnContext = {}) {
   const type = flow === "mandate" ? "mandate" : "card";
   const callbackBase = BASE_URL.startsWith("https://")
     ? BASE_URL
-    : process.env.PRAVA_MERCHANT_URL || "https://zepto-shop.vercel.app";
+    : process.env.PRAVA_MERCHANT_URL || "https://tokko-drab.vercel.app";
   if (returnContext?.channel === "telegram") {
     const callbackUrl = new URL("/api/payments/return", callbackBase);
     callbackUrl.searchParams.set("channel", "telegram");
@@ -801,7 +1054,7 @@ async function createTokenizationSessionForUser(userId, input = {}) {
     process.env.PRAVA_MERCHANT_URL ||
     (BASE_URL.startsWith("https://")
       ? BASE_URL
-      : "https://zepto-shop.vercel.app");
+      : "https://tokko-drab.vercel.app");
   const callbackUrl = pravaReturnCallback("card", input.returnContext);
   const session = await payments.createTokenizationSession({
     customerId: providerCustomerId,
@@ -3543,17 +3796,27 @@ route("GET", "/api/me", async (req, res) => {
 
 route("PUT", "/api/onboarding/profile", async (req, res) => {
   const user = await auth.requireUser(req);
-  const input = validation.onboardingInput(await parseBody(req));
-  const linkedUser = await db.linkWebsiteUserPhone(
-    user.userId,
-    {
-      clerkUserId: user.clerkUserId,
-      email: user.email,
-    },
-    input.primaryParentPhone
-  );
-  const userId = Number(linkedUser.id);
+  const input = validation.websiteOnboardingInput(await parseBody(req));
+  let userId = Number(user.userId);
+  if (input.primaryParentPhone) {
+    const linkedUser = await db.linkWebsiteUserPhone(
+      user.userId,
+      {
+        clerkUserId: user.clerkUserId,
+        email: user.email,
+      },
+      input.primaryParentPhone
+    );
+    userId = Number(linkedUser.id);
+  }
   await db.saveProfile(userId, input, "website");
+  await db.recordActivityEvent(userId, {
+    eventType: "family_updated",
+    title: "Family circle updated",
+    detail: `${input.dependents.length} member${input.dependents.length === 1 ? "" : "s"} ready for Tokko`,
+    entityType: "family",
+    metadata: { memberCount: input.dependents.length },
+  });
   sendJson(res, 200, await getUserState(userId, user.clerkUserId));
 });
 
@@ -4199,7 +4462,6 @@ route("GET", "/api/platforms", async (req, res) => {
 route("GET", "/api/addresses", async (req, res) => {
   try {
     const user = await auth.requireUser(req);
-    await db.clearDeliveryPreference(user.userId, "zepto");
     return sendJson(
       res,
       200,
@@ -4212,17 +4474,76 @@ route("GET", "/api/addresses", async (req, res) => {
 route("POST", "/api/addresses", async (req, res) => {
   try {
     const user = await auth.requireUser(req);
+    const body = await parseBody(req);
     const address = await db.createFamilyAddress(
       user.userId,
-      familyAddressInput(await parseBody(req))
+      familyAddressInput(body, { requireContact: true })
     );
+    await db.assignFamilyAddress(user.userId, address.id, body.memberIds);
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_added",
+      title: `${address.label} address added`,
+      detail: address.formatted_address,
+      entityType: "address",
+      entityId: address.id,
+    });
+    const addresses = await db.getFamilyAddresses(user.userId);
     return sendJson(res, 201, {
       saved: true,
       reflected: true,
       savedAddressId: String(address.id),
-      savedAddress: publicFamilyAddress(address),
-      ...familyAddressPayload(await db.getFamilyAddresses(user.userId)),
+      savedAddress: publicFamilyAddress(
+        addresses.find((entry) => String(entry.id) === String(address.id))
+      ),
+      ...familyAddressPayload(addresses),
     });
+  } catch (error) {
+    return sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("PUT", "/api/addresses/:id", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const body = await parseBody(req);
+    const updated = await db.updateFamilyAddress(
+      user.userId,
+      params.id,
+      familyAddressInput(body, { requireContact: true })
+    );
+    if (!updated) return sendJson(res, 404, { error: "Tokko address not found" });
+    await db.assignFamilyAddress(user.userId, params.id, body.memberIds);
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_updated",
+      title: `${updated.label} address updated`,
+      detail: updated.formatted_address,
+      entityType: "address",
+      entityId: params.id,
+    });
+    return sendJson(
+      res,
+      200,
+      familyAddressPayload(await db.getFamilyAddresses(user.userId))
+    );
+  } catch (error) {
+    return sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("DELETE", "/api/addresses/:id", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const removed = await db.deleteFamilyAddress(user.userId, params.id);
+    if (!removed) return sendJson(res, 404, { error: "Tokko address not found" });
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_removed",
+      title: "Delivery address removed",
+      entityType: "address",
+      entityId: params.id,
+    });
+    return sendJson(
+      res,
+      200,
+      familyAddressPayload(await db.getFamilyAddresses(user.userId))
+    );
   } catch (error) {
     return sendJson(res, error.status || 400, { error: error.message });
   }
@@ -4233,6 +4554,13 @@ route("POST", "/api/addresses/select", async (req, res) => {
     const user = await auth.requireUser(req);
     const selected = await db.selectFamilyAddress(user.userId, addressId);
     if (!selected) return sendJson(res, 404, { error: "Tokko address not found" });
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_selected",
+      title: `${selected.label} set as default`,
+      detail: selected.formatted_address,
+      entityType: "address",
+      entityId: selected.id,
+    });
     return sendJson(res, 200, {
       selected: true,
       selectedAddress: publicFamilyAddress(selected),
@@ -4240,6 +4568,178 @@ route("POST", "/api/addresses/select", async (req, res) => {
     });
   } catch (error) {
     return sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("GET", "/api/care-rules", async (req, res) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, { careRules: publicCareRules(await db.getCareRules(user.userId)) });
+});
+route("PUT", "/api/care-rules", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const rules = await db.saveCareRules(
+      user.userId,
+      careRulesInput(await parseBody(req))
+    );
+    await db.recordActivityEvent(user.userId, {
+      eventType: "care_rules_updated",
+      title: rules.approval_mode === "auto_essentials"
+        ? "Automatic essentials configured"
+        : "Approval required for every order",
+      detail: rules.approval_mode === "auto_essentials"
+        ? `${rules.currency} ${Number(rules.per_order_cap)} per order · ${rules.currency} ${Number(rules.monthly_cap)} monthly`
+        : "Tokko will ask before every purchase",
+      entityType: "care_rules",
+    });
+    sendJson(res, 200, { careRules: publicCareRules(rules) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("GET", "/api/preferences", async (req, res) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, {
+    preferences: publicPreferences(await db.getUserPreferences(user.userId)),
+  });
+});
+route("PUT", "/api/preferences", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const current = await db.getUserPreferences(user.userId);
+    const preferences = await db.saveUserPreferences(
+      user.userId,
+      preferenceInput(await parseBody(req), current)
+    );
+    sendJson(res, 200, { preferences: publicPreferences(preferences) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("GET", "/api/decisions", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const query = getQuery(req);
+    const status = !query.status || query.status === "all" ? null : query.status;
+    if (status && !new Set(["pending", "resolved", "expired"]).has(status)) {
+      throw Object.assign(new Error("status is invalid"), { status: 400 });
+    }
+    const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 50, 1), 100);
+    const decisions = await db.getDecisionRequests(user.userId, { status, limit });
+    sendJson(res, 200, { decisions: decisions.map(publicDecision) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("POST", "/api/decisions/:id/resolve", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const body = await parseBody(req);
+    const resolution = String(body.resolution || "").trim();
+    if (!new Set(["approve", "decline"]).has(resolution)) {
+      throw Object.assign(new Error("resolution must be approve or decline"), {
+        status: 400,
+      });
+    }
+    const note = String(body.note || "").trim().slice(0, 500) || null;
+    const current = (await db.getDecisionRequests(user.userId, { limit: 100 }))
+      .find((entry) => entry.id === params.id);
+    if (current?.request_type === "safety_stop" && resolution === "approve") {
+      throw Object.assign(
+        new Error("A safety stop cannot be approved; review or decline the request"),
+        { status: 409 }
+      );
+    }
+    const result = await db.resolveDecisionRequest(
+      user.userId,
+      params.id,
+      resolution,
+      note
+    );
+    if (result.outcome === "not_found") {
+      return sendJson(res, 404, { error: "Decision request not found" });
+    }
+    if (result.outcome === "conflict") {
+      return sendJson(res, 409, {
+        error: "This request was already resolved differently",
+        decision: publicDecision(result.decision),
+      });
+    }
+    if (result.outcome === "expired") {
+      return sendJson(res, 409, {
+        error: "This request has expired",
+        decision: publicDecision(result.decision),
+      });
+    }
+    if (result.outcome === "resolved") {
+      await db.recordActivityEvent(user.userId, {
+        eventType: `decision_${resolution}d`,
+        title: resolution === "approve" ? "Request approved" : "Request declined",
+        detail: current?.title || null,
+        entityType: "decision",
+        entityId: params.id,
+        metadata: { resolution },
+      });
+    }
+    sendJson(res, 200, {
+      outcome: result.outcome,
+      decision: publicDecision(result.decision),
+    });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("GET", "/api/activity", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const limit = Math.min(
+      Math.max(Number.parseInt(getQuery(req).limit, 10) || 50, 1),
+      100
+    );
+    sendJson(res, 200, {
+      activity: (await db.getActivityEvents(user.userId, limit)).map(publicActivity),
+    });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+route("POST", "/api/v1/decisions", async (req, res) => {
+  try {
+    await auth.requireService(req);
+    const body = await parseBody(req);
+    let user = null;
+    if (body.userId || body.familyUserId) {
+      user = await db.getUserById(parseOnboardingId(body.userId || body.familyUserId));
+    } else if (body.email || body.familyEmail) {
+      user = await db.getUserByEmail(body.email || body.familyEmail);
+    } else if (body.phone || body.familyPhone) {
+      const userId = await resolveOnboardingUserId(body.phone || body.familyPhone);
+      user = await db.getUserById(userId);
+    }
+    if (!user) {
+      throw Object.assign(
+        new Error("A valid userId, email, or family phone is required"),
+        { status: 404 }
+      );
+    }
+    const input = decisionRequestInput(body);
+    const decision = await db.createDecisionRequest(Number(user.id), input);
+    if (!decision) {
+      throw Object.assign(
+        new Error("The selected family member or address was not found"),
+        { status: 404 }
+      );
+    }
+    await db.recordActivityEvent(Number(user.id), {
+      eventType: "decision_requested",
+      title: input.title,
+      detail: input.reasonText,
+      entityType: "decision",
+      entityId: input.id,
+      metadata: { requestType: input.requestType },
+    });
+    sendJson(res, 201, { decision: publicDecision(decision) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
   }
 });
 route("POST", "/api/location/serviceability", async (req, res) => {
@@ -5653,7 +6153,9 @@ Object.assign(server, {
   HERMES_ZEPTO_RECONNECT_TOOL,
   MERCHANT_CONSENT_TEXT,
   canonicalPravaCustomerId,
+  careRulesInput,
   createUcpCheckoutWithPayment,
+  decisionRequestInput,
   familyAddressInput,
   familyAddressPayload,
   handler,

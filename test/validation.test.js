@@ -6,7 +6,48 @@ const {
   optionalEmail,
   optionalGender,
   phoneInput,
+  websiteOnboardingInput,
 } = require("../lib/validation.js");
+
+test("website onboarding needs family contacts but not an account phone", () => {
+  const profile = websiteOnboardingInput({
+    primaryParentName: "Shivang",
+    dependents: [{
+      id: 12,
+      name: "Asha",
+      countryCode: "+91",
+      localPhone: "98765 43210",
+      relationshipToUser: "Mother",
+    }],
+  });
+  assert.equal(profile.primaryParentPhone, null);
+  assert.equal(profile.dependents[0].id, 12);
+  assert.equal(profile.dependents[0].phone, "+919876543210");
+  assert.equal(profile.merchantAuthPhone, null);
+});
+
+test("website onboarding rejects duplicate family contacts and account reuse", () => {
+  const member = {
+    name: "Asha",
+    phone: "+919876543210",
+    relationshipToUser: "Mother",
+  };
+  assert.throws(
+    () => websiteOnboardingInput({
+      primaryParentName: "Shivang",
+      dependents: [member, { ...member, name: "Kabir" }],
+    }),
+    /different phone number/
+  );
+  assert.throws(
+    () => websiteOnboardingInput({
+      primaryParentName: "Shivang",
+      primaryParentPhone: member.phone,
+      dependents: [member],
+    }),
+    /must be different/
+  );
+});
 
 test("phoneInput supports complete E.164 and country-code phone login values", () => {
   assert.equal(
