@@ -75,7 +75,7 @@ const HERMES_ZEPTO_RECONNECT_TOOL = {
 const HERMES_UCP_SEARCH_TOOL = {
   name: "search_wellness_merchants",
   description:
-    "Search the live health-and-wellness UCP catalogues available to Trakko for the selected India or US delivery market. Results include current availability, image, variant, and native-currency price. A selected delivery address is required.",
+    "Search every live health-and-wellness UCP catalogue in Hermes merchant memory for the selected India or US delivery market, then return the three lowest-priced matches. A selected delivery address is required.",
   inputSchema: {
     type: "object",
     properties: {
@@ -83,23 +83,10 @@ const HERMES_UCP_SEARCH_TOOL = {
         type: "string",
         description: "The user's product or wellness need in concise catalogue wording.",
       },
-      limit: {
-        type: "integer",
-        description: "Page size. Trakko returns at most 50 image-backed products.",
-      },
-      offset: {
-        type: "integer",
-        description: "Zero-based result offset. Use 50 when the user asks to show 50 more.",
-      },
       market: {
         type: "string",
         enum: ["IN", "US"],
         description: "Delivery market derived from the selected saved address.",
-      },
-      merchant: {
-        type: "string",
-        description:
-          "One merchant slug or name from Hermes merchant memory. Prefer the best remembered merchant persona for this request.",
       },
     },
     required: ["query"],
@@ -6174,8 +6161,8 @@ async function runHermesBackend({
     result.productQuery = searchResult.query;
     result.productPagination = searchResult.pagination || null;
     result.message = searchResult.products.length
-      ? `i found ${searchResult.products.length} options from the selected live merchant ucp. select the one you want.`
-      : "i could not find a match from the selected live merchant ucp. try a broader product name.";
+      ? `i found the ${searchResult.products.length} lowest-priced options across the eligible live merchant ucps. select the one you want.`
+      : "i could not find a match across the eligible live merchant ucps. try a broader product name.";
   }
   const checkoutResult = [...(result.tools || [])]
     .reverse()
@@ -6303,13 +6290,28 @@ async function executeHermesTool(req, userId, toolName, args) {
     return prepareTelegramMandateChoices(userId, args);
   }
   if (toolName === HERMES_UCP_SEARCH_TOOL.name) {
-    return ucp.searchAll(args?.query, {
-      limit: 50,
-      offset: args?.offset,
+    const searchResult = await ucp.searchAll(args?.query, {
+      limit: 3,
+      offset: 0,
       market: args?.market,
-      merchant: args?.merchant,
+      merchantResultLimit: 50,
       baseUrl: BASE_URL,
     });
+    const products = (searchResult.products || []).slice(0, 3);
+    return {
+      ...searchResult,
+      selectedMerchant: null,
+      sort: "lowest_native_price",
+      products,
+      pagination: {
+        ...(searchResult.pagination || {}),
+        offset: 0,
+        limit: 3,
+        returned: products.length,
+        nextOffset: products.length,
+        hasMore: false,
+      },
+    };
   }
   if (toolName === HERMES_UCP_CHECKOUT_TOOL.name) {
     return createUcpCheckoutWithPayment(userId, args);
@@ -6689,6 +6691,7 @@ Object.assign(server, {
   careRulesInput,
   createUcpCheckoutWithPayment,
   decisionRequestInput,
+  executeHermesTool,
   familyAddressInput,
   familyAddressPayload,
   handler,

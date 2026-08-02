@@ -21,6 +21,36 @@ test("server.js exports the HTTP server expected by Vercel", () => {
   );
 });
 
+test("Hermes UCP search fans out without a merchant filter and returns only three", async () => {
+  const originalSearchAll = ucp.searchAll;
+  let capturedOptions;
+  ucp.searchAll = async (_query, options) => {
+    capturedOptions = options;
+    return {
+      products: [1, 2, 3, 4].map((price) => ({ price })),
+      pagination: { hasMore: true },
+    };
+  };
+  try {
+    const result = await server.executeHermesTool(
+      {},
+      42,
+      "search_wellness_merchants",
+      { query: "vitamin", market: "IN", merchant: "himalayawellness", limit: 50 }
+    );
+    assert.equal(capturedOptions.limit, 3);
+    assert.equal(capturedOptions.offset, 0);
+    assert.equal(capturedOptions.merchantResultLimit, 50);
+    assert.equal("merchant" in capturedOptions, false);
+    assert.deepEqual(result.products.map((product) => product.price), [1, 2, 3]);
+    assert.equal(result.selectedMerchant, null);
+    assert.equal(result.pagination.hasMore, false);
+    assert.equal(result.pagination.limit, 3);
+  } finally {
+    ucp.searchAll = originalSearchAll;
+  }
+});
+
 test("email OTP verification is a public signup route", () => {
   assert.ok(server.matchRoute("POST", "/api/auth/signup"));
   assert.ok(server.matchRoute("POST", "/api/auth/signup/verify"));

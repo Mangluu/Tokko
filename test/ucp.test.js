@@ -74,6 +74,7 @@ test("searches only live UCP merchants present in Hermes memory", async () => {
     if (url === "https://himalaya.test/mcp") {
       return rpc({
         products: [
+          product("Free Ashwagandha Gift Sample", "200", 0),
           product("Himalaya Ashwagandha Value", "201", 19900),
           product("Unavailable Ashwagandha Deal", "202", 9900, false),
         ],
@@ -100,6 +101,41 @@ test("searches only live UCP merchants present in Hermes memory", async () => {
   assert.equal(result.source, "live_hermes_merchant_ucp");
   assert.equal(requestedUrls.includes("https://catalog.shopify.com/api/ucp/mcp"), false);
   assert.equal(requestedUrls.includes("https://www.oziva.in/.well-known/ucp"), false);
+});
+
+test("logs a credential-free curl command when a merchant MCP search fails", async () => {
+  const messages = [];
+  const originalError = console.error;
+  console.error = (...values) => messages.push(values.join(" "));
+  try {
+    const fakeFetch = async (url) => {
+      if (url === "https://drorthooil.com/.well-known/ucp") {
+        return Response.json(discovery("https://drortho.test/api/ucp/mcp"));
+      }
+      if (url === "https://drortho.test/api/ucp/mcp") {
+        return Response.json(
+          { error: { message: "catalog temporarily unavailable" } },
+          { status: 503 }
+        );
+      }
+      throw new Error(`Unexpected URL: ${url}`);
+    };
+    const result = await ucp.searchAll("vitamin", {
+      market: "IN",
+      merchant: "drortho",
+      baseUrl: "https://tokko.example",
+      fetchImpl: fakeFetch,
+    });
+    assert.equal(result.products.length, 0);
+  } finally {
+    console.error = originalError;
+  }
+  const diagnostic = messages.find((message) => message.includes("catalog_mcp"));
+  assert.match(diagnostic, /curl -sS/);
+  assert.match(diagnostic, /https:\/\/drortho\.test\/api\/ucp\/mcp/);
+  assert.match(diagnostic, /MCP-Protocol-Version: 2026-04-08/);
+  assert.match(diagnostic, /search_catalog/);
+  assert.doesNotMatch(diagnostic, /authorization|api[_-]?key|secret/i);
 });
 
 test("targets the remembered merchant UCP without Global Catalog fallback", async () => {
