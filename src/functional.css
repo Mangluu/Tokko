@@ -357,7 +357,7 @@
   .tf-address-card .tf-card-menu { grid-column: 1 / -1; justify-content: flex-end; border-top: 1px solid var(--line); padding-top: 8px; }
   .tf-mode-grid { grid-template-columns: 1fr; }
   .tf-mode-card { min-height: 170px; }
-  .tf-dashboard-header { min-height: calc(62px + env(safe-area-inset-top)); padding: max(8px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left)); }
+  .tf-dashboard-header { grid-template-columns: 1fr auto; min-height: calc(62px + env(safe-area-inset-top)); padding: max(8px, env(safe-area-inset-top)) max(14px, env(safe-area-inset-right)) 8px max(14px, env(safe-area-inset-left)); }
   .tf-dashboard-header > strong { display: none; }
   .tf-dashboard-main { width: calc(100% - 28px); padding-top: 32px; padding-bottom: calc(106px + env(safe-area-inset-bottom)); }
   .tf-page-intro h1 { font-size: 43px; }
