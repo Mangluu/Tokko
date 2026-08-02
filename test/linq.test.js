@@ -4,6 +4,7 @@ const assert = require("node:assert/strict");
 const {
   incomingMessage,
   selectHealthyNumber,
+  sendChatLink,
   sendChatMessage,
   verifyWebhook,
 } = require("../lib/linq.js");
@@ -118,6 +119,38 @@ test("sendChatMessage posts an idempotent text part to the existing chat", async
       message: {
         parts: [{ type: "text", value: "Tokko reply" }],
         idempotency_key: "tokko-event-1",
+      },
+    });
+  } finally {
+    global.fetch = previousFetch;
+    if (previousKey === undefined) delete process.env.LINQ_API_KEY;
+    else process.env.LINQ_API_KEY = previousKey;
+  }
+});
+
+test("sendChatLink sends a standalone tappable HTTPS link part", async () => {
+  const previousFetch = global.fetch;
+  const previousKey = process.env.LINQ_API_KEY;
+  let captured;
+  process.env.LINQ_API_KEY = "test-linq-key";
+  global.fetch = async (url, options) => {
+    captured = { url, options };
+    return {
+      ok: true,
+      json: async () => ({ message: { id: "sent-link" } }),
+    };
+  };
+  try {
+    const result = await sendChatLink({
+      chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+      url: "https://checkout.example/session/123",
+      idempotencyKey: "tokko-link-1",
+    });
+    assert.equal(result.id, "sent-link");
+    assert.deepEqual(JSON.parse(captured.options.body), {
+      message: {
+        parts: [{ type: "link", value: "https://checkout.example/session/123" }],
+        idempotency_key: "tokko-link-1",
       },
     });
   } finally {

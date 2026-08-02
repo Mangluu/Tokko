@@ -24,6 +24,25 @@ const COUNTRY_CODES = [['+91', 'India +91'], ['+1', 'US / Canada +1'], ['+44', '
 const RELATIONSHIPS = ['Mother', 'Father', 'Spouse', 'Child', 'Son', 'Daughter', 'Sibling', 'Grandparent', 'Other'];
 const CATEGORIES = [['medicines', 'Medicines'], ['wellness', 'Wellness'], ['personal_care', 'Personal care'], ['devices', 'Health devices'], ['nutrition', 'Nutrition']];
 let clerkBrowserPromise = null;
+const LINQ_ONBOARDING_STORAGE_KEY = 'tokko-linq-onboarding';
+
+function browserLinqOnboardingToken() {
+  const token = new URL(window.location.href).searchParams.get('linqOnboarding')?.trim() || '';
+  try {
+    if (token) sessionStorage.setItem(LINQ_ONBOARDING_STORAGE_KEY, token);
+    return token || sessionStorage.getItem(LINQ_ONBOARDING_STORAGE_KEY) || '';
+  } catch { return token; }
+}
+function clearBrowserLinqOnboardingToken() {
+  try { sessionStorage.removeItem(LINQ_ONBOARDING_STORAGE_KEY); } catch {}
+}
+function browserAuthUrl(pathname, params = {}) {
+  const url = new URL(pathname, window.location.origin);
+  const linqToken = browserLinqOnboardingToken();
+  if (linqToken) url.searchParams.set('linqOnboarding', linqToken);
+  Object.entries(params).forEach(([key, value]) => url.searchParams.set(key, value));
+  return url.toString();
+}
 
 function clerkErrorMessage(error) {
   const details = Array.isArray(error?.errors) ? error.errors[0] : null;
@@ -80,14 +99,13 @@ async function verifyClerkEmail(signUpId, code) {
 }
 async function startGoogleOAuth() {
   const clerk = await browserClerk();
-  const origin = window.location.origin;
   try {
-    await clerk.client.signIn.authenticateWithRedirect({ strategy: 'oauth_google', redirectUrl: `${origin}/sso-callback`, redirectUrlComplete: `${origin}/?clerk_oauth=complete` });
+    await clerk.client.signIn.authenticateWithRedirect({ strategy: 'oauth_google', redirectUrl: browserAuthUrl('/sso-callback'), redirectUrlComplete: browserAuthUrl('/', { clerk_oauth: 'complete' }) });
   } catch (error) { throw new Error(clerkErrorMessage(error)); }
 }
 async function completeGoogleOAuthCallback() {
   const clerk = await browserClerk();
-  const completeUrl = `${window.location.origin}/?clerk_oauth=complete`;
+  const completeUrl = browserAuthUrl('/', { clerk_oauth: 'complete' });
   await clerk.handleRedirectCallback({ signInFallbackRedirectUrl: completeUrl, signUpFallbackRedirectUrl: completeUrl, signInForceRedirectUrl: completeUrl, signUpForceRedirectUrl: completeUrl });
 }
 async function exchangeClerkSession() {
@@ -219,9 +237,9 @@ function MemberDialog({ open, initial, canRemove, onSave, onRemove, onClose }) {
   </Modal>;
 }
 
-function FamilyEditor({ state, displayName, submitLabel, onSaved }) {
+function FamilyEditor({ state, displayName, submitLabel, onSaved, linqPhone = '' }) {
   const [ownerName, setOwnerName] = useState(state.profile?.primaryParentName || displayName || '');
-  const ownerParts = phoneParts(state.profile?.primaryParentPhone || '');
+  const ownerParts = phoneParts(state.profile?.primaryParentPhone || linqPhone || '');
   const [ownerPhone, setOwnerPhone] = useState({ countryCode: ownerParts.countryCode, localPhone: ownerParts.localPhone });
   const [members, setMembers] = useState((state.profile?.dependents || []).map(memberFromApi));
   const [editing, setEditing] = useState(null);
@@ -230,9 +248,9 @@ function FamilyEditor({ state, displayName, submitLabel, onSaved }) {
   const [busy, setBusy] = useState(false);
   useEffect(() => {
     setOwnerName(state.profile?.primaryParentName || displayName || '');
-    setOwnerPhone(phoneParts(state.profile?.primaryParentPhone || ''));
+    setOwnerPhone(phoneParts(state.profile?.primaryParentPhone || linqPhone || ''));
     setMembers((state.profile?.dependents || []).map(memberFromApi));
-  }, [state.profile, displayName]);
+  }, [state.profile, displayName, linqPhone]);
   const saveMember = (member) => { setMembers((current) => editing?.index === undefined ? [...current, member] : current.map((item, index) => index === editing.index ? member : item)); setEditing(null); };
   const submit = async () => {
     if (!ownerName.trim()) return setStatus({ type: 'error', message: 'Tell Tokko what to call you.' });
@@ -243,12 +261,12 @@ function FamilyEditor({ state, displayName, submitLabel, onSaved }) {
     try {
       const normalizedOwnerPhone = normalizeLocalPhone(ownerPhone.countryCode, ownerPhone.localPhone);
       const next = await api('/api/onboarding/profile', { method: 'PUT', body: { primaryParentName: ownerName.trim(), ...(normalizedOwnerPhone ? { primaryParentCountryCode: ownerPhone.countryCode, primaryParentLocalPhone: normalizedOwnerPhone } : {}), dependents: members.map(memberPayload) } });
-      setStatus({ type: 'success', message: 'Family circle saved.' }); onSaved(next);
+      setStatus({ type: 'success', message: 'Family circle saved.' }); await onSaved(next);
     } catch (error) { setStatus({ type: 'error', message: error.message }); }
     finally { setBusy(false); }
   };
   return <>
-    <div className="tf-card tf-owner-card"><span className="tf-card-icon"><Fingerprint size={20} /></span><label><span>What should Tokko call you?</span><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Your name" /></label><small>{state.account?.email} · secure account owner</small><details><summary>Add my phone for account alerts <em>optional</em></summary><span className="tf-phone-input"><select aria-label="Your country calling code" value={ownerPhone.countryCode} onChange={(event) => setOwnerPhone({ ...ownerPhone, countryCode: event.target.value })}>{COUNTRY_CODES.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><input inputMode="tel" value={ownerPhone.localPhone} onChange={(event) => setOwnerPhone({ ...ownerPhone, localPhone: event.target.value })} placeholder="98765 43210" /></span></details></div>
+    <div className="tf-card tf-owner-card"><span className="tf-card-icon"><Fingerprint size={20} /></span><label><span>What should Tokko call you?</span><input value={ownerName} onChange={(event) => setOwnerName(event.target.value)} placeholder="Your name" /></label><small>{state.account?.email} · secure account owner</small>{linqPhone && <small>LINQ callback number: {linqPhone}. Keep it here as your account phone, or add it below as the correct family member.</small>}<details defaultOpen={Boolean(linqPhone && !state.profile?.primaryParentPhone)}><summary>Add my phone for account alerts <em>{linqPhone ? 'required for this callback unless added as a family member' : 'optional'}</em></summary><span className="tf-phone-input"><select aria-label="Your country calling code" value={ownerPhone.countryCode} onChange={(event) => setOwnerPhone({ ...ownerPhone, countryCode: event.target.value })}>{COUNTRY_CODES.map(([value, label]) => <option value={value} key={value}>{label}</option>)}</select><input inputMode="tel" value={ownerPhone.localPhone} onChange={(event) => setOwnerPhone({ ...ownerPhone, localPhone: event.target.value })} placeholder="98765 43210" /></span></details></div>
     <div className="tf-section-heading"><div><h2>Your care circle</h2><p>The people who can message Tokko for help.</p></div><button className="tf-small-button" type="button" onClick={() => setEditing({ index: undefined, member: null })}><Plus size={16} /> Add</button></div>
     <div className="tf-member-list">{members.map((member, index) => <button className="tf-member-card" type="button" key={member.clientId} onClick={() => setEditing({ index, member })}><span className="tf-avatar">{initials(member.name)}</span><span><strong>{member.name}</strong><small>{member.relationship === 'Other' ? member.otherRelationship : member.relationship} · {member.countryCode} {member.localPhone}</small></span><span className="tf-ready"><MessageCircle size={13} /> Ready</span><Pencil size={15} /></button>)}{!members.length && <div className="tf-empty-inline"><Users size={24} /><p>No family members yet. Add the first person Tokko should recognise.</p></div>}</div>
     <Status value={status} /><button className="tokko-button tokko-button-primary tf-main-action" type="button" onClick={submit} disabled={busy}><span>{submitLabel}</span><BusyIcon busy={busy} /></button>
@@ -426,10 +444,18 @@ function Landing({ page, setPage, theme, onTheme }) {
 
 function App() {
   const [page, setPage] = useState('loading'); const [session, setSession] = useState('checking'); const [state, setState] = useState(null); const [authNotice, setAuthNotice] = useState(''); const [displayName, setDisplayName] = useState(''); const [theme, setTheme] = useState(() => localStorage.getItem('tokko-theme') || 'light');
+  const [linqToken] = useState(() => browserLinqOnboardingToken());
+  const [linqContext, setLinqContext] = useState(null);
   const toggleTheme = () => setTheme((current) => current === 'light' ? 'dark' : 'light');
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('tokko-theme', theme); }, [theme]);
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: 'auto' }); }, [page]);
-  const routeAuthenticated = (next, name = '') => { setState(next); setSession('authenticated'); if (name || next.clerkDisplayName) setDisplayName(name || next.clerkDisplayName); if (!next.familyComplete) setPage('family'); else if (!next.deliveryComplete) setPage('delivery'); else if (!next.spendingComplete) setPage('spending'); else setPage('dashboard'); };
+  useEffect(() => {
+    if (!linqToken) return;
+    api(`/api/linq/onboarding/context?token=${encodeURIComponent(linqToken)}`)
+      .then(setLinqContext)
+      .catch((error) => setAuthNotice(`${error.message}. Return to LINQ and request a new setup link.`));
+  }, [linqToken]);
+  const routeAuthenticated = (next, name = '') => { setState(next); setSession('authenticated'); if (name || next.clerkDisplayName) setDisplayName(name || next.clerkDisplayName); if (linqToken || !next.familyComplete) setPage('family'); else if (!next.deliveryComplete) setPage('delivery'); else if (!next.spendingComplete) setPage('spending'); else setPage('dashboard'); };
   useEffect(() => {
     let active = true;
     const boot = async () => {
@@ -440,14 +466,29 @@ function App() {
       if (callback) window.history.replaceState({}, '', '/');
       return next;
     };
-    boot().then((next) => { if (active) routeAuthenticated(next); }).catch((error) => { if (!active) return; const url = new URL(window.location.href); const callback = url.pathname === '/sso-callback' || url.searchParams.get('clerk_oauth') === 'complete'; if (callback) { setAuthNotice(error.message); window.history.replaceState({}, '', '/'); setPage('auth'); } else setPage('landing'); setSession('guest'); });
+    boot().then((next) => { if (active) routeAuthenticated(next); }).catch((error) => { if (!active) return; const url = new URL(window.location.href); const callback = url.pathname === '/sso-callback' || url.searchParams.get('clerk_oauth') === 'complete'; if (callback) { setAuthNotice(error.message); window.history.replaceState({}, '', linqToken ? `/?linqOnboarding=${encodeURIComponent(linqToken)}` : '/'); setPage('auth'); } else setPage(linqToken ? 'auth' : 'landing'); setSession('guest'); });
     return () => { active = false; };
   }, []);
+  const finishLinqFamilySetup = async (next) => {
+    setState(next);
+    if (!linqToken) { setPage('delivery'); return; }
+    const completed = await api('/api/linq/onboarding/complete', {
+      method: 'POST',
+      body: { token: linqToken },
+    });
+    clearBrowserLinqOnboardingToken();
+    window.history.replaceState({}, '', '/');
+    if (completed.returnUrl) {
+      window.location.assign(completed.returnUrl);
+      return;
+    }
+    setPage(!next.deliveryComplete ? 'delivery' : !next.spendingComplete ? 'spending' : 'dashboard');
+  };
   const logout = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch {} try { const clerk = await browserClerk(); if (clerk?.session) await clerk.signOut(); } catch {} setState(null); setSession('guest'); setPage('auth'); };
   if (page === 'loading') return <div className="tf-app-loading"><Brand /><LoaderCircle className="tokko-spinner" /><span>Waking your care circle…</span></div>;
   if (['landing', 'explainer'].includes(page)) return <Landing page={page} setPage={setPage} theme={theme} onTheme={toggleTheme} />;
-  if (page === 'auth') return <section className="tf-auth-screen"><header><button className="tokko-brand-button" type="button" onClick={() => setPage('landing')}><Brand compact /></button><ThemeButton theme={theme} onToggle={toggleTheme} /></header><main><div className="tf-auth-copy"><span className="tokko-panel-kicker"><ShieldCheck size={15} /> Private by design</span><h1>One account.<br /><em>Your family’s care circle.</em></h1><p>Sign in once to set the people, places and boundaries behind every Tokko request.</p><div className="tf-auth-orbit"><span><Sparkles /></span><p><strong>AI that knows when to pause.</strong><small>Simple messages for family. Explicit control for you.</small></p></div></div><div className="tf-auth-card">{session === 'checking' ? <div className="tokko-loading-panel"><LoaderCircle className="tokko-spinner" /> Checking your session…</div> : <AccountAccess initialStatus={authNotice} onAuthenticated={routeAuthenticated} />}</div></main><button className="tf-auth-back" type="button" onClick={() => setPage('explainer')}><ArrowLeft size={17} /> Back to how it works</button></section>;
-  if (page === 'family') return <SetupShell stage={1} eyebrow="Your care circle" title="Who can ask Tokko for help?" copy="No duplicate profile questions. Just give Tokko a name for you, then add the family numbers it should recognise." theme={theme} onTheme={toggleTheme} onExit={() => setPage('landing')}><FamilyEditor state={state} displayName={displayName} submitLabel="Continue to delivery" onSaved={(next) => { setState(next); setPage('delivery'); }} /></SetupShell>;
+  if (page === 'auth') return <section className="tf-auth-screen"><header><button className="tokko-brand-button" type="button" onClick={() => setPage(linqToken ? 'auth' : 'landing')}><Brand compact /></button><ThemeButton theme={theme} onToggle={toggleTheme} /></header><main><div className="tf-auth-copy"><span className="tokko-panel-kicker"><ShieldCheck size={15} /> {linqToken ? 'Return securely to LINQ' : 'Private by design'}</span><h1>{linqToken ? <>Connect this number.<br /><em>Continue your chat.</em></> : <>One account.<br /><em>Your family’s care circle.</em></>}</h1><p>{linqToken ? `Sign in or create a Tokko account, add ${linqContext?.phone || 'this phone number'} to your family, and Tokko will reopen the LINQ conversation where you left off.` : 'Sign in once to set the people, places and boundaries behind every Tokko request.'}</p><div className="tf-auth-orbit"><span><Sparkles /></span><p><strong>AI that knows when to pause.</strong><small>Simple messages for family. Explicit control for you.</small></p></div></div><div className="tf-auth-card">{session === 'checking' ? <div className="tokko-loading-panel"><LoaderCircle className="tokko-spinner" /> Checking your session…</div> : <AccountAccess initialStatus={authNotice} onAuthenticated={routeAuthenticated} />}</div></main>{!linqToken && <button className="tf-auth-back" type="button" onClick={() => setPage('explainer')}><ArrowLeft size={17} /> Back to how it works</button>}</section>;
+  if (page === 'family') return <SetupShell stage={1} eyebrow={linqToken ? 'Connect LINQ' : 'Your care circle'} title="Who can ask Tokko for help?" copy={linqToken ? `Save ${linqContext?.phone || 'the number from your LINQ message'} as your account phone or the correct family member. Tokko will then return you to the same chat.` : 'No duplicate profile questions. Just give Tokko a name for you, then add the family numbers it should recognise.'} theme={theme} onTheme={toggleTheme} onExit={() => setPage(linqToken ? 'auth' : 'landing')}><FamilyEditor state={state} displayName={displayName} linqPhone={linqContext?.phone || ''} submitLabel={linqToken ? 'Save and return to LINQ' : 'Continue to delivery'} onSaved={finishLinqFamilySetup} /></SetupShell>;
   if (page === 'delivery') return <SetupShell stage={2} eyebrow="Delivery context" title="Where should care arrive?" copy="Tokko checks the destination before searching, so stock, price and delivery promises remain honest." theme={theme} onTheme={toggleTheme} onExit={() => setPage('landing')}><AddressManager state={state} onState={setState} onboarding onContinue={() => setPage('spending')} /></SetupShell>;
   if (page === 'spending') return <SetupShell stage={3} eyebrow="Safe spending" title="Choose how much Tokko may handle." copy="Start with approval every time, or create narrow rules for repeat essentials. You can change this later." theme={theme} onTheme={toggleTheme} onExit={() => setPage('landing')}><SpendingManager state={state} onState={setState} onboarding onContinue={(next) => { setState(next); setPage('dashboard'); }} /></SetupShell>;
   return <Dashboard state={state} onState={setState} theme={theme} onTheme={toggleTheme} onLogout={logout} />;
