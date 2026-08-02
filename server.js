@@ -2254,7 +2254,13 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
   ]);
   const selectedAddress = addresses.find((address) => address.is_selected) || null;
   const checkoutIdentity = ucpCheckoutIdentity(user, profile, selectedAddress);
-  const checkoutResult = await ucp.createCheckout(input.selectionToken, {
+  const selectionInput = Array.isArray(input.items)
+    ? input.items.map((item) => ({
+        selectionToken: item?.selectionToken,
+        quantity: item?.quantity,
+      }))
+    : input.selectionToken;
+  const checkoutResult = await ucp.createCheckout(selectionInput, {
     quantity: input.quantity,
     baseUrl: BASE_URL,
     buyer: checkoutIdentity.buyer,
@@ -4606,6 +4612,45 @@ route(
         ...(error.conflict ? { conflict: error.conflict } : {}),
       });
     }
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/checkout",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const body = await parseBody(req);
+    const cart = await db.getUcpCart(userId);
+    const items = Array.isArray(cart.items) ? cart.items : [];
+    if (!items.length) {
+      throw Object.assign(new Error("Your cart is empty"), { status: 409 });
+    }
+    const merchants = new Set(
+      items.map((item) => String(item.merchant || "").trim().toLowerCase())
+    );
+    if (merchants.size !== 1 || merchants.has("")) {
+      throw Object.assign(
+        new Error("Checkout requires a cart containing one merchant"),
+        { status: 409 }
+      );
+    }
+    const cartMerchant = [...merchants][0];
+    const requestedMerchant = String(body.merchant || "").trim().toLowerCase();
+    if (requestedMerchant && requestedMerchant !== cartMerchant) {
+      throw Object.assign(
+        new Error("The checkout merchant does not match the current cart"),
+        { status: 409 }
+      );
+    }
+    const checkout = await createUcpCheckoutWithPayment(userId, {
+      items: items.map((item) => ({
+        selectionToken: item.selectionToken,
+        quantity: item.quantity,
+      })),
+    });
+    sendJson(res, 201, checkout);
   }
 );
 

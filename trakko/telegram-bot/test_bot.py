@@ -137,6 +137,32 @@ class PhoneNormalizationTests(unittest.TestCase):
         self.assertIn("cart:empty", callbacks)
         self.assertIn("cart:checkout:himalayawellness", callbacks)
 
+    def test_cart_checkout_uses_live_checkout_result_without_missing_order_routes(self):
+        result = bot._ucp_checkout_hermes_result({
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "547.00",
+            "totals": [{"type": "total", "amountMinor": 54700}],
+            "paymentRoute": "merchant_checkout",
+            "merchantHandoffUrl": "https://merchant.example/checkouts/secure-1",
+        })
+        self.assertEqual(
+            result["nextAction"]["url"],
+            "https://merchant.example/checkouts/secure-1",
+        )
+        self.assertEqual(result["checkoutSummary"]["totalAmount"], "547.00")
+        self.assertNotIn("confirmationRequired", result["checkoutSummary"])
+
+        card_result = bot._ucp_checkout_hermes_result({
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "547.00",
+            "paymentRoute": "card_selection_required",
+            "cardChoices": [{"token": "choice", "last4": "4242"}],
+        })
+        self.assertIsNone(card_result["nextAction"])
+        self.assertEqual(card_result["cardChoices"][0]["last4"], "4242")
+
     def test_shopping_message_requires_session_address_confirmation(self):
         update = SimpleNamespace(
             effective_chat=SimpleNamespace(id=1234),

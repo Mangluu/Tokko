@@ -410,6 +410,58 @@ test("creates checkout from a signed search selection and returns continue_url",
   assert.equal(submittedCheckout.context.postal_code, "700016");
 });
 
+test("creates one merchant checkout containing every cart item", async () => {
+  let submittedLineItems;
+  const fakeFetch = async (url, options = {}) => {
+    if (url === "https://zanducare.com/.well-known/ucp") {
+      return Response.json(discovery("https://zandu.cart.test/mcp"));
+    }
+    const request = JSON.parse(options.body);
+    if (request.params.name === "search_catalog") {
+      return rpc({ products: [
+        product("Cart Vitamin C", "cart-501", 10000),
+        product("Cart Herbal Tonic", "cart-502", 25000),
+      ] });
+    }
+    if (request.params.name === "create_checkout") {
+      submittedLineItems = request.params.arguments.checkout.line_items;
+      return rpc({ checkout: {
+        id: "checkout-cart-1",
+        status: "incomplete",
+        currency: "INR",
+        line_items: submittedLineItems,
+        totals: [
+          { type: "subtotal", amount: 45000 },
+          { type: "total", amount: 45000 },
+        ],
+        continue_url: "https://zandu.example/checkouts/cart-1",
+      } });
+    }
+    throw new Error(`Unexpected URL: ${url}`);
+  };
+
+  const products = await ucp.searchMerchant("zanducare", "cart", {
+    baseUrl: "https://tokko.example",
+    fetchImpl: fakeFetch,
+  });
+  const result = await ucp.createCheckout([
+    { selectionToken: products[0].selectionToken, quantity: 2 },
+    { selectionToken: products[1].selectionToken, quantity: 1 },
+  ], {
+    baseUrl: "https://tokko.example",
+    fetchImpl: fakeFetch,
+  });
+
+  assert.deepEqual(submittedLineItems, [
+    { item: { id: "gid://shopify/ProductVariant/cart-501" }, quantity: 2 },
+    { item: { id: "gid://shopify/ProductVariant/cart-502" }, quantity: 1 },
+  ]);
+  assert.equal(result.productName, "2 cart items");
+  assert.equal(result.quantity, 3);
+  assert.equal(result.totalAmount, "450.00");
+  assert.equal(result.continueUrl, "https://zandu.example/checkouts/cart-1");
+});
+
 test("advertises fulfillment and searches live UCP merchants in India and the US", () => {
   const profile = ucp.agentProfile("https://tokko.example").document;
   assert.ok(profile.ucp.capabilities["dev.ucp.shopping.fulfillment"]);

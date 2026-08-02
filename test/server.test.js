@@ -140,6 +140,12 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
   );
   assert.ok(
     server.matchRoute(
+      "POST",
+      "/api/v1/onboarding/42/merchants/ucp/cart/checkout"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
       "DELETE",
       "/api/v1/onboarding/42/merchants/ucp/cart/items/7"
     )

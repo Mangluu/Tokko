@@ -2414,7 +2414,7 @@ def _ucp_cart_checkout_markup(cart: dict) -> InlineKeyboardMarkup | None:
         )])
     if cart.get("items"):
         rows.append([InlineKeyboardButton("Empty Cart", callback_data="cart:empty")])
-    if len(groups) != 1 or cart.get("checkoutAvailable") is not True:
+    if len(groups) != 1:
         return InlineKeyboardMarkup(rows) if rows else None
     for group in groups:
         merchant = str(group.get("merchant") or "").strip().lower()
@@ -2581,23 +2581,57 @@ async def checkout_ucp_merchant_cart(
             "merchants/ucp/cart/checkout",
             {"merchant": merchant},
         )
-        await _send_hermes_result(update, {
-            "message": (
-                f"{checkout.get('merchantName') or 'The merchant'} returned a final quote of "
-                f"{checkout.get('currency') or ''} {checkout.get('totalAmount') or ''}. "
-                "Review every charge and delivery estimate before proceeding."
-            ).strip(),
-            "checkoutSummary": {
-                "orderId": checkout.get("orderId"),
-                "currency": checkout.get("currency"),
-                "totalAmount": checkout.get("totalAmount"),
-                **(checkout.get("quote") or {}),
-                "confirmationRequired": True,
-            },
-        }, binding)
+        await _send_hermes_result(
+            update,
+            _ucp_checkout_hermes_result(checkout),
+            binding,
+        )
     except Exception as exc:
         log.exception("Could not create merchant UCP cart checkout")
         await query.message.reply_text(f"I couldn't create that merchant checkout: {exc}")
+
+
+def _ucp_checkout_hermes_result(checkout: dict) -> dict:
+    payment_route = str(checkout.get("paymentRoute") or "")
+    currency = str(checkout.get("currency") or "").upper()
+    total = str(checkout.get("totalAmount") or "")
+    merchant_name = str(checkout.get("merchantName") or "The merchant")
+    mandate_count = int(
+        (checkout.get("mandateCheck") or {}).get("checkedMandateCount") or 0
+    )
+    if payment_route == "card_selection_required":
+        message = (
+            f"{merchant_name} returned a final quote of {currency} {total}. "
+            "No active mandate covers it; choose a saved Prava card."
+        )
+    elif payment_route == "mandate":
+        message = (
+            f"{merchant_name} returned a final quote of {currency} {total}. "
+            f"Tokko checked {mandate_count} Prava mandate(s) and selected one "
+            "that covers the total. Review the quote before continuing."
+        )
+    else:
+        message = (
+            f"{merchant_name} returned a final quote of {currency} {total}. "
+            "Review every charge and delivery estimate before continuing."
+        )
+    result = {
+        **checkout,
+        "message": message.strip(),
+        "checkoutSummary": checkout,
+    }
+    handoff_url = str(checkout.get("merchantHandoffUrl") or "")
+    if payment_route != "card_selection_required" and handoff_url.startswith("https://"):
+        result["nextAction"] = {
+            "type": "merchant_ucp_checkout",
+            "label": f"Continue to {merchant_name} checkout",
+            "url": handoff_url,
+            "paymentHandoff": checkout.get("paymentHandoff"),
+            "paymentSelection": checkout.get("paymentSelection"),
+        }
+    else:
+        result["nextAction"] = None
+    return result
 
 
 async def decide_ucp_order(
