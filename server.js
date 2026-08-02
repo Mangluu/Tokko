@@ -75,7 +75,7 @@ const HERMES_ZEPTO_RECONNECT_TOOL = {
 const HERMES_UCP_SEARCH_TOOL = {
   name: "search_wellness_merchants",
   description:
-    "Search the live health-and-wellness UCP catalogues available to Trakko for the selected India or US delivery market. Results include current availability, image, variant, and native-currency price. A selected delivery address is required.",
+    "Search live health-and-wellness UCP catalogues that advertise delivery to the selected address country. Results include current availability, image, variant, and native-currency price. A selected delivery address is required.",
   inputSchema: {
     type: "object",
     properties: {
@@ -83,18 +83,24 @@ const HERMES_UCP_SEARCH_TOOL = {
         type: "string",
         description: "The user's product or wellness need in concise catalogue wording.",
       },
+      merchant: {
+        type: "string",
+        description:
+          "For India, one delivery-eligible Indian merchant slug or name chosen from learned family preferences and merchant personas. Omit for other countries, where Trakko searches the global UCP catalogue with an exact shipping-country filter.",
+      },
       limit: {
         type: "integer",
-        description: "Page size. Trakko returns at most 50 image-backed products.",
+        description: "Page size. Trakko returns at most 10 image-backed products per requested item.",
       },
       offset: {
         type: "integer",
-        description: "Zero-based result offset. Use 50 when the user asks to show 50 more.",
+        description: "Zero-based result offset. Use 10, 20, and so on when the user asks to show more.",
       },
       market: {
         type: "string",
-        enum: ["IN", "US"],
-        description: "Delivery market derived from the selected saved address.",
+        pattern: "^[A-Z]{2}$",
+        description:
+          "ISO 3166-1 alpha-2 delivery country derived from the selected saved address.",
       },
     },
     required: ["query"],
@@ -129,7 +135,6 @@ function routeAuth(pattern) {
     pattern === "/api/config" ||
     pattern === "/api/auth/signup" ||
     pattern === "/api/auth/signup/verify" ||
-    pattern === "/api/auth/clerk/session" ||
     pattern === "/api/auth/login" ||
     pattern === "/api/auth/logout" ||
     pattern === "/api/payments/return" ||
@@ -179,14 +184,7 @@ function matchRoute(method, url) {
     let matches = true;
     for (let index = 0; index < patternParts.length; index += 1) {
       if (patternParts[index].startsWith(":")) {
-        try {
-          params[patternParts[index].slice(1)] = decodeURIComponent(urlParts[index]);
-        } catch {
-          // A malformed percent-encoding must not throw out of the router and
-          // hang the request; treat it as a non-match so routing returns 404.
-          matches = false;
-          break;
-        }
+        params[patternParts[index].slice(1)] = decodeURIComponent(urlParts[index]);
       } else if (patternParts[index] !== urlParts[index]) {
         matches = false;
         break;
@@ -207,14 +205,20 @@ function readRawBody(req) {
   }
   return new Promise((resolve, reject) => {
     let body = "";
+    let tooLarge = false;
     req.on("data", (chunk) => {
+      if (tooLarge) return;
       body += chunk;
-      if (Buffer.byteLength(body) > 1_000_000) {
-        reject(Object.assign(new Error("Request body is too large"), { status: 413 }));
-        req.destroy();
+      if (Buffer.byteLength(body) > 4_000_000) {
+        tooLarge = true;
+        body = "";
       }
     });
     req.on("end", () => {
+      if (tooLarge) {
+        reject(Object.assign(new Error("Request body is too large"), { status: 413 }));
+        return;
+      }
       req.rawBody = body;
       resolve(body);
     });
@@ -304,14 +308,13 @@ function publicFamilyAddress(address) {
     countryCode: address.country_code || "IN",
     contactName: address.contact_name || null,
     contactPhone: address.contact_phone || null,
-    memberIds: (address.member_ids || []).map(String),
     selected: address.is_selected === true,
     createdAt: address.created_at || null,
     updatedAt: address.updated_at || null,
   };
 }
 
-function familyAddressInput(value = {}, { requireContact = false } = {}) {
+function familyAddressInput(value = {}) {
   const field = (key, max = 300) => {
     const result = String(value[key] || "").trim();
     return result ? result.slice(0, max) : null;
@@ -347,16 +350,6 @@ function familyAddressInput(value = {}, { requireContact = false } = {}) {
       status: 400,
     });
   }
-  const contactName = field("contactName", 160);
-  const contactPhone = value.contactPhone || value.contactNumber
-    ? validation.e164(value.contactPhone || value.contactNumber, "contactPhone")
-    : null;
-  if (requireContact && (!contactName || !contactPhone)) {
-    throw Object.assign(
-      new Error("A delivery contact name and phone number are required"),
-      { status: 400 }
-    );
-  }
   return {
     label,
     formattedAddress,
@@ -366,8 +359,10 @@ function familyAddressInput(value = {}, { requireContact = false } = {}) {
     state,
     postalCode,
     countryCode,
-    contactName,
-    contactPhone,
+    contactName: field("contactName", 160),
+    contactPhone: value.contactPhone || value.contactNumber
+      ? validation.e164(value.contactPhone || value.contactNumber, "contactPhone")
+      : null,
   };
 }
 
@@ -379,226 +374,349 @@ function familyAddressPayload(rows) {
   };
 }
 
-const CARE_APPROVAL_MODES = new Set(["ask_every_time", "auto_essentials"]);
-const CARE_CATEGORIES = new Set([
-  "medicines",
-  "wellness",
-  "personal_care",
-  "devices",
-  "nutrition",
-]);
-
-function optionalMoney(value, field) {
-  if (value === undefined || value === null || value === "") return null;
-  const amount = Number(value);
-  if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
-    throw Object.assign(new Error(`${field} must be between 0 and 1,000,000`), {
-      status: 400,
-    });
-  }
-  return Math.round(amount * 100) / 100;
-}
-
-function careRulesInput(value = {}) {
-  const approvalMode = String(value.approvalMode || "ask_every_time").trim();
-  if (!CARE_APPROVAL_MODES.has(approvalMode)) {
-    throw Object.assign(new Error("Choose a valid purchase approval mode"), {
-      status: 400,
-    });
-  }
-  const currency = String(value.currency || "INR").trim().toUpperCase();
-  if (!/^[A-Z]{3}$/.test(currency)) {
-    throw Object.assign(new Error("currency must use a three-letter code"), {
-      status: 400,
-    });
-  }
-  const monthlyCap = optionalMoney(value.monthlyCap, "monthlyCap");
-  const perOrderCap = optionalMoney(value.perOrderCap, "perOrderCap");
-  if (approvalMode === "auto_essentials" && (!monthlyCap || !perOrderCap)) {
-    throw Object.assign(
-      new Error("Automatic essentials need both monthly and per-order limits"),
-      { status: 400 }
-    );
-  }
-  if (monthlyCap && perOrderCap && perOrderCap > monthlyCap) {
-    throw Object.assign(
-      new Error("The per-order limit cannot exceed the monthly limit"),
-      { status: 400 }
-    );
-  }
-  const allowedCategories = [...new Set(
-    (Array.isArray(value.allowedCategories) ? value.allowedCategories : [])
-      .map((item) => String(item).trim().toLowerCase())
-      .filter((item) => CARE_CATEGORIES.has(item))
-  )];
-  const blockedItems = [...new Set(
-    (Array.isArray(value.blockedItems) ? value.blockedItems : [])
-      .map((item) => String(item).trim().slice(0, 80))
-      .filter(Boolean)
-  )].slice(0, 30);
-  if (approvalMode === "auto_essentials" && allowedCategories.length === 0) {
-    throw Object.assign(
-      new Error("Choose at least one category for automatic essentials"),
-      { status: 400 }
-    );
-  }
-  return {
-    approvalMode,
-    monthlyCap: approvalMode === "auto_essentials" ? monthlyCap : null,
-    perOrderCap: approvalMode === "auto_essentials" ? perOrderCap : null,
-    currency,
-    repeatKnownEssentials:
-      approvalMode === "auto_essentials" && value.repeatKnownEssentials === true,
-    allowedCategories:
-      approvalMode === "auto_essentials" ? allowedCategories : [],
-    blockedItems,
-  };
-}
-
-function publicCareRules(rules) {
-  if (!rules) return null;
-  const numberOrNull = (value) =>
-    value === null || value === undefined ? null : Number(value);
-  return {
-    approvalMode: rules.approval_mode,
-    monthlyCap: numberOrNull(rules.monthly_cap),
-    perOrderCap: numberOrNull(rules.per_order_cap),
-    currency: rules.currency || "INR",
-    repeatKnownEssentials: rules.repeat_known_essentials === true,
-    allowedCategories: rules.allowed_categories || [],
-    blockedItems: rules.blocked_items || [],
-    updatedAt: rules.updated_at || null,
-  };
-}
-
-function preferenceInput(value = {}, current = null) {
-  const pick = (key, column, fallback) =>
-    typeof value[key] === "boolean" ? value[key] : current?.[column] ?? fallback;
-  return {
-    decisionAlerts: pick("decisionAlerts", "decision_alerts", true),
-    deliveryUpdates: pick("deliveryUpdates", "delivery_updates", true),
-    weeklyDigest: pick("weeklyDigest", "weekly_digest", false),
-  };
-}
-
-function publicPreferences(preferences) {
-  const values = preferenceInput({}, preferences);
-  return {
-    ...values,
-    updatedAt: preferences?.updated_at || null,
-  };
-}
-
-function decisionRequestInput(value = {}) {
-  const requiredText = (key, max) => {
-    const text = String(value[key] || "").trim();
-    if (!text) {
-      throw Object.assign(new Error(`${key} is required`), { status: 400 });
-    }
-    return text.slice(0, max);
-  };
-  const optionalText = (key, max) => {
-    const text = String(value[key] || "").trim();
-    return text ? text.slice(0, max) : null;
-  };
-  const requestType = String(value.requestType || "purchase_approval").trim();
-  if (!new Set([
-    "purchase_approval",
-    "substitution",
-    "address_confirmation",
-    "safety_stop",
-  ]).has(requestType)) {
-    throw Object.assign(new Error("requestType is invalid"), { status: 400 });
-  }
-  const numericId = (key) => {
-    if (value[key] === undefined || value[key] === null || value[key] === "") {
-      return null;
-    }
-    const id = Number(value[key]);
-    if (!Number.isSafeInteger(id) || id <= 0) {
-      throw Object.assign(new Error(`${key} is invalid`), { status: 400 });
-    }
-    return id;
-  };
-  const amount = optionalMoney(value.amount, "amount");
-  const currency = String(value.currency || "INR").trim().toUpperCase();
-  if (!/^[A-Z]{3}$/.test(currency)) {
-    throw Object.assign(new Error("currency must use a three-letter code"), {
-      status: 400,
-    });
-  }
-  let expiresAt = null;
-  if (value.expiresAt) {
-    const parsed = new Date(value.expiresAt);
-    if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
-      throw Object.assign(new Error("expiresAt must be in the future"), {
-        status: 400,
+function ucpCartPayload(items) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const byMerchant = new Map();
+  for (const item of safeItems) {
+    const merchant = String(item.merchant || "unknown");
+    if (!byMerchant.has(merchant)) {
+      byMerchant.set(merchant, {
+        merchant,
+        merchantName: item.merchantName || merchant,
+        items: [],
+        subtotals: {},
       });
     }
-    expiresAt = parsed.toISOString();
+    const group = byMerchant.get(merchant);
+    group.items.push(item);
+    const currency = String(item.currency || "INR").toUpperCase();
+    group.subtotals[currency] = (group.subtotals[currency] || 0)
+      + Number(item.priceMinor || 0) * Number(item.quantity || 1);
   }
-  const jsonObject = (key) =>
-    value[key] && typeof value[key] === "object" && !Array.isArray(value[key])
-      ? value[key]
-      : {};
+  const merchantGroups = [...byMerchant.values()].map((group) => ({
+    ...group,
+    subtotals: Object.entries(group.subtotals).map(([currency, amountMinor]) => ({
+      currency,
+      amountMinor,
+      amount: (amountMinor / 100).toFixed(2),
+    })),
+  }));
   return {
-    id: nodeCrypto.randomUUID(),
-    memberId: numericId("memberId"),
-    addressId: numericId("addressId"),
-    requestType,
-    title: requiredText("title", 180),
-    originalRequest: optionalText("originalRequest", 1_000),
-    merchantName: optionalText("merchantName", 160),
-    product: jsonObject("product"),
-    amount,
-    currency,
-    reasonCode: optionalText("reasonCode", 60),
-    reasonText: requiredText("reasonText", 1_000),
-    paymentContext: jsonObject("paymentContext"),
-    actionContext: jsonObject("actionContext"),
-    expiresAt,
+    itemCount: safeItems.reduce((sum, item) => sum + Number(item.quantity || 0), 0),
+    merchantCount: merchantGroups.length,
+    items: safeItems,
+    merchantGroups,
+    lockedMerchant: merchantGroups[0]?.merchant || null,
+    lockedMerchantName: merchantGroups[0]?.merchantName || null,
+    checkoutPolicy: "single_merchant_only",
+    requiresCartRepair: merchantGroups.length > 1,
   };
 }
 
-function publicDecision(decision) {
-  if (!decision) return null;
+function ucpCartCountryConflict(items, targetCountry) {
+  const safeItems = Array.isArray(items) ? items : [];
+  const requestedCountry = String(targetCountry || "").trim().toUpperCase();
+  if (!safeItems.length || !/^[A-Z]{2}$/.test(requestedCountry)) return null;
+
+  const markets = [...new Set(safeItems.map((item) => {
+    const snapshotMarket = String(item?.market || "").trim().toUpperCase();
+    if (/^[A-Z]{2}$/.test(snapshotMarket)) return snapshotMarket;
+    const merchantMarket = String(
+      ucp.MERCHANTS[String(item?.merchant || "").trim()]?.market || ""
+    ).trim().toUpperCase();
+    if (/^[A-Z]{2}$/.test(merchantMarket)) return merchantMarket;
+    const currency = String(item?.currency || "").trim().toUpperCase();
+    if (currency === "INR") return "IN";
+    if (currency === "USD") return "US";
+    return null;
+  }).filter(Boolean))];
+  const incompatibleMarkets = markets.filter((market) => market !== requestedCountry);
+  if (!incompatibleMarkets.length) return null;
+
+  const cart = ucpCartPayload(safeItems);
   return {
-    id: decision.id,
-    memberId: decision.member_id ? String(decision.member_id) : null,
-    memberName: decision.member_name || null,
-    requestType: decision.request_type,
-    status: decision.status,
-    title: decision.title,
-    originalRequest: decision.original_request || null,
-    merchantName: decision.merchant_name || null,
-    product: decision.product || {},
-    amount: decision.amount === null ? null : Number(decision.amount),
-    currency: decision.currency,
-    addressId: decision.address_id ? String(decision.address_id) : null,
-    addressLabel: decision.address_label || null,
-    formattedAddress: decision.formatted_address || null,
-    reasonCode: decision.reason_code || null,
-    reasonText: decision.reason_text,
-    resolution: decision.resolution || null,
-    resolutionNote: decision.resolution_note || null,
-    expiresAt: decision.expires_at || null,
-    resolvedAt: decision.resolved_at || null,
-    createdAt: decision.created_at,
-    updatedAt: decision.updated_at,
+    code: "cart_delivery_country_conflict",
+    targetCountry: requestedCountry,
+    cartCountry: incompatibleMarkets[0],
+    currentMerchant: cart.lockedMerchant,
+    currentMerchantName: cart.lockedMerchantName,
+    itemCount: cart.itemCount,
+    cart,
   };
 }
 
-function publicActivity(event) {
+function cartCountryConflictMessage(conflict) {
+  const merchant = conflict?.currentMerchantName || "your current merchant";
+  return `Your cart from ${merchant} is for ${conflict?.cartCountry || "another country"}, but this delivery address is in ${conflict?.targetCountry || "a different country"}. Clear the current cart before switching countries.`;
+}
+
+async function selectFamilyAddressWithCartPolicy(
+  userId,
+  addressId,
+  { replaceCart = false } = {}
+) {
+  const addresses = await db.getFamilyAddresses(userId);
+  const target = addresses.find((address) => String(address.id) === String(addressId));
+  if (!target) return null;
+  const cart = await db.getUcpCart(userId);
+  const conflict = ucpCartCountryConflict(cart, target.country_code);
+  if (conflict && !replaceCart) {
+    throw Object.assign(new Error(cartCountryConflictMessage(conflict)), {
+      status: 409,
+      code: conflict.code,
+      conflict,
+    });
+  }
+  if (conflict) await db.clearUcpCart(userId);
+  const selected = await db.selectFamilyAddress(userId, addressId);
   return {
-    id: String(event.id),
-    eventType: event.event_type,
-    title: event.title,
-    detail: event.detail || null,
-    entityType: event.entity_type || null,
-    entityId: event.entity_id || null,
-    metadata: event.metadata || {},
-    createdAt: event.created_at,
+    selected,
+    cartCleared: Boolean(conflict),
+    conflict,
   };
+}
+
+function latestUserMessageText(messages) {
+  const message = [...(Array.isArray(messages) ? messages : [])]
+    .reverse()
+    .find((entry) => entry?.role === "user" && entry?.content);
+  return String(message?.content || "").trim();
+}
+
+function normalizedCartWords(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\b(?:please|the|a|an|my|from|out|of|cart|item|product)\b/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function requestedCartAction(messages, items) {
+  const text = latestUserMessageText(messages);
+  const compact = text.toLowerCase().replace(/\s+/g, " ").trim();
+  if (!compact) return null;
+  if (/^(?:\/cart|show (?:me )?(?:my )?cart|view (?:my )?cart|what(?:'s| is) in (?:my )?cart|my cart)$/i.test(compact)) {
+    return { type: "show" };
+  }
+  if (/^(?:\/emptycart|empty (?:my )?cart|clear (?:my )?cart|remove (?:all|everything)(?: from (?:my )?cart)?|delete (?:all|everything)(?: from (?:my )?cart)?)$/i.test(compact)) {
+    return { type: "clear" };
+  }
+  const removal = compact.match(
+    /^(?:remove|delete)\s+(.+?)(?:\s+from\s+(?:my\s+)?cart)?$/i
+  ) || compact.match(
+    /^take\s+(.+?)\s+out\s+of\s+(?:my\s+)?cart$/i
+  );
+  if (!removal) return null;
+  const requested = normalizedCartWords(removal[1]);
+  if (!requested) return { type: "remove", item: null };
+  const numbered = requested.match(/^(?:number\s+)?(\d+)$/i);
+  if (numbered) {
+    return {
+      type: "remove",
+      item: items[Number(numbered[1]) - 1] || null,
+    };
+  }
+  const requestedWords = new Set(requested.split(" ").filter(Boolean));
+  const ranked = (Array.isArray(items) ? items : []).map((item) => {
+    const name = normalizedCartWords(
+      `${item.productName || ""} ${item.variantName || ""}`
+    );
+    const nameWords = new Set(name.split(" ").filter(Boolean));
+    const overlap = [...requestedWords].filter((word) => nameWords.has(word)).length;
+    return {
+      item,
+      score: name === requested ? 1000 : name.includes(requested) ? 500 : overlap,
+    };
+  }).sort((left, right) => right.score - left.score);
+  if (!ranked[0]?.score || ranked[0].score === ranked[1]?.score) {
+    return { type: "remove", item: null };
+  }
+  return { type: "remove", item: ranked[0].item };
+}
+
+async function handleRequestedCartAction(userId, messages, items) {
+  const action = requestedCartAction(messages, items);
+  if (!action) return null;
+  if (action.type === "show") {
+    return {
+      message: items.length
+        ? "here is your current cart. you can remove an item or empty the cart."
+        : "your cart is empty.",
+      tools: [],
+      cartSummary: ucpCartPayload(items),
+    };
+  }
+  if (action.type === "clear") {
+    const removedCount = await db.clearUcpCart(userId);
+    return {
+      message: removedCount
+        ? `done, i emptied the cart and removed ${removedCount} item${removedCount === 1 ? "" : "s"}.`
+        : "your cart was already empty.",
+      tools: [{ name: "empty_wellness_cart", status: "completed" }],
+      cartSummary: ucpCartPayload([]),
+    };
+  }
+  if (!action.item) {
+    return {
+      message: items.length
+        ? "i could not tell which cart item you meant. choose remove beside the item below."
+        : "your cart is empty.",
+      tools: [],
+      cartSummary: ucpCartPayload(items),
+    };
+  }
+  const removed = await db.removeUcpCartItem(userId, action.item.id);
+  const remaining = await db.getUcpCart(userId);
+  return {
+    message: removed
+      ? `removed ${removed.productName || "that item"} from your cart.`
+      : "that cart item was already removed.",
+    tools: [{ name: "remove_wellness_cart_item", status: "completed" }],
+    cartSummary: ucpCartPayload(remaining),
+  };
+}
+
+function searchUcpForMarket(body = {}) {
+  const market = String(body.market || "").trim().toUpperCase();
+  if (market && market !== "IN") {
+    return ucp.searchGlobalMarket(body.query, {
+      limit: body.limit,
+      offset: body.offset,
+      market,
+      merchant: body.merchant,
+      baseUrl: BASE_URL,
+    });
+  }
+  return ucp.searchAll(body.query, {
+    limit: body.limit,
+    offset: body.offset,
+    market,
+    merchant: body.merchant,
+    baseUrl: BASE_URL,
+  });
+}
+
+function rankUcpProducts(products, memories = []) {
+  const preferenceText = (Array.isArray(memories) ? memories : [])
+    .filter((memory) => [
+      "checkout_preference", "successful_wellness_search", "product_preferences",
+    ].includes(memory.type))
+    .map((memory) => `${memory.cue || ""} ${JSON.stringify(memory.value || {})}`)
+    .join(" ")
+    .toLowerCase();
+  const scored = (Array.isArray(products) ? products : []).map((product, index) => {
+    const words = [product.merchantName, product.productName, product.variantName]
+      .join(" ")
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((word) => word.length >= 4);
+    const preferenceHits = [...new Set(words)].filter((word) =>
+      preferenceText.includes(word)
+    ).length;
+    const rating = Number(product.rating);
+    const hasRating = Number.isFinite(rating) && rating > 0;
+    return {
+      product: {
+        ...product,
+        rankingReasons: [
+          ...(preferenceHits ? ["matches family order history or preference"] : []),
+          ...(hasRating ? [`merchant rating ${rating.toFixed(1)}`] : []),
+          "lower live price used as tie-breaker",
+        ],
+      },
+      preferenceHits,
+      rating: hasRating ? rating : 0,
+      index,
+    };
+  });
+  scored.sort((left, right) => {
+    if (left.product.available !== right.product.available) {
+      return left.product.available ? -1 : 1;
+    }
+    if (left.preferenceHits !== right.preferenceHits) {
+      return right.preferenceHits - left.preferenceHits;
+    }
+    if (left.rating !== right.rating) return right.rating - left.rating;
+    const priceDifference = Number(left.product.priceMinor) - Number(right.product.priceMinor);
+    return priceDifference || left.index - right.index;
+  });
+  return scored.map((entry) => entry.product);
+}
+
+async function selectedDeliveryCountryForUser(userId) {
+  const addresses = await db.getFamilyAddresses(userId);
+  const selected = addresses.find((address) => address.is_selected) || null;
+  if (!selected) {
+    throw Object.assign(
+      new Error("Select a delivery address before searching or checking out"),
+      { status: 409 }
+    );
+  }
+  const countryCode = String(selected.country_code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(countryCode)) {
+    throw Object.assign(
+      new Error("The selected address needs a valid two-letter country code"),
+      { status: 409 }
+    );
+  }
+  return { countryCode, selectedAddress: selected };
+}
+
+async function searchUcpForSelectedAddress(userId, body = {}) {
+  const { countryCode } = await selectedDeliveryCountryForUser(userId);
+  const [cart, memories] = await Promise.all([
+    db.getUcpCart(userId),
+    db.getHermesMemories(userId),
+  ]);
+  const conflict = ucpCartCountryConflict(cart, countryCode);
+  if (conflict) {
+    throw Object.assign(new Error(cartCountryConflictMessage(conflict)), {
+      status: 409,
+      code: conflict.code,
+      conflict,
+    });
+  }
+  const lockedMerchant = cart[0]?.merchant || null;
+  const result = await searchUcpForMarket({
+    ...body,
+    market: countryCode,
+    ...(lockedMerchant ? { merchant: lockedMerchant } : {}),
+  });
+  result.products = rankUcpProducts(result.products, memories);
+  result.ranking = {
+    policy: "availability_then_family_preference_then_live_rating_then_lowest_price",
+    qualitySignal: result.products.some((product) => Number(product.rating) > 0)
+      ? "merchant_rating"
+      : "not_returned_by_merchant",
+  };
+  result.lockedMerchant = lockedMerchant;
+  return result;
+}
+
+async function rememberUcpCheckout(userId, checkoutResult) {
+  const products = (Array.isArray(checkoutResult?.items)
+    ? checkoutResult.items.map((item) => item.productName)
+    : [checkoutResult?.productName])
+    .map((value) => String(value || "").trim())
+    .filter(Boolean)
+    .slice(0, 20);
+  const merchant = String(
+    checkoutResult?.merchantName || checkoutResult?.merchant || ""
+  ).trim();
+  if (!merchant && !products.length) return;
+  await db.upsertHermesMemory(userId, {
+    type: "checkout_preference",
+    cue: products.join(", ").toLocaleLowerCase("en-IN").slice(0, 500)
+      || `checkout at ${merchant}`,
+    value: {
+      merchant,
+      merchantSlug: checkoutResult?.merchant || null,
+      products,
+      checkoutStatus: checkoutResult?.status || null,
+    },
+    confidence: 0.8,
+  });
 }
 
 async function createBrowserSession(req, res, user, status = 200) {
@@ -734,6 +852,24 @@ function canonicalPravaCustomerId(userId) {
   return `tokko_family_${id}`;
 }
 
+function legacyPravaCustomerId(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(new Error("A valid family user ID is required"), {
+      status: 400,
+    });
+  }
+  return `tokko_user_${id}`;
+}
+
+function pravaCustomerIdCandidates(userId, currentCustomerId) {
+  return [...new Set([
+    String(currentCustomerId || "").trim(),
+    canonicalPravaCustomerId(userId),
+    legacyPravaCustomerId(userId),
+  ].filter(Boolean))];
+}
+
 async function getOrCreateFamilyPaymentCustomer(userId) {
   const existing = await db.getPaymentCustomer(userId);
   if (existing) return existing;
@@ -754,11 +890,7 @@ function parseOnboardingId(value) {
 
 async function resolveOnboardingUserId(value) {
   if (/^[1-9]\d*$/.test(String(value || ""))) {
-    const id = parseOnboardingId(value);
-    if (!(await db.getUserById(id))) {
-      throw Object.assign(new Error("Onboarding not found"), { status: 404 });
-    }
-    return id;
+    return parseOnboardingId(value);
   }
   const phone = validation.e164(value, "family phone");
   const matches = await db.getFamilyUsersByPhone(phone);
@@ -1027,11 +1159,24 @@ function telegramBotUsername(value) {
   return username;
 }
 
+function pravaCallbackIdentifier(value) {
+  const id = String(value || "").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id)) {
+    throw Object.assign(new Error("A valid Prava callback ID is required"), {
+      status: 400,
+    });
+  }
+  return id.toLowerCase();
+}
+
 function pravaReturnCallback(flow, returnContext = {}) {
   const type = flow === "mandate" ? "mandate" : "card";
+  const callbackId = returnContext?.callbackId
+    ? pravaCallbackIdentifier(returnContext.callbackId)
+    : null;
   const callbackBase = BASE_URL.startsWith("https://")
     ? BASE_URL
-    : process.env.PRAVA_MERCHANT_URL || "https://tokko-drab.vercel.app";
+    : process.env.PRAVA_MERCHANT_URL || "https://zepto-shop.vercel.app";
   if (returnContext?.channel === "telegram") {
     const callbackUrl = new URL("/api/payments/return", callbackBase);
     callbackUrl.searchParams.set("channel", "telegram");
@@ -1040,6 +1185,10 @@ function pravaReturnCallback(flow, returnContext = {}) {
       telegramBotUsername(returnContext.botUsername)
     );
     callbackUrl.searchParams.set("flow", type);
+    if (callbackId) callbackUrl.searchParams.set("callback", callbackId);
+    if (/^[0-9a-f-]{36}$/i.test(String(returnContext.orderId || ""))) {
+      callbackUrl.searchParams.set("order", String(returnContext.orderId));
+    }
     return callbackUrl.toString();
   }
 
@@ -1048,6 +1197,14 @@ function pravaReturnCallback(flow, returnContext = {}) {
     type === "mandate" ? "pravaMandate" : "pravaCard",
     "return"
   );
+  if (callbackId) callbackUrl.searchParams.set("pravaCallback", callbackId);
+  if (/^[0-9a-f-]{36}$/i.test(String(returnContext.orderId || ""))) {
+    callbackUrl.searchParams.set("ucpOrder", String(returnContext.orderId));
+  }
+  const returnPage = String(returnContext.page || "").trim().toLowerCase();
+  if (["assistant", "card", "mandates"].includes(returnPage)) {
+    callbackUrl.searchParams.set("pravaReturnPage", returnPage);
+  }
   return callbackUrl.toString();
 }
 
@@ -1071,7 +1228,7 @@ async function createTokenizationSessionForUser(userId, input = {}) {
     process.env.PRAVA_MERCHANT_URL ||
     (BASE_URL.startsWith("https://")
       ? BASE_URL
-      : "https://tokko-drab.vercel.app");
+      : "https://zepto-shop.vercel.app");
   const callbackUrl = pravaReturnCallback("card", input.returnContext);
   const session = await payments.createTokenizationSession({
     customerId: providerCustomerId,
@@ -1150,6 +1307,72 @@ async function pravaMandateIdentity(userId) {
   };
 }
 
+async function listPravaMandatesForUser(
+  userId,
+  customerId,
+  { allowCached = false } = {}
+) {
+  try {
+    const settled = await Promise.allSettled(
+      pravaCustomerIdCandidates(userId, customerId).map((candidate) =>
+        payments.listMandates(candidate)
+      )
+    );
+    const successful = settled.filter((result) => result.status === "fulfilled");
+    const rejected = settled.filter((result) => result.status === "rejected");
+    if (!successful.length) {
+      throw rejected[0]?.reason
+        || Object.assign(new Error("Prava mandate list is unavailable"), { status: 502 });
+    }
+    const mandates = [...new Map(
+      successful
+        .flatMap((result) => result.value || [])
+        .filter((mandate) => mandate?.id)
+        .map((mandate) => [String(mandate.id), mandate])
+    ).values()];
+    if (!mandates.length && rejected.length) throw rejected[0].reason;
+    if (mandates.length) {
+      if (allowCached) {
+        await db.savePravaMandateSnapshot(userId, customerId, mandates);
+      }
+      return {
+        mandates,
+        source: "prava",
+        stale: false,
+        fetchedAt: null,
+        warning: rejected.length
+          ? "Some historical Prava customer aliases could not be refreshed; active mandates returned by the available aliases are shown."
+          : null,
+      };
+    }
+    if (allowCached) {
+      const cached = await db.getPravaMandateSnapshot(userId, customerId);
+      if (Array.isArray(cached?.mandates) && cached.mandates.length) {
+        return {
+          mandates: cached.mandates,
+          source: "cache",
+          stale: true,
+          fetchedAt: cached.fetched_at,
+          warning:
+            "Prava returned an empty list, so Tokko is showing the last successful mandate snapshot.",
+        };
+      }
+    }
+    return { mandates, source: "prava", stale: false, fetchedAt: null };
+  } catch (error) {
+    if (!allowCached) throw error;
+    const cached = await db.getPravaMandateSnapshot(userId, customerId);
+    if (!Array.isArray(cached?.mandates) || !cached.mandates.length) throw error;
+    return {
+      mandates: cached.mandates,
+      source: "cache",
+      stale: true,
+      fetchedAt: cached.fetched_at,
+      warning: `Prava mandate refresh failed, so Tokko is showing the last successful snapshot: ${error.message}`,
+    };
+  }
+}
+
 async function createPravaMandateForUser(userId, input) {
   const [{ email, customerId }, methods] = await Promise.all([
     pravaMandateIdentity(userId),
@@ -1163,15 +1386,185 @@ async function createPravaMandateForUser(userId, input) {
       status: 404,
     });
   }
-  const callbackUrl = pravaReturnCallback("mandate", input.returnContext);
-  return payments.createMandateSession({
+  const callbackId = nodeCrypto.randomUUID();
+  const returnContext = {
+    ...(input.returnContext || {}),
+    callbackId,
+  };
+  const callbackUrl = pravaReturnCallback("mandate", returnContext);
+  const existingMandates = await listPravaMandatesForUser(
+    userId,
+    customerId,
+    { allowCached: true }
+  ).then((result) => result.mandates).catch(() => []);
+  const session = await payments.createMandateSession({
     customerId,
     email,
     cardId: selected.provider_payment_method_id,
     amount: input.amount,
     frequency: input.frequency,
     callbackUrl,
+    currency: input.currency,
+    purchaseContext: input.purchaseContext,
+    externalOrderRef: input.externalOrderRef,
+    description: input.description,
   });
+  await db.savePravaMandateCallback({
+    callbackId,
+    userId,
+    customerId,
+    sessionId: session.sessionId,
+    amount: session.amount,
+    currency: session.currency,
+    frequency: session.frequency,
+    preexistingMandateIds: existingMandates.map((mandate) => mandate.id),
+    returnChannel:
+      String(returnContext.channel || "web").trim().toLowerCase() || "web",
+    returnPage: returnContext.page || null,
+    telegramBotUsername: returnContext.botUsername || null,
+    orderId: returnContext.orderId || null,
+  });
+  return { ...session, callbackId };
+}
+
+function activePravaMandate(value) {
+  return (
+    String(value?.status || "").toLowerCase() === "active"
+    || String(value?.state || "").toLowerCase() === "available"
+  );
+}
+
+function mandateCallbackCandidate(record, mandates) {
+  const previous = new Set(
+    Array.isArray(record.preexisting_mandate_ids)
+      ? record.preexisting_mandate_ids.map(String)
+      : []
+  );
+  const amount = Number(record.amount);
+  const createdAfter = new Date(record.created_at).getTime() - 5 * 60 * 1_000;
+  const candidates = (Array.isArray(mandates) ? mandates : [])
+    .filter(activePravaMandate)
+    .filter((mandate) =>
+      String(mandate.currency || "").toUpperCase()
+        === String(record.currency || "").toUpperCase()
+    )
+    .filter((mandate) =>
+      String(mandate.frequency || "one_time").toLowerCase()
+        === String(record.frequency || "one_time").toLowerCase()
+    )
+    .filter((mandate) => {
+      const approved = Number(mandate.approvedAmount);
+      return !Number.isFinite(amount) || !Number.isFinite(approved)
+        ? true
+        : Math.abs(approved - amount) < 0.005;
+    })
+    .sort((left, right) =>
+      new Date(right.createdAt || 0).getTime()
+      - new Date(left.createdAt || 0).getTime()
+    );
+  return (
+    candidates.find((mandate) => !previous.has(String(mandate.id)))
+    || candidates.find((mandate) =>
+      new Date(mandate.createdAt || 0).getTime() >= createdAfter
+    )
+    || null
+  );
+}
+
+async function completePravaMandateCallback(userId, callbackId) {
+  const id = pravaCallbackIdentifier(callbackId);
+  let record = await db.getPravaMandateCallback(userId, id);
+  if (!record) {
+    throw Object.assign(new Error("This Prava mandate callback is invalid or expired"), {
+      status: 404,
+    });
+  }
+  if (payments.configuration().environment !== "sandbox") {
+    throw Object.assign(
+      new Error("Automatic callback token display is enabled only for Prava sandbox"),
+      { status: 409 }
+    );
+  }
+
+  let mandate = null;
+  if (record.mandate_id) {
+    mandate = await payments.getMandate(record.mandate_id);
+  } else {
+    const result = await listPravaMandatesForUser(
+      userId,
+      record.provider_customer_id,
+      { allowCached: false }
+    );
+    mandate = mandateCallbackCandidate(record, result.mandates);
+    if (!mandate) {
+      throw Object.assign(
+        new Error(
+          "Prava has not returned the newly approved active mandate yet. Retry in a moment."
+        ),
+        { status: 409 }
+      );
+    }
+    record = await db.updatePravaMandateCallback(userId, id, {
+      status: "MANDATE_CONFIRMED",
+      mandateId: mandate.id,
+    });
+  }
+
+  if (!activePravaMandate(mandate)) {
+    throw Object.assign(
+      new Error("Prava has not marked this mandate active yet. Retry in a moment."),
+      { status: 409 }
+    );
+  }
+  const configuredChargeAmount = payments.decimalAmount(
+    process.env.PRAVA_MANDATE_CALLBACK_CHARGE_AMOUNT || "1.00",
+    "Prava callback charge amount"
+  );
+  const remaining = Number(mandate.remaining ?? mandate.approvedAmount);
+  if (Number.isFinite(remaining) && remaining < Number(configuredChargeAmount)) {
+    throw Object.assign(
+      new Error("The approved mandate cannot cover the sandbox callback charge"),
+      { status: 409 }
+    );
+  }
+  const reference = `tokko_callback_${id.replaceAll("-", "")}`;
+  try {
+    const charge = await payments.chargeMandate({
+      mandateId: mandate.id,
+      amount: configuredChargeAmount,
+      reference,
+    });
+    await db.updatePravaMandateCallback(userId, id, {
+      status: "CREDENTIAL_ISSUED",
+      mandateId: charge.mandateId,
+      transactionId: charge.transactionId,
+      credentialFingerprint: paymentCredentialFingerprint(charge.credentials),
+      chargeError: null,
+    });
+    return {
+      callbackId: id,
+      status: "credential_issued",
+      chargeAmount: configuredChargeAmount,
+      currency: String(mandate.currency || record.currency || "INR").toUpperCase(),
+      mandate,
+      tokenIssued: true,
+      sandboxPaymentCredential: {
+        mandateId: charge.mandateId,
+        transactionId: charge.transactionId,
+        token: charge.credentials.token,
+        ephemeral: true,
+      },
+      note:
+        "Prava issued this single-use sandbox virtual PAN. Tokko stored only its SHA-256 fingerprint.",
+    };
+  } catch (error) {
+    await db.updatePravaMandateCallback(userId, id, {
+      status: "CHARGE_FAILED",
+      mandateId: mandate.id,
+      chargeError: error.message,
+    });
+    throw error;
+  }
 }
 
 async function completePaymentSetup(userId, sessionId, enrollmentId) {
@@ -1703,14 +2096,10 @@ function usablePravaMandatesForAmount(mandates, amount) {
     );
 }
 
-function merchantIdentityMatches(mandate, merchantName, merchantUrl, namesEchoed = false) {
+function merchantIdentityMatches(mandate, merchantName, merchantUrl) {
   if (String(mandate?.merchantScope || "").toLowerCase() === "any") return true;
   const configured = String(mandate?.merchantName || "").trim().toLowerCase();
-  // A mandate with no merchant identity used to match every merchant. Keep that
-  // permissive fallback only when the provider is not echoing merchant names at
-  // all; once any mandate in the set carries a name, a nameless one is an
-  // anomaly and must not be charged against an arbitrary merchant.
-  if (!configured) return namesEchoed ? false : true;
+  if (!configured) return true;
   const requestedName = String(merchantName || "").trim().toLowerCase();
   let requestedHost = "";
   try {
@@ -1728,13 +2117,15 @@ function merchantIdentityMatches(mandate, merchantName, merchantUrl, namesEchoed
   );
 }
 
-function usablePravaMandatesForMerchant(mandates, amount, merchantName, merchantUrl) {
-  const list = Array.isArray(mandates) ? mandates : [];
+function usablePravaMandatesForMerchant(
+  mandates,
+  amount,
+  merchantName,
+  merchantUrl,
+  currency = "INR"
+) {
   const amountValue = Number(amount);
-  const namesEchoed = list.some(
-    (mandate) => String(mandate?.merchantName || "").trim() !== ""
-  );
-  return list
+  return (Array.isArray(mandates) ? mandates : [])
     .filter((mandate) => {
       const remaining = Number(mandate.remaining ?? mandate.approvedAmount);
       const active =
@@ -1742,10 +2133,11 @@ function usablePravaMandatesForMerchant(mandates, amount, merchantName, merchant
         || String(mandate.state || "").toLowerCase() === "available";
       return (
         active
-        && String(mandate.currency || "").toUpperCase() === "INR"
+        && String(mandate.currency || "").toUpperCase()
+          === String(currency || "INR").toUpperCase()
         && Number.isFinite(remaining)
         && remaining >= amountValue
-        && merchantIdentityMatches(mandate, merchantName, merchantUrl, namesEchoed)
+        && merchantIdentityMatches(mandate, merchantName, merchantUrl)
       );
     })
     .sort(
@@ -1756,8 +2148,29 @@ function usablePravaMandatesForMerchant(mandates, amount, merchantName, merchant
 }
 
 function ucpPurchaseContext(checkoutResult) {
-  const quantity = Math.max(1, Math.round(Number(checkoutResult.quantity || 1)));
-  const resolvedUnitPrice = Number(checkoutResult.totalAmount || 0) / quantity;
+  const totalAmount = Number(checkoutResult.totalAmount || 0).toFixed(2);
+  const items = Array.isArray(checkoutResult.items)
+    ? checkoutResult.items
+    : [];
+  const itemNames = items
+    .map((item) => String(item?.productName || item?.variantName || "").trim())
+    .filter(Boolean);
+  const itemCount = items.reduce(
+    (sum, item) => sum + Math.max(1, Math.round(Number(item?.quantity || 1))),
+    0
+  );
+  const merchantName = String(
+    checkoutResult.merchantName || "UCP merchant"
+  ).trim().slice(0, 200);
+  const listedItems = itemNames.slice(0, 3).join(", ");
+  const extraItems = itemNames.length > 3
+    ? ` and ${itemNames.length - 3} more`
+    : "";
+  const description = (
+    listedItems
+      ? `${listedItems}${extraItems}; merchant quote total including charges`
+      : `${merchantName} order${itemCount ? ` (${itemCount} item${itemCount === 1 ? "" : "s"})` : ""}; merchant quote total including charges`
+  ).slice(0, 200);
   const productId = nodeCrypto
     .createHash("sha256")
     .update(String(checkoutResult.variantId || checkoutResult.checkoutId || "ucp-product"))
@@ -1765,18 +2178,18 @@ function ucpPurchaseContext(checkoutResult) {
     .slice(0, 40);
   return [{
     merchant_details: {
-      name: String(checkoutResult.merchantName || "UCP merchant").slice(0, 200),
+      name: merchantName,
       url: checkoutResult.merchantUrl,
-      country_code_iso2: "IN",
+      country_code_iso2: String(checkoutResult.market || "IN").toUpperCase(),
     },
     product_details: [{
-      description: [checkoutResult.productName, checkoutResult.variantName]
-        .filter(Boolean)
-        .join(" - ")
-        .slice(0, 200),
-      unit_price: resolvedUnitPrice.toFixed(2),
+      description,
+      // Prava requires total_amount to exactly equal unit_price x quantity.
+      // The merchant quote can include shipping, tax, discounts, and fees, so
+      // represent the binding checkout total as one order-level line.
+      unit_price: totalAmount,
       product_id: `ucp_${productId}`,
-      quantity,
+      quantity: 1,
     }],
   }];
 }
@@ -2054,13 +2467,28 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
     db.getFamilyAddresses(userId),
   ]);
   const selectedAddress = addresses.find((address) => address.is_selected) || null;
+  const selectedCountry = String(
+    selectedAddress?.country_code || ""
+  ).trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(selectedCountry)) {
+    throw Object.assign(
+      new Error("Select a delivery address with a valid two-letter country code"),
+      { status: 409 }
+    );
+  }
   const checkoutIdentity = ucpCheckoutIdentity(user, profile, selectedAddress);
-  const checkoutResult = await ucp.createCheckout(input.selectionToken, {
-    quantity: input.quantity,
+  const checkoutOptions = {
     baseUrl: BASE_URL,
     buyer: checkoutIdentity.buyer,
     destination: checkoutIdentity.destination,
-  });
+    deliveryCountry: selectedCountry,
+  };
+  const checkoutResult = Array.isArray(input.cartItems)
+    ? await ucp.createCheckoutFromSelections(input.cartItems, checkoutOptions)
+    : await ucp.createCheckout(input.selectionToken, {
+        ...checkoutOptions,
+        quantity: input.quantity,
+      });
   const merchantHandoffUrl = checkoutResult.continueUrl;
   const baseResult = {
     ...checkoutResult,
@@ -2113,7 +2541,10 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
   }
   let mandates;
   try {
-    mandates = await payments.listMandates(identity.customerId);
+    mandates = (await listPravaMandatesForUser(
+      userId,
+      identity.customerId
+    )).mandates;
   } catch (error) {
     return ucpSavedCardResult(
       userId,
@@ -2123,36 +2554,6 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
         checked: true,
         status: "check_failed",
         message: error.message,
-      },
-      savedCards
-    );
-  }
-  const checkoutCurrency = String(checkoutResult.currency || "").toUpperCase();
-  if (checkoutCurrency && checkoutCurrency !== "INR") {
-    // Prava mandates are INR-only. A non-INR total must never be matched
-    // one-to-one against a rupee mandate, so route it to a saved card.
-    return ucpSavedCardResult(
-      userId,
-      baseResult,
-      {
-        checked: true,
-        checkedMandateCount: mandates.length,
-        status: "currency_not_mandate_eligible",
-      },
-      savedCards
-    );
-  }
-  if (checkoutResult.totalIsAuthoritative === false) {
-    // The merchant did not return an authoritative total, so the amount is a
-    // stale search-time estimate. Do not mint a mandate credential against an
-    // unverified amount; route to a saved card so the person reviews and pays.
-    return ucpSavedCardResult(
-      userId,
-      baseResult,
-      {
-        checked: true,
-        checkedMandateCount: mandates.length,
-        status: "total_not_authoritative",
       },
       savedCards
     );
@@ -2179,19 +2580,9 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
   }
 
   const selectedMandate = eligible[0];
-  // The dedup reference must be stable across retries of the same purchase
-  // intent so a retried checkout reuses the existing single-use credential
-  // instead of minting a second one. checkoutId is assigned fresh by the
-  // merchant on every create_checkout, and the total can drift between calls,
-  // so key off the signed selection token (fixed at search time) plus the
-  // chosen quantity and the mandate.
-  const dedupBasis = `${input.selectionToken || checkoutResult.checkoutId}:${Math.max(
-    1,
-    Math.round(Number(input.quantity) || 1)
-  )}:${selectedMandate.id}`;
   const chargeReference = `tokko_ucp_${nodeCrypto
     .createHash("sha256")
-    .update(dedupBasis)
+    .update(`${checkoutResult.checkoutId}:${selectedMandate.id}`)
     .digest("hex")
     .slice(0, 40)}`;
   let charge;
@@ -2200,7 +2591,6 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
       mandateId: selectedMandate.id,
       amount: checkoutResult.totalAmount,
       reference: chargeReference,
-      purchaseContext: ucpPurchaseContext(checkoutResult),
     });
   } catch (error) {
     return ucpSavedCardResult(
@@ -2240,6 +2630,571 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
       label: `Continue to ${checkoutResult.merchantName} checkout`,
       url: merchantHandoffUrl,
       paymentHandoff,
+    },
+  };
+}
+
+function ucpQuoteDeliveryWindow(checkoutResult) {
+  const selected = (checkoutResult.shippingOptions || []).find((option) => option.selected)
+    || checkoutResult.shippingOptions?.[0]
+    || null;
+  if (!selected) return null;
+  return {
+    title: selected.title || "Delivery",
+    description: selected.description || null,
+    earliest: selected.earliestFulfillmentTime || null,
+    latest: selected.latestFulfillmentTime || null,
+  };
+}
+
+function ucpForexLines(checkoutResult) {
+  return (checkoutResult.totals || []).filter((line) =>
+    /(?:forex|foreign exchange|currency conversion|exchange fee|fx fee)/i.test(
+      `${line.type || ""} ${line.label || ""}`
+    )
+  );
+}
+
+const UCP_FOREX_RATE_PERCENT = 3;
+
+function ucpQuoteWithForexCharge(checkoutResult) {
+  const merchantTotalMinor = Math.round(Number(checkoutResult?.totalMinor));
+  if (!Number.isFinite(merchantTotalMinor) || merchantTotalMinor <= 0) {
+    throw Object.assign(new Error("Merchant checkout total is invalid"), {
+      status: 502,
+    });
+  }
+  const forexChargeMinor = Math.round(
+    merchantTotalMinor * UCP_FOREX_RATE_PERCENT / 100
+  );
+  const totalMinor = merchantTotalMinor + forexChargeMinor;
+  const originalTotals = Array.isArray(checkoutResult.totals)
+    ? checkoutResult.totals
+    : [];
+  const componentTotals = originalTotals.filter(
+    (line) => String(line?.type || "").toLowerCase() !== "total"
+  );
+  const totals = componentTotals.length
+    ? componentTotals
+    : [{
+        type: "subtotal",
+        label: "Merchant cart total",
+        amountMinor: merchantTotalMinor,
+        lines: [],
+      }];
+  totals.push({
+    type: "forex",
+    label: `Foreign exchange charge (${UCP_FOREX_RATE_PERCENT}%)`,
+    amountMinor: forexChargeMinor,
+    lines: [],
+  });
+  totals.push({
+    type: "total",
+    label: "Total payable",
+    amountMinor: totalMinor,
+    lines: [],
+  });
+  return {
+    ...checkoutResult,
+    merchantTotalMinor,
+    forexChargeMinor,
+    forexRatePercent: UCP_FOREX_RATE_PERCENT,
+    totals,
+    totalMinor,
+    totalAmount: (totalMinor / 100).toFixed(2),
+  };
+}
+
+function publicUcpOrderIntent(row) {
+  if (!row) return null;
+  const quote = row.quote_snapshot || {};
+  return {
+    orderId: String(row.id),
+    merchant: row.merchant_slug,
+    merchantName: row.merchant_name,
+    currency: row.currency,
+    totalAmount: (Number(row.total_minor) / 100).toFixed(2),
+    totalMinor: Number(row.total_minor),
+    status: row.status,
+    priceConfirmed: Boolean(row.price_confirmed_at),
+    paymentRoute: row.payment_route || null,
+    paymentReference: row.credential_fingerprint
+      ? {
+          fingerprint: row.credential_fingerprint,
+          issuedAt: row.credential_issued_at,
+          storage: "fingerprint_only",
+        }
+      : null,
+    prava: {
+      mandateId: row.prava_mandate_id || null,
+      sessionId: row.prava_session_id || null,
+      transactionId: row.prava_transaction_id || null,
+      orderId: row.prava_order_id || null,
+    },
+    merchantOrder: row.merchant_order_id
+      ? { id: row.merchant_order_id, url: row.merchant_order_url || null }
+      : null,
+    failureMessage: row.failure_message || null,
+    quote,
+  };
+}
+
+function ucpOrderIntentInput(row, updates = {}) {
+  return {
+    id: row.id,
+    merchantSlug: row.merchant_slug,
+    merchantName: row.merchant_name,
+    merchantUrl: row.merchant_url,
+    merchantCheckoutId: row.merchant_checkout_id,
+    selectionToken: row.selection_token,
+    quoteSnapshot: row.quote_snapshot || {},
+    currency: row.currency,
+    totalMinor: Number(row.total_minor),
+    status: updates.status || row.status,
+    priceConfirmedAt: updates.priceConfirmedAt || row.price_confirmed_at,
+    paymentRoute: updates.paymentRoute || row.payment_route,
+    pravaMandateId: updates.pravaMandateId || row.prava_mandate_id,
+    pravaSessionId: updates.pravaSessionId || row.prava_session_id,
+    pravaTransactionId: updates.pravaTransactionId || row.prava_transaction_id,
+    pravaOrderId: updates.pravaOrderId || row.prava_order_id,
+    credentialFingerprint:
+      updates.credentialFingerprint || row.credential_fingerprint,
+    credentialIssuedAt: updates.credentialIssuedAt || row.credential_issued_at,
+    merchantOrderId: updates.merchantOrderId || row.merchant_order_id,
+    merchantOrderUrl: updates.merchantOrderUrl || row.merchant_order_url,
+    failureMessage: Object.hasOwn(updates, "failureMessage")
+      ? updates.failureMessage
+      : row.failure_message,
+  };
+}
+
+async function createUcpCheckoutQuote(userId, input = {}) {
+  const [user, profile, addresses] = await Promise.all([
+    db.getUserById(userId),
+    db.getProfile(userId),
+    db.getFamilyAddresses(userId),
+  ]);
+  const selectedAddress = addresses.find((address) => address.is_selected) || null;
+  const selectedCountry = String(selectedAddress?.country_code || "").trim().toUpperCase();
+  if (!/^[A-Z]{2}$/.test(selectedCountry)) {
+    throw Object.assign(new Error("Select a delivery address before requesting a quote"), {
+      status: 409,
+    });
+  }
+  const checkoutIdentity = ucpCheckoutIdentity(user, profile, selectedAddress);
+  const checkoutOptions = {
+    baseUrl: BASE_URL,
+    buyer: checkoutIdentity.buyer,
+    destination: checkoutIdentity.destination,
+    deliveryCountry: selectedCountry,
+  };
+  const cartItems = Array.isArray(input.cartItems) ? input.cartItems : null;
+  const checkoutResult = cartItems
+    ? await ucp.createCheckoutFromSelections(cartItems, checkoutOptions)
+    : await ucp.createCheckout(input.selectionToken, {
+        ...checkoutOptions,
+        quantity: input.quantity,
+      });
+  if (checkoutResult.reconciles === false) {
+    throw Object.assign(
+      new Error("Merchant checkout components do not reconcile with its final total"),
+      { status: 409 }
+    );
+  }
+  const payableCheckout = ucpQuoteWithForexCharge(checkoutResult);
+  const selectionToken = String(
+    cartItems?.[0]?.selectionToken || input.selectionToken || ""
+  );
+  const forexLines = ucpForexLines(payableCheckout);
+  const quoteSnapshot = {
+    items: payableCheckout.items || [],
+    market: payableCheckout.market || selectedCountry,
+    totals: payableCheckout.totals || [],
+    shippingOptions: payableCheckout.shippingOptions || [],
+    shippingQuoted: payableCheckout.shippingQuoted === true,
+    deliveryWindow: ucpQuoteDeliveryWindow(payableCheckout),
+    merchantTotalMinor: payableCheckout.merchantTotalMinor,
+    forex: {
+      returnedByMerchant: false,
+      appliedByTokko: true,
+      ratePercent: payableCheckout.forexRatePercent,
+      baseAmountMinor: payableCheckout.merchantTotalMinor,
+      amountMinor: payableCheckout.forexChargeMinor,
+      lines: forexLines,
+    },
+    destinationSelected: checkoutResult.destinationSelected === true,
+    phoneAccepted: checkoutResult.phoneAccepted === true,
+    reconciles: checkoutResult.reconciles,
+    expiresAt: checkoutResult.expiresAt || null,
+  };
+  const row = await db.saveUcpOrderIntent(userId, {
+    merchantSlug: checkoutResult.merchant,
+    merchantName: checkoutResult.merchantName,
+    merchantUrl: checkoutResult.merchantUrl,
+    merchantCheckoutId: checkoutResult.checkoutId,
+    selectionToken,
+    quoteSnapshot,
+    currency: payableCheckout.currency,
+    totalMinor: payableCheckout.totalMinor,
+    status: "AWAITING_PRICE_CONFIRMATION",
+  });
+  await rememberUcpCheckout(userId, checkoutResult);
+  return {
+    ...publicUcpOrderIntent(row),
+    confirmationRequired: true,
+    actions: [
+      { id: "proceed", label: "Proceed With Order" },
+      { id: "cancel", label: "Do Not Place Order" },
+    ],
+    merchantCheckoutUrl: null,
+    pravaCheckoutUrl: null,
+  };
+}
+
+async function ucpPaymentOptions(userId, row) {
+  const [cards, identity] = await Promise.all([
+    syncPravaPaymentMethodsForUser(userId),
+    pravaMandateIdentity(userId).catch(() => null),
+  ]);
+  let mandates = [];
+  let mandateError = null;
+  if (identity) {
+    try {
+      mandates = (await listPravaMandatesForUser(
+        userId,
+        identity.customerId
+      )).mandates;
+    } catch (error) {
+      mandateError = error.message;
+    }
+  }
+  const allEligibleMandates = usablePravaMandatesForMerchant(
+    mandates,
+    Number(row.total_minor) / 100,
+    row.merchant_name,
+    row.merchant_url,
+    row.currency
+  );
+  const eligibleMandates = allEligibleMandates.slice(0, 5);
+  const publicCards = cards.map(publicUcpCard);
+  return {
+    eligibleMandates,
+    eligibleMandateCount: allEligibleMandates.length,
+    recommendedMandate: eligibleMandates[0] || null,
+    savedCards: publicCards,
+    mandateError,
+    categories: {
+      mandates: {
+        id: "mandates",
+        label: "Mandates",
+        coverageAvailable: eligibleMandates.length > 0,
+        eligibleCount: allEligibleMandates.length,
+        recommendedMandate: eligibleMandates[0] || null,
+        canCreate: publicCards.length > 0,
+      },
+      savedCards: {
+        id: "saved_cards",
+        label: "Saved Cards",
+        count: publicCards.length,
+        cards: publicCards,
+        canCreate: true,
+      },
+    },
+    methods: [
+      ...(eligibleMandates.length ? [{ id: "mandate", label: "Use Active Mandate" }] : []),
+      { id: "create_mandate", label: "Create A Mandate" },
+      ...(cards.length ? [{ id: "card", label: "Use Saved Card" }] : []),
+      { id: "add_card", label: "Add A Card" },
+    ],
+  };
+}
+
+async function decideUcpOrder(userId, orderId, proceed) {
+  const row = await db.getUcpOrderIntent(userId, orderId);
+  if (!row) throw Object.assign(new Error("Order quote was not found"), { status: 404 });
+  if (typeof proceed !== "boolean") {
+    throw Object.assign(new Error("proceed must be true or false"), { status: 400 });
+  }
+  if (!proceed) {
+    const canceled = await db.saveUcpOrderIntent(
+      userId,
+      ucpOrderIntentInput(row, { status: "CANCELED", failureMessage: null })
+    );
+    return { ...publicUcpOrderIntent(canceled), paymentDecisionRequired: false };
+  }
+  if (row.status === "CANCELED") {
+    throw Object.assign(
+      new Error("This quote was canceled after the cart changed. Review a fresh checkout total."),
+      { status: 409 }
+    );
+  }
+  const confirmed = await db.saveUcpOrderIntent(
+    userId,
+    ucpOrderIntentInput(row, {
+      status: "AWAITING_PAYMENT_METHOD",
+      priceConfirmedAt: new Date().toISOString(),
+      failureMessage: null,
+    })
+  );
+  return {
+    ...publicUcpOrderIntent(confirmed),
+    paymentDecisionRequired: true,
+    paymentOptions: await ucpPaymentOptions(userId, confirmed),
+  };
+}
+
+function paymentCredentialFingerprint(credentials) {
+  return nodeCrypto
+    .createHash("sha256")
+    .update(String(credentials?.token || ""))
+    .digest("hex");
+}
+
+async function chooseUcpOrderPayment(userId, orderId, input = {}) {
+  let row = await db.getUcpOrderIntent(userId, orderId);
+  if (!row) throw Object.assign(new Error("Order quote was not found"), { status: 404 });
+  if (!row.price_confirmed_at || row.status === "CANCELED") {
+    throw Object.assign(new Error("Confirm the final merchant price first"), { status: 409 });
+  }
+  const method = String(input.method || "").trim().toLowerCase();
+  const amount = (Number(row.total_minor) / 100).toFixed(2);
+  const purchaseContext = ucpPurchaseContext({
+    ...(row.quote_snapshot || {}),
+    merchantName: row.merchant_name,
+    merchantUrl: row.merchant_url,
+    market: row.quote_snapshot?.market,
+    checkoutId: row.merchant_checkout_id,
+    totalAmount: amount,
+    quantity: (row.quote_snapshot?.items || []).reduce(
+      (sum, item) => sum + Number(item.quantity || 0),
+      0
+    ) || 1,
+  });
+  if (method === "mandate") {
+    const { customerId } = await pravaMandateIdentity(userId);
+    const mandates = (await listPravaMandatesForUser(
+      userId,
+      customerId
+    )).mandates;
+    const eligible = usablePravaMandatesForMerchant(
+      mandates,
+      amount,
+      row.merchant_name,
+      row.merchant_url,
+      row.currency
+    );
+    const requestedMandateId = String(input.mandateId || "").trim();
+    const selected = requestedMandateId
+      ? eligible.find((mandate) => String(mandate.id) === requestedMandateId)
+      : eligible[0];
+    if (!selected) {
+      throw Object.assign(new Error("Select an active mandate that covers the total"), {
+        status: 409,
+      });
+    }
+    const reference = `trakko_ucp_${row.id.replaceAll("-", "")}`;
+    const charge = await payments.chargeMandate({
+      mandateId: selected.id,
+      amount,
+      reference,
+    });
+    row = await db.saveUcpOrderIntent(userId, ucpOrderIntentInput(row, {
+      status: "PAYMENT_CREDENTIAL_ISSUED",
+      paymentRoute: "mandate",
+      pravaMandateId: charge.mandateId,
+      pravaTransactionId: charge.transactionId,
+      pravaOrderId: charge.orderId,
+      credentialFingerprint: paymentCredentialFingerprint(charge.credentials),
+      credentialIssuedAt: new Date().toISOString(),
+      failureMessage: null,
+    }));
+    return {
+      ...publicUcpOrderIntent(row),
+      tokenIssued: true,
+      sandboxPaymentCredential:
+        payments.configuration().environment === "sandbox"
+          ? {
+              mandateId: charge.mandateId,
+              transactionId: charge.transactionId,
+              token: charge.credentials.token,
+              ephemeral: true,
+            }
+          : null,
+      pravaCheckoutUrl: null,
+      redirectRequired: false,
+      nextAction: {
+        type: "browser_harness_required",
+        label: "Payment credential issued; merchant order not placed yet",
+      },
+      selectedMandate: {
+        id: selected.id,
+        currency: selected.currency,
+        remaining: selected.remaining ?? selected.approvedAmount,
+        selectionRule: "smallest_active_mandate_covering_full_cart",
+      },
+    };
+  }
+  if (method === "create_mandate") {
+    const availableCards = await syncPravaPaymentMethodsForUser(userId);
+    const selectedCard = availableCards.find((card) =>
+      String(card.id) === String(input.paymentMethodId || "")
+    ) || availableCards.find((card) => card.is_default === true || card.isDefault === true)
+      || availableCards[0];
+    if (!selectedCard) {
+      throw Object.assign(new Error("Add a saved Prava card before creating a mandate"), {
+        status: 409,
+      });
+    }
+    const session = await createPravaMandateForUser(userId, {
+      paymentMethodId: selectedCard.id,
+      amount,
+      frequency: input.frequency || "monthly",
+      returnContext: { ...(input.returnContext || {}), orderId: row.id },
+      currency: row.currency,
+      purchaseContext,
+      externalOrderRef: `trakko_ucp_mandate_${row.id.replaceAll("-", "")}`,
+      description: `Authorize ${row.merchant_name} purchases up to ${row.currency} ${amount}.`,
+    });
+    row = await db.saveUcpOrderIntent(userId, ucpOrderIntentInput(row, {
+      status: "PRAVA_MANDATE_APPROVAL_REQUIRED",
+      paymentRoute: "create_mandate",
+    }));
+    return {
+      ...publicUcpOrderIntent(row),
+      tokenIssued: false,
+      pravaCheckoutUrl: session.approvalUrl,
+      redirectRequired: true,
+      nextAction: { type: "prava_mandate_approval", label: "Approve Mandate With Prava", url: session.approvalUrl },
+    };
+  }
+  if (method === "add_card") {
+    const session = await createTokenizationSessionForUser(userId, {
+      returnContext: { ...(input.returnContext || {}), orderId: row.id },
+    });
+    row = await db.saveUcpOrderIntent(userId, ucpOrderIntentInput(row, {
+      status: "PRAVA_CARD_SETUP_REQUIRED",
+      paymentRoute: "add_card",
+    }));
+    return {
+      ...publicUcpOrderIntent(row),
+      tokenIssued: false,
+      pravaCheckoutUrl: session.approvalUrl,
+      redirectRequired: true,
+      nextAction: { type: "prava_card_setup", label: "Add Card With Prava", url: session.approvalUrl },
+    };
+  }
+  if (method === "card") {
+    const [{ email, customerId }, methods] = await Promise.all([
+      pravaMandateIdentity(userId),
+      syncPravaPaymentMethodsForUser(userId),
+    ]);
+    const selected = methods.find((card) =>
+      String(card.id) === String(input.paymentMethodId || "")
+    ) || methods.find((card) => card.is_default === true || card.isDefault === true)
+      || methods[0];
+    if (!selected?.provider_payment_method_id) {
+      throw Object.assign(new Error("Select a saved Prava card"), { status: 404 });
+    }
+    const callbackUrl = pravaReturnCallback("card", {
+      ...(input.returnContext || {}),
+      orderId: row.id,
+    });
+    const session = await payments.createPaymentSession({
+      customerId,
+      email,
+      cardId: selected.provider_payment_method_id,
+      amount,
+      callbackUrl,
+      purchaseContext,
+      externalOrderRef: `trakko_ucp_${row.id.replaceAll("-", "")}`,
+      currency: row.currency,
+    });
+    row = await db.saveUcpOrderIntent(userId, ucpOrderIntentInput(row, {
+      status: "PRAVA_CARD_APPROVAL_REQUIRED",
+      paymentRoute: "card",
+      pravaSessionId: session.sessionId,
+      pravaOrderId: session.orderId,
+      failureMessage: null,
+    }));
+    return {
+      ...publicUcpOrderIntent(row),
+      tokenIssued: false,
+      pravaCheckoutUrl: session.approvalUrl,
+      redirectRequired: true,
+      nextAction: { type: "prava_card_approval", label: "Approve Card With Prava", url: session.approvalUrl },
+    };
+  }
+  throw Object.assign(new Error("Choose mandate, create_mandate, card, or add_card"), {
+    status: 400,
+  });
+}
+
+async function continueUcpOrderPayment(userId, orderId) {
+  let row = await db.getUcpOrderIntent(userId, orderId);
+  if (!row) throw Object.assign(new Error("Order quote was not found"), { status: 404 });
+  if (row.payment_route === "create_mandate") {
+    const { customerId } = await pravaMandateIdentity(userId);
+    const mandates = usablePravaMandatesForMerchant(
+      (await listPravaMandatesForUser(userId, customerId)).mandates,
+      Number(row.total_minor) / 100,
+      row.merchant_name,
+      row.merchant_url,
+      row.currency
+    );
+    if (!mandates.length) {
+      return {
+        ...publicUcpOrderIntent(row),
+        tokenIssued: false,
+        pravaStatus: "mandate_approval_pending",
+      };
+    }
+    return chooseUcpOrderPayment(userId, orderId, {
+      method: "mandate",
+      mandateId: mandates[0].id,
+    });
+  }
+  if (row.payment_route !== "card" || !row.prava_session_id) {
+    throw Object.assign(new Error("No Prava card payment is waiting for this order"), {
+      status: 409,
+    });
+  }
+  const result = await payments.getPaymentResult(row.prava_session_id);
+  const payment = payments.paymentSessionCredentials(result);
+  if (!payment) {
+    return {
+      ...publicUcpOrderIntent(row),
+      tokenIssued: false,
+      pravaStatus: String(result?.status || "pending").toLowerCase(),
+      pravaCheckoutUrl: row.quote_snapshot?.pravaCheckoutUrl || null,
+    };
+  }
+  row = await db.saveUcpOrderIntent(userId, ucpOrderIntentInput(row, {
+    status: "PAYMENT_CREDENTIAL_ISSUED",
+    pravaTransactionId: payment.transactionId,
+    credentialFingerprint: paymentCredentialFingerprint(payment.credentials),
+    credentialIssuedAt: new Date().toISOString(),
+    failureMessage: null,
+  }));
+  return {
+    ...publicUcpOrderIntent(row),
+    tokenIssued: true,
+    pravaStatus: payment.status,
+    sandboxPaymentCredential:
+      payments.configuration().environment === "sandbox"
+        ? {
+            sessionId: row.prava_session_id,
+            transactionId: payment.transactionId,
+            token: payment.credentials.token,
+            ephemeral: true,
+          }
+        : null,
+    note:
+      payments.configuration().environment === "sandbox"
+        ? "Prava payment-result returned this single-use sandbox virtual PAN. Tokko stored only its SHA-256 fingerprint."
+        : "Prava payment-result issued a one-time credential. Tokko stored only its SHA-256 fingerprint.",
+    nextAction: {
+      type: "browser_harness_required",
+      label: "Payment credential issued; merchant order not placed yet",
     },
   };
 }
@@ -2402,7 +3357,10 @@ function tokkoPaymentRoute({ mandates, paymentMethods, amount }) {
 
 async function selectPravaMandateForAmount(userId, requestedId, amount) {
   const { customerId } = await pravaMandateIdentity(userId);
-  const mandates = await payments.listMandates(customerId);
+  const mandates = (await listPravaMandatesForUser(
+    userId,
+    customerId
+  )).mandates;
   const usable = usablePravaMandatesForAmount(mandates, amount);
   if (requestedId) {
     const selected = usable.find(
@@ -2587,7 +3545,10 @@ async function executeHermesCheckoutPolicy(req, userId, args = {}) {
   let mandateCheckError = null;
   if (identity?.customerId) {
     try {
-      mandates = await payments.listMandates(identity.customerId);
+      mandates = (await listPravaMandatesForUser(
+        userId,
+        identity.customerId
+      )).mandates;
     } catch (error) {
       mandateCheckError = error.message;
     }
@@ -3487,37 +4448,142 @@ route("GET", "/api/merchants/ucp", async (req, res) => {
 });
 
 route("POST", "/api/merchants/ucp/search", async (req, res) => {
-  await auth.requireUser(req);
+  const user = await auth.requireUser(req);
   const body = await parseBody(req);
-  sendJson(
-    res,
-    200,
-    await ucp.searchAll(body.query, {
-      limit: body.limit,
-      offset: body.offset,
-      market: body.market,
-      baseUrl: BASE_URL,
-    })
+  const result = await searchUcpForSelectedAddress(user.userId, {
+    ...body,
+    limit: Math.min(Math.max(Number(body.limit) || 10, 1), 10),
+  });
+  result.products = await db.saveUcpProductChoices(
+    user.userId,
+    result.products.slice(0, 10),
+    result.query
   );
+  sendJson(res, 200, result);
+});
+
+route("GET", "/api/merchants/ucp/cart", async (req, res) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, ucpCartPayload(await db.getUcpCart(user.userId)));
+});
+
+route("DELETE", "/api/merchants/ucp/cart/items/:itemId", async (req, res, params) => {
+  const user = await auth.requireUser(req);
+  const removedItem = await db.removeUcpCartItem(user.userId, params.itemId);
+  if (!removedItem) return sendJson(res, 404, { error: "Cart item was not found" });
+  sendJson(res, 200, {
+    removedItem,
+    cart: ucpCartPayload(await db.getUcpCart(user.userId)),
+  });
+});
+
+route("DELETE", "/api/merchants/ucp/cart", async (req, res) => {
+  const user = await auth.requireUser(req);
+  const removedCount = await db.clearUcpCart(user.userId);
+  sendJson(res, 200, { removedCount, cart: ucpCartPayload([]) });
+});
+
+route("POST", "/api/merchants/ucp/cart/items", async (req, res) => {
+  const user = await auth.requireUser(req);
+  const body = await parseBody(req);
+  const choiceId = String(body.choiceId || "").trim();
+  if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(choiceId)) {
+    throw Object.assign(new Error("choiceId is required"), { status: 400 });
+  }
+  const addition = await db.addSingleMerchantUcpCartItem(
+    user.userId,
+    choiceId,
+    body.quantity,
+    body.replaceCart === true
+  );
+  if (addition.expired) {
+    return sendJson(res, 409, {
+      error: "This product choice expired. Search again for current availability and price.",
+    });
+  }
+  if (addition.conflict) {
+    return sendJson(res, 409, {
+      error:
+        `Your cart is locked to ${addition.currentMerchantName}. `
+        + `Replace it before adding a product from ${addition.requestedMerchantName}.`,
+      code: "merchant_cart_conflict",
+      conflict: addition,
+    });
+  }
+  sendJson(res, 201, {
+    added: true,
+    addedItem: addition.addedItem,
+    replacedCart: addition.replacedCart,
+    cart: ucpCartPayload(await db.getUcpCart(user.userId)),
+  });
+});
+
+route("POST", "/api/merchants/ucp/cart/checkout", async (req, res) => {
+  const user = await auth.requireUser(req);
+  const cart = await db.getUcpCart(user.userId);
+  const merchant = cart[0]?.merchant;
+  if (!merchant) return sendJson(res, 404, { error: "Your cart is empty" });
+  if (new Set(cart.map((item) => item.merchant)).size > 1) {
+    return sendJson(res, 409, {
+      error: "This legacy cart contains multiple merchants. Keep one merchant before checkout.",
+    });
+  }
+  const cartItems = await db.getUcpCartCheckoutItems(user.userId, merchant);
+  if (cartItems.some((item) => item.expired)) {
+    return sendJson(res, 409, { error: "One or more product prices expired. Search again." });
+  }
+  sendJson(res, 201, await createUcpCheckoutQuote(user.userId, { cartItems }));
 });
 
 route("POST", "/api/merchants/ucp/checkout", async (req, res) => {
   const user = await auth.requireUser(req);
   const body = await parseBody(req);
-  sendJson(
-    res,
-    201,
-    await createUcpCheckoutWithPayment(user.userId, body)
-  );
+  const result = await createUcpCheckoutQuote(user.userId, body);
+  sendJson(res, 201, result);
 });
 
-route("POST", "/api/merchants/ucp/payment-choice", async (req, res) => {
+route("GET", "/api/merchants/ucp/orders/:id", async (req, res, params) => {
+  const user = await auth.requireUser(req);
+  const row = await db.getUcpOrderIntent(user.userId, params.id);
+  if (!row) return sendJson(res, 404, { error: "Order quote was not found" });
+  sendJson(res, 200, publicUcpOrderIntent(row));
+});
+
+route("GET", "/api/merchants/ucp/orders/:id/payment-options", async (req, res, params) => {
+  const user = await auth.requireUser(req);
+  const row = await db.getUcpOrderIntent(user.userId, params.id);
+  if (!row) return sendJson(res, 404, { error: "Order quote was not found" });
+  if (!row.price_confirmed_at || row.status === "CANCELED") {
+    return sendJson(res, 409, { error: "Confirm the final merchant price first" });
+  }
+  sendJson(res, 200, await ucpPaymentOptions(user.userId, row));
+});
+
+route("POST", "/api/merchants/ucp/orders/:id/decision", async (req, res, params) => {
   const user = await auth.requireUser(req);
   const body = await parseBody(req);
+  sendJson(res, 200, await decideUcpOrder(user.userId, params.id, body.proceed));
+});
+
+route("POST", "/api/merchants/ucp/orders/:id/payment", async (req, res, params) => {
+  const user = await auth.requireUser(req);
   sendJson(
     res,
     200,
-    await selectUcpSavedCard(user.userId, String(body.token || ""))
+    await chooseUcpOrderPayment(user.userId, params.id, await parseBody(req))
+  );
+});
+
+route("POST", "/api/merchants/ucp/orders/:id/payment/continue", async (req, res, params) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, await continueUcpOrderPayment(user.userId, params.id));
+});
+
+route("POST", "/api/merchants/ucp/payment-choice", async (req, res) => {
+  await auth.requireUser(req);
+  throw Object.assign(
+    new Error("Use the confirmed order payment endpoint; merchant checkout redirects are disabled"),
+    { status: 410 }
   );
 });
 
@@ -3632,12 +4698,6 @@ route("POST", "/api/auth/login", async (req, res) => {
   await createBrowserSession(req, res, user);
 });
 
-route("POST", "/api/auth/clerk/session", async (req, res) => {
-  const { identity, email } = await auth.authenticateClerkUser(req);
-  const user = await db.getOrCreateWebsiteUser(identity.userId, email);
-  await createBrowserSession(req, res, user);
-});
-
 route("GET", "/api/auth/session", async (req, res) => {
   const user = await auth.requireUser(req);
   sendJson(res, 200, { account: publicAccount(user) });
@@ -3663,8 +4723,7 @@ route("GET", "/api/config", async (_req, res) => {
   const emailConfiguration = emailVerification.configuration();
   const hermesConfiguration = hermes.configuration();
   sendJson(res, 200, {
-    websiteAuthentication: "google_or_email_password",
-    googleOAuthConfigured: emailConfiguration.configured,
+    websiteAuthentication: "email_or_phone_password",
     signupEmailVerification: "otp",
     signupEmailVerificationConfigured: emailConfiguration.configured,
     clerkPublishableKey: emailConfiguration.publishableKey || null,
@@ -3748,7 +4807,27 @@ route(
         paymentCustomer?.provider_customer_id
         || canonicalPravaCustomerId(Number(binding.user_id)),
       familyPhone: profile?.primary_parent_phone || null,
+      responseLanguage: binding.response_language || "en-IN",
     });
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/integrations/telegram/bindings/:chatId/language",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const chatId = telegramChatIdentifier({ chatId: params.chatId });
+    const binding = await db.getTelegramHermesBinding(chatId);
+    if (!binding) return sendJson(res, 404, { error: "Telegram chat is not linked" });
+    const body = await parseBody(req);
+    const requested = String(body.language || "").trim();
+    const language = hermes.normalizeResponseLanguage(requested);
+    if (language !== requested) {
+      throw Object.assign(new Error("Unsupported response language"), { status: 400 });
+    }
+    await db.setTelegramResponseLanguage(chatId, language);
+    sendJson(res, 200, { language });
   }
 );
 
@@ -3794,6 +4873,10 @@ route(
     const confirmed = Boolean(session.selected_address_id && session.formatted_address);
     sendJson(res, 200, {
       confirmed,
+      awaitingAddress: session.awaiting_address === true,
+      pendingCountryCode: /^[A-Z]{2}$/.test(String(session.pending_address_country || ""))
+        ? session.pending_address_country
+        : null,
       selectedAddress: confirmed
         ? {
             addressId: String(session.selected_address_id),
@@ -3818,13 +4901,53 @@ route(
     const body = await parseBody(req);
     if (body.reset === true) {
       await db.resetTelegramAddressSession(chatId);
-      return sendJson(res, 200, { confirmed: false, selectedAddress: null });
+      return sendJson(res, 200, {
+        confirmed: false,
+        awaitingAddress: false,
+        selectedAddress: null,
+      });
+    }
+    if (typeof body.awaitingAddress === "boolean") {
+      const pendingCountryCode = String(body.countryCode || "").trim().toUpperCase();
+      if (pendingCountryCode && !/^[A-Z]{2}$/.test(pendingCountryCode)) {
+        throw Object.assign(
+          new Error("countryCode must use a two-letter ISO code"),
+          { status: 400 }
+        );
+      }
+      const session = await db.setTelegramAwaitingAddress(
+        chatId,
+        body.awaitingAddress,
+        pendingCountryCode || null
+      );
+      return sendJson(res, 200, {
+        confirmed: Boolean(session?.selected_address_id),
+        awaitingAddress: session?.awaiting_address === true,
+        pendingCountryCode: session?.pending_address_country || null,
+      });
     }
     const addressId = String(body.addressId || "").trim();
     if (!/^[1-9]\d*$/.test(addressId)) {
       throw Object.assign(new Error("addressId is required"), { status: 400 });
     }
-    const selected = await db.selectFamilyAddress(Number(binding.user_id), addressId);
+    let selection;
+    try {
+      selection = await selectFamilyAddressWithCartPolicy(
+        Number(binding.user_id),
+        addressId,
+        { replaceCart: body.replaceCart === true }
+      );
+    } catch (error) {
+      if (error.code === "cart_delivery_country_conflict") {
+        return sendJson(res, 409, {
+          error: error.message,
+          code: error.code,
+          conflict: error.conflict,
+        });
+      }
+      throw error;
+    }
+    const selected = selection?.selected;
     if (!selected) {
       return sendJson(res, 404, { error: "Tokko address not found" });
     }
@@ -3835,6 +4958,7 @@ route(
     sendJson(res, 200, {
       confirmed: true,
       selectedAddress: publicFamilyAddress(selected),
+      cartCleared: selection.cartCleared,
     });
   }
 );
@@ -3862,27 +4986,17 @@ route("GET", "/api/me", async (req, res) => {
 
 route("PUT", "/api/onboarding/profile", async (req, res) => {
   const user = await auth.requireUser(req);
-  const input = validation.websiteOnboardingInput(await parseBody(req));
-  let userId = Number(user.userId);
-  if (input.primaryParentPhone) {
-    const linkedUser = await db.linkWebsiteUserPhone(
-      user.userId,
-      {
-        clerkUserId: user.clerkUserId,
-        email: user.email,
-      },
-      input.primaryParentPhone
-    );
-    userId = Number(linkedUser.id);
-  }
+  const input = validation.onboardingInput(await parseBody(req));
+  const linkedUser = await db.linkWebsiteUserPhone(
+    user.userId,
+    {
+      clerkUserId: user.clerkUserId,
+      email: user.email,
+    },
+    input.primaryParentPhone
+  );
+  const userId = Number(linkedUser.id);
   await db.saveProfile(userId, input, "website");
-  await db.recordActivityEvent(userId, {
-    eventType: "family_updated",
-    title: "Family circle updated",
-    detail: `${input.dependents.length} member${input.dependents.length === 1 ? "" : "s"} ready for Tokko`,
-    entityType: "family",
-    metadata: { memberCount: input.dependents.length },
-  });
   sendJson(res, 200, await getUserState(userId, user.clerkUserId));
 });
 
@@ -3902,10 +5016,17 @@ route("GET", "/api/payments/return", async (req, res) => {
   const query = getQuery(req);
   if (query.channel === "telegram") {
     const bot = telegramBotUsername(query.bot);
+    const orderId = /^[0-9a-f-]{36}$/i.test(String(query.order || ""))
+      ? String(query.order).toLowerCase()
+      : null;
     const payload =
       query.flow === "mandate"
-        ? "payments_mandate_return"
-        : "payments_card_return";
+        ? query.callback
+          ? `pmr_${pravaCallbackIdentifier(query.callback).replaceAll("-", "")}`
+          : "payments_mandate_return"
+        : orderId
+          ? `pcr_${orderId.replaceAll("-", "")}`
+          : "payments_card_return";
     return sendRedirect(
       res,
       `https://t.me/${encodeURIComponent(bot)}?start=${payload}`
@@ -3956,8 +5077,32 @@ route("GET", "/api/payments/mandates", async (req, res) => {
   try {
     const user = await auth.requireUser(req);
     const { customerId } = await pravaMandateIdentity(user.userId);
-    const mandates = await payments.listMandates(customerId);
-    sendJson(res, 200, mandateListPayload(mandates, getQuery(req)));
+    const result = await listPravaMandatesForUser(
+      user.userId,
+      customerId,
+      { allowCached: true }
+    );
+    sendJson(res, 200, {
+      ...mandateListPayload(result.mandates, getQuery(req)),
+      source: result.source,
+      stale: result.stale,
+      fetchedAt: result.fetchedAt,
+      warning: result.warning || null,
+    });
+  } catch (error) {
+    sendJson(res, error.status || 500, { error: error.message });
+  }
+});
+
+route("POST", "/api/payments/mandates/callback/complete", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const { callbackId } = await parseBody(req);
+    sendJson(
+      res,
+      200,
+      await completePravaMandateCallback(user.userId, callbackId)
+    );
   } catch (error) {
     sendJson(res, error.status || 500, { error: error.message });
   }
@@ -4249,12 +5394,35 @@ route(
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
     const { customerId } = await pravaMandateIdentity(userId);
-    const mandates = await payments.listMandates(customerId);
+    const result = await listPravaMandatesForUser(
+      userId,
+      customerId,
+      { allowCached: true }
+    );
     sendJson(res, 200, {
       userId,
       customerId,
-      ...mandateListPayload(mandates, getQuery(req)),
+      ...mandateListPayload(result.mandates, getQuery(req)),
+      source: result.source,
+      stale: result.stale,
+      fetchedAt: result.fetchedAt,
+      warning: result.warning || null,
     });
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/payment/mandates/callback/complete",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const { callbackId } = await parseBody(req);
+    sendJson(
+      res,
+      200,
+      await completePravaMandateCallback(userId, callbackId)
+    );
   }
 );
 
@@ -4385,12 +5553,226 @@ route(
       return sendJson(res, 404, { error: "Onboarding not found" });
     }
     const body = await parseBody(req);
-    sendJson(res, 200, await ucp.searchAll(body.query, {
-      limit: body.limit,
-      offset: body.offset,
-      market: body.market,
-      baseUrl: BASE_URL,
+    sendJson(res, 200, await searchUcpForSelectedAddress(userId, body));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/hermes/transcribe",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    if (!(await db.getUserById(userId))) {
+      return sendJson(res, 404, { error: "Onboarding not found" });
+    }
+    const body = await parseBody(req);
+    sendJson(res, 200, await hermes.transcribeAudio({
+      audioBase64: body.audioBase64,
+      mimeType: body.mimeType,
+      language: body.language,
     }));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/hermes/media",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    if (!(await db.getUserById(userId))) {
+      return sendJson(res, 404, { error: "Onboarding not found" });
+    }
+    const body = await parseBody(req);
+    sendJson(res, 200, await runHermesMediaBackend({
+      req,
+      userId,
+      messages: body.messages,
+      language: body.language,
+      dataBase64: body.dataBase64,
+      mimeType: body.mimeType,
+      declaredType: body.declaredType,
+    }));
+  }
+);
+
+route(
+  "GET",
+  "/api/v1/onboarding/:id/merchants/ucp/cart",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    if (!(await db.getUserById(userId))) {
+      return sendJson(res, 404, { error: "Onboarding not found" });
+    }
+    const [items, prescriptionReviewItems] = await Promise.all([
+      db.getUcpCart(userId),
+      db.getPrescriptionReviewItems(userId),
+    ]);
+    sendJson(res, 200, {
+      ...ucpCartPayload(items),
+      prescriptionReviewItems,
+    });
+  }
+);
+
+route(
+  "DELETE",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/items/:itemId",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const removedItem = await db.removeUcpCartItem(userId, params.itemId);
+    if (!removedItem) return sendJson(res, 404, { error: "Cart item was not found" });
+    sendJson(res, 200, {
+      removedItem,
+      cart: ucpCartPayload(await db.getUcpCart(userId)),
+    });
+  }
+);
+
+route(
+  "DELETE",
+  "/api/v1/onboarding/:id/merchants/ucp/cart",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const removedCount = await db.clearUcpCart(userId);
+    sendJson(res, 200, { removedCount, cart: ucpCartPayload([]) });
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/items",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    if (!(await db.getUserById(userId))) {
+      return sendJson(res, 404, { error: "Onboarding not found" });
+    }
+    const body = await parseBody(req);
+    const choiceId = String(body.choiceId || "").trim();
+    if (!/^[0-9a-f]{8}-[0-9a-f-]{27}$/i.test(choiceId)) {
+      throw Object.assign(new Error("choiceId is required"), { status: 400 });
+    }
+    const addition = await db.addSingleMerchantUcpCartItem(
+      userId,
+      choiceId,
+      body.quantity,
+      body.replaceCart === true
+    );
+    if (addition.expired) {
+      return sendJson(res, 409, {
+        error: "This product choice expired. Search again for current availability and price.",
+      });
+    }
+    if (addition.conflict) {
+      return sendJson(res, 409, {
+        error:
+          `Your cart is locked to ${addition.currentMerchantName}. `
+          + `Replace it before adding a product from ${addition.requestedMerchantName}.`,
+        code: "merchant_cart_conflict",
+        conflict: addition,
+      });
+    }
+    sendJson(res, 201, {
+      added: true,
+      addedItem: addition.addedItem,
+      replacedCart: addition.replacedCart,
+      cart: ucpCartPayload(await db.getUcpCart(userId)),
+    });
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/checkout",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    if (!(await db.getUserById(userId))) {
+      return sendJson(res, 404, { error: "Onboarding not found" });
+    }
+    const body = await parseBody(req);
+    const merchant = String(body.merchant || "").trim().toLowerCase();
+    if (!/^[a-z0-9][a-z0-9_-]{0,79}$/.test(merchant)) {
+      throw Object.assign(new Error("merchant is required"), { status: 400 });
+    }
+    const cartItems = await db.getUcpCartCheckoutItems(userId, merchant);
+    if (!cartItems.length) {
+      return sendJson(res, 404, { error: "This merchant cart is empty" });
+    }
+    if (cartItems.some((item) => item.expired)) {
+      return sendJson(res, 409, {
+        error: "One or more product prices expired. Search again before checkout.",
+      });
+    }
+    const result = await createUcpCheckoutQuote(userId, { cartItems });
+    sendJson(res, 201, result);
+  }
+);
+
+route(
+  "GET",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const row = await db.getUcpOrderIntent(userId, params.orderId);
+    if (!row) return sendJson(res, 404, { error: "Order quote was not found" });
+    sendJson(res, 200, publicUcpOrderIntent(row));
+  }
+);
+
+route(
+  "GET",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/payment-options",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const row = await db.getUcpOrderIntent(userId, params.orderId);
+    if (!row) return sendJson(res, 404, { error: "Order quote was not found" });
+    if (!row.price_confirmed_at || row.status === "CANCELED") {
+      return sendJson(res, 409, { error: "Confirm the final merchant price first" });
+    }
+    sendJson(res, 200, await ucpPaymentOptions(userId, row));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/decision",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const body = await parseBody(req);
+    sendJson(res, 200, await decideUcpOrder(userId, params.orderId, body.proceed));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/payment",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    sendJson(
+      res,
+      200,
+      await chooseUcpOrderPayment(userId, params.orderId, await parseBody(req))
+    );
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/payment/continue",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    sendJson(res, 200, await continueUcpOrderPayment(userId, params.orderId));
   }
 );
 
@@ -4428,12 +5810,28 @@ route(
   async (req, res, params) => {
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
-    const { addressId } = await parseBody(req);
-    const selected = await db.selectFamilyAddress(userId, addressId);
+    const body = await parseBody(req);
+    let selection;
+    try {
+      selection = await selectFamilyAddressWithCartPolicy(userId, body.addressId, {
+        replaceCart: body.replaceCart === true,
+      });
+    } catch (error) {
+      if (error.code === "cart_delivery_country_conflict") {
+        return sendJson(res, 409, {
+          error: error.message,
+          code: error.code,
+          conflict: error.conflict,
+        });
+      }
+      throw error;
+    }
+    const selected = selection?.selected;
     if (!selected) return sendJson(res, 404, { error: "Tokko address not found" });
     sendJson(res, 200, {
       selected: true,
       selectedAddress: publicFamilyAddress(selected),
+      cartCleared: selection.cartCleared,
       ...familyAddressPayload(await db.getFamilyAddresses(userId)),
     });
   }
@@ -4527,6 +5925,7 @@ route("GET", "/api/platforms", async (req, res) => {
 route("GET", "/api/addresses", async (req, res) => {
   try {
     const user = await auth.requireUser(req);
+    await db.clearDeliveryPreference(user.userId, "zepto");
     return sendJson(
       res,
       200,
@@ -4574,245 +5973,29 @@ route("POST", "/api/addresses", async (req, res) => {
     return sendJson(res, error.status || 400, { error: error.message });
   }
 });
-route("PUT", "/api/addresses/:id", async (req, res, params) => {
-  try {
-    const user = await auth.requireUser(req);
-    const body = await parseBody(req);
-    const updated = await db.updateFamilyAddress(
-      user.userId,
-      params.id,
-      familyAddressInput(body, { requireContact: true })
-    );
-    if (!updated) return sendJson(res, 404, { error: "Tokko address not found" });
-    await db.assignFamilyAddress(user.userId, params.id, body.memberIds);
-    await db.recordActivityEvent(user.userId, {
-      eventType: "address_updated",
-      title: `${updated.label} address updated`,
-      detail: updated.formatted_address,
-      entityType: "address",
-      entityId: params.id,
-    });
-    return sendJson(
-      res,
-      200,
-      familyAddressPayload(await db.getFamilyAddresses(user.userId))
-    );
-  } catch (error) {
-    return sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("DELETE", "/api/addresses/:id", async (req, res, params) => {
-  try {
-    const user = await auth.requireUser(req);
-    const removed = await db.deleteFamilyAddress(user.userId, params.id);
-    if (!removed) return sendJson(res, 404, { error: "Tokko address not found" });
-    await db.recordActivityEvent(user.userId, {
-      eventType: "address_removed",
-      title: "Delivery address removed",
-      entityType: "address",
-      entityId: params.id,
-    });
-    return sendJson(
-      res,
-      200,
-      familyAddressPayload(await db.getFamilyAddresses(user.userId))
-    );
-  } catch (error) {
-    return sendJson(res, error.status || 400, { error: error.message });
-  }
-});
 route("POST", "/api/addresses/select", async (req, res) => {
-  const { addressId } = await parseBody(req);
+  const body = await parseBody(req);
   try {
     const user = await auth.requireUser(req);
-    const selected = await db.selectFamilyAddress(user.userId, addressId);
+    const selection = await selectFamilyAddressWithCartPolicy(
+      user.userId,
+      body.addressId,
+      { replaceCart: body.replaceCart === true }
+    );
+    const selected = selection?.selected;
     if (!selected) return sendJson(res, 404, { error: "Tokko address not found" });
-    await db.recordActivityEvent(user.userId, {
-      eventType: "address_selected",
-      title: `${selected.label} set as default`,
-      detail: selected.formatted_address,
-      entityType: "address",
-      entityId: selected.id,
-    });
     return sendJson(res, 200, {
       selected: true,
       selectedAddress: publicFamilyAddress(selected),
+      cartCleared: selection.cartCleared,
       ...familyAddressPayload(await db.getFamilyAddresses(user.userId)),
     });
   } catch (error) {
-    return sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("GET", "/api/care-rules", async (req, res) => {
-  const user = await auth.requireUser(req);
-  sendJson(res, 200, { careRules: publicCareRules(await db.getCareRules(user.userId)) });
-});
-route("PUT", "/api/care-rules", async (req, res) => {
-  try {
-    const user = await auth.requireUser(req);
-    const rules = await db.saveCareRules(
-      user.userId,
-      careRulesInput(await parseBody(req))
-    );
-    await db.recordActivityEvent(user.userId, {
-      eventType: "care_rules_updated",
-      title: rules.approval_mode === "auto_essentials"
-        ? "Automatic essentials configured"
-        : "Approval required for every order",
-      detail: rules.approval_mode === "auto_essentials"
-        ? `${rules.currency} ${Number(rules.per_order_cap)} per order · ${rules.currency} ${Number(rules.monthly_cap)} monthly`
-        : "Tokko will ask before every purchase",
-      entityType: "care_rules",
+    return sendJson(res, error.status || 400, {
+      error: error.message,
+      ...(error.code ? { code: error.code } : {}),
+      ...(error.conflict ? { conflict: error.conflict } : {}),
     });
-    sendJson(res, 200, { careRules: publicCareRules(rules) });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("GET", "/api/preferences", async (req, res) => {
-  const user = await auth.requireUser(req);
-  sendJson(res, 200, {
-    preferences: publicPreferences(await db.getUserPreferences(user.userId)),
-  });
-});
-route("PUT", "/api/preferences", async (req, res) => {
-  try {
-    const user = await auth.requireUser(req);
-    const current = await db.getUserPreferences(user.userId);
-    const preferences = await db.saveUserPreferences(
-      user.userId,
-      preferenceInput(await parseBody(req), current)
-    );
-    sendJson(res, 200, { preferences: publicPreferences(preferences) });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("GET", "/api/decisions", async (req, res) => {
-  try {
-    const user = await auth.requireUser(req);
-    const query = getQuery(req);
-    const status = !query.status || query.status === "all" ? null : query.status;
-    if (status && !new Set(["pending", "resolved", "expired"]).has(status)) {
-      throw Object.assign(new Error("status is invalid"), { status: 400 });
-    }
-    const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 50, 1), 100);
-    const decisions = await db.getDecisionRequests(user.userId, { status, limit });
-    sendJson(res, 200, { decisions: decisions.map(publicDecision) });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("POST", "/api/decisions/:id/resolve", async (req, res, params) => {
-  try {
-    const user = await auth.requireUser(req);
-    const body = await parseBody(req);
-    const resolution = String(body.resolution || "").trim();
-    if (!new Set(["approve", "decline"]).has(resolution)) {
-      throw Object.assign(new Error("resolution must be approve or decline"), {
-        status: 400,
-      });
-    }
-    const note = String(body.note || "").trim().slice(0, 500) || null;
-    const current = (await db.getDecisionRequests(user.userId, { limit: 100 }))
-      .find((entry) => entry.id === params.id);
-    if (current?.request_type === "safety_stop" && resolution === "approve") {
-      throw Object.assign(
-        new Error("A safety stop cannot be approved; review or decline the request"),
-        { status: 409 }
-      );
-    }
-    const result = await db.resolveDecisionRequest(
-      user.userId,
-      params.id,
-      resolution,
-      note
-    );
-    if (result.outcome === "not_found") {
-      return sendJson(res, 404, { error: "Decision request not found" });
-    }
-    if (result.outcome === "conflict") {
-      return sendJson(res, 409, {
-        error: "This request was already resolved differently",
-        decision: publicDecision(result.decision),
-      });
-    }
-    if (result.outcome === "expired") {
-      return sendJson(res, 409, {
-        error: "This request has expired",
-        decision: publicDecision(result.decision),
-      });
-    }
-    if (result.outcome === "resolved") {
-      await db.recordActivityEvent(user.userId, {
-        eventType: `decision_${resolution}d`,
-        title: resolution === "approve" ? "Request approved" : "Request declined",
-        detail: current?.title || null,
-        entityType: "decision",
-        entityId: params.id,
-        metadata: { resolution },
-      });
-    }
-    sendJson(res, 200, {
-      outcome: result.outcome,
-      decision: publicDecision(result.decision),
-    });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("GET", "/api/activity", async (req, res) => {
-  try {
-    const user = await auth.requireUser(req);
-    const limit = Math.min(
-      Math.max(Number.parseInt(getQuery(req).limit, 10) || 50, 1),
-      100
-    );
-    sendJson(res, 200, {
-      activity: (await db.getActivityEvents(user.userId, limit)).map(publicActivity),
-    });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
-  }
-});
-route("POST", "/api/v1/decisions", async (req, res) => {
-  try {
-    await auth.requireService(req);
-    const body = await parseBody(req);
-    let user = null;
-    if (body.userId || body.familyUserId) {
-      user = await db.getUserById(parseOnboardingId(body.userId || body.familyUserId));
-    } else if (body.email || body.familyEmail) {
-      user = await db.getUserByEmail(body.email || body.familyEmail);
-    } else if (body.phone || body.familyPhone) {
-      const userId = await resolveOnboardingUserId(body.phone || body.familyPhone);
-      user = await db.getUserById(userId);
-    }
-    if (!user) {
-      throw Object.assign(
-        new Error("A valid userId, email, or family phone is required"),
-        { status: 404 }
-      );
-    }
-    const input = decisionRequestInput(body);
-    const decision = await db.createDecisionRequest(Number(user.id), input);
-    if (!decision) {
-      throw Object.assign(
-        new Error("The selected family member or address was not found"),
-        { status: 404 }
-      );
-    }
-    await db.recordActivityEvent(Number(user.id), {
-      eventType: "decision_requested",
-      title: input.title,
-      detail: input.reasonText,
-      entityType: "decision",
-      entityId: input.id,
-      metadata: { requestType: input.requestType },
-    });
-    sendJson(res, 201, { decision: publicDecision(decision) });
-  } catch (error) {
-    sendJson(res, error.status || 400, { error: error.message });
   }
 });
 route("POST", "/api/location/serviceability", async (req, res) => {
@@ -5763,6 +6946,20 @@ route("POST", "/api/hermes/transcribe", async (req, res) => {
   );
 });
 
+route("POST", "/api/hermes/media", async (req, res) => {
+  const user = await auth.requireUser(req);
+  const body = await parseBody(req);
+  sendJson(res, 200, await runHermesMediaBackend({
+    req,
+    userId: user.userId,
+    messages: body.messages,
+    language: body.language,
+    dataBase64: body.dataBase64,
+    mimeType: body.mimeType,
+    declaredType: body.declaredType,
+  }));
+});
+
 route("POST", "/api/hermes/checkout/continue", async (req, res) => {
   const user = await auth.requireUser(req);
   const body = await parseBody(req);
@@ -5807,6 +7004,13 @@ async function runHermesBackend({
   language,
   approvalToken = null,
 }) {
+  const activeCart = await db.getUcpCart(userId);
+  const cartActionResult = await handleRequestedCartAction(
+    userId,
+    messages,
+    activeCart
+  );
+  if (cartActionResult) return cartActionResult;
   if (!hermes.configuration().configured) {
     throw Object.assign(
       new Error("Hermes is not configured. Add GEMINI_API_KEY to the deployment."),
@@ -5825,6 +7029,8 @@ async function runHermesBackend({
     getUserState(userId, clerkUserId),
     db.getHermesMemories(userId),
   ]);
+  const lockedMerchant = activeCart[0]?.merchant || null;
+  const lockedMerchantName = activeCart[0]?.merchantName || null;
   const tools = [
     HERMES_UCP_SEARCH_TOOL,
     HERMES_UCP_CHECKOUT_TOOL,
@@ -5832,11 +7038,24 @@ async function runHermesBackend({
   const selectedDeliveryCountry = String(
     state.deliveryPreference?.countryCode || ""
   ).trim().toUpperCase();
-  const selectedDeliveryMarket = ["IN", "US"].includes(
-    selectedDeliveryCountry
-  )
+  const selectedDeliveryMarket = /^[A-Z]{2}$/.test(selectedDeliveryCountry)
     ? selectedDeliveryCountry
     : null;
+  const countryConflict = ucpCartCountryConflict(
+    activeCart,
+    selectedDeliveryMarket
+  );
+  if (countryConflict) {
+    return {
+      message: `${cartCountryConflictMessage(countryConflict)} Clear it and I’ll retry your search using merchants that deliver to ${countryConflict.targetCountry}.`,
+      tools: [],
+      cartSummary: ucpCartPayload(activeCart),
+      cartCountryConflict: {
+        ...countryConflict,
+        retryQuery: latestUserMessageText(messages).slice(0, 300),
+      },
+    };
+  }
   const result = await hermes.run({
     userId,
     messages,
@@ -5866,6 +7085,18 @@ async function runHermesBackend({
       confirmedDeliveryAddress:
         state.deliveryPreference?.formattedAddress || null,
       selectedDeliveryCountry: selectedDeliveryMarket,
+      lockedMerchant,
+      lockedMerchantName,
+      eligibleMerchants: selectedDeliveryMarket === "IN"
+        ? Object.values(ucp.MERCHANTS)
+            .filter((merchant) => merchant.market === "IN")
+            .map((merchant) => ({ slug: merchant.slug, name: merchant.name }))
+        : selectedDeliveryMarket
+          ? [{
+              slug: "global_ucp",
+              name: `Global UCP catalogue shipping to ${selectedDeliveryMarket}`,
+            }]
+          : [],
       responseLanguage: hermes.normalizeResponseLanguage(language),
       learnedMemories,
     },
@@ -5873,13 +7104,16 @@ async function runHermesBackend({
       if (toolName === HERMES_UCP_SEARCH_TOOL.name) {
         if (!selectedDeliveryMarket) {
           throw Object.assign(
-            new Error("Select an India or US delivery address before searching"),
+            new Error(
+              "Select a delivery address with a valid two-letter country code before searching"
+            ),
             { status: 409 }
           );
         }
         return executeHermesTool(req, userId, toolName, {
           ...args,
           market: selectedDeliveryMarket,
+          ...(lockedMerchant ? { merchant: lockedMerchant } : {}),
         });
       }
       return executeHermesTool(req, userId, toolName, args);
@@ -5896,20 +7130,39 @@ async function runHermesBackend({
       )
     );
   }
-  const searchResult = [...(result.tools || [])]
-    .reverse()
-    .find((tool) =>
-      tool.name === HERMES_UCP_SEARCH_TOOL.name &&
-      tool.status === "completed"
-    )?.result;
-  if (Array.isArray(searchResult?.products)) {
-    const shownProducts = searchResult.products.slice(0, 3);
-    result.productChoices = shownProducts;
-    result.merchantStatuses = searchResult.merchants || [];
-    result.productQuery = searchResult.query;
-    result.productPagination = searchResult.pagination || null;
-    result.message = shownProducts.length
-      ? `i found ${shownProducts.length} good option${shownProducts.length === 1 ? "" : "s"} for you, best value first. select the one you want.`
+  const searchResults = (result.tools || [])
+    .filter((tool) =>
+      tool.name === HERMES_UCP_SEARCH_TOOL.name
+      && tool.status === "completed"
+      && Array.isArray(tool.result?.products)
+    )
+    .map((tool) => tool.result);
+  if (searchResults.length) {
+    for (const searchResult of searchResults) {
+      searchResult.products = rankUcpProducts(searchResult.products, learnedMemories);
+    }
+    result.productGroups = await Promise.all(searchResults.map(async (searchResult) => ({
+      query: searchResult.query,
+      merchant: searchResult.merchants?.[0]?.merchant || null,
+      merchantName: searchResult.merchants?.[0]?.merchantName || null,
+      products: await db.saveUcpProductChoices(
+        userId,
+        searchResult.products.slice(0, 10),
+        searchResult.query
+      ),
+      pagination: searchResult.pagination || null,
+    })));
+    result.productChoices = result.productGroups.flatMap((group) =>
+      group.products.map((product) => ({ ...product, searchQuery: group.query }))
+    );
+    result.merchantStatuses = searchResults.flatMap((entry) => entry.merchants || []);
+    result.productQuery = searchResults.length === 1 ? searchResults[0].query : null;
+    result.productPagination = searchResults.length === 1
+      ? searchResults[0].pagination || null
+      : null;
+    const foundGroups = result.productGroups.filter((group) => group.products.length);
+    result.message = foundGroups.length
+      ? `i found ${foundGroups.map((group) => `${group.products.length} preferred options for ${group.query}`).join(", ")}. tap a product to add it to your cart.`
       : "i could not find an image-backed match for that search. try a broader product name.";
   }
   const checkoutResult = [...(result.tools || [])]
@@ -5918,30 +7171,104 @@ async function runHermesBackend({
       tool.name === HERMES_UCP_CHECKOUT_TOOL.name &&
       tool.status === "completed"
     )?.result;
-  if (checkoutResult?.merchantHandoffUrl) {
-    result.merchantHandoffUrl = checkoutResult.merchantHandoffUrl;
+  if (checkoutResult?.orderId) {
+    result.merchantHandoffUrl = null;
     result.paymentUrl = null;
-    result.paymentHandoff = checkoutResult.paymentHandoff || null;
-    result.cardChoices = checkoutResult.cardChoices || [];
-    result.checkoutSummary = publicUcpCheckoutSummary(checkoutResult);
-    result.message = checkoutResult.paymentRoute === "card_selection_required"
-      ? `the selected address and phone are prefilled. no active mandate covers ${checkoutResult.currency} ${checkoutResult.totalAmount}. choose which saved prava card you want to use.`
-      : checkoutResult.paymentRoute === "mandate"
-      ? `i prefilled the selected address and phone, checked ${checkoutResult.mandateCheck?.checkedMandateCount || 0} prava mandates, and selected an active mandate that covers ${checkoutResult.currency} ${checkoutResult.totalAmount}.`
-      : checkoutResult.paymentRoute === "prava_card"
-        ? "i prefilled the selected address and phone. no eligible mandate covered the total, so trakko selected the approved saved card. the merchant checkout did not advertise a compatible prava payment handler, so it may still ask for payment confirmation."
-        : `i prefilled the selected address and phone and checked ${checkoutResult.mandateCheck?.checkedMandateCount || 0} prava mandates, but no eligible mandate or saved card could cover ${checkoutResult.currency} ${checkoutResult.totalAmount}.`;
-    result.nextAction = checkoutResult.paymentRoute === "card_selection_required"
-      ? null
-      : {
-          type: "merchant_ucp_checkout",
-          url: checkoutResult.merchantHandoffUrl,
-          label: `Continue to ${checkoutResult.merchantName} checkout`,
-          paymentHandoff: checkoutResult.paymentHandoff || null,
-          paymentSelection: checkoutResult.paymentSelection || null,
-          checkoutSummary: publicUcpCheckoutSummary(checkoutResult),
-        };
+    result.paymentHandoff = null;
+    result.cardChoices = [];
+    result.checkoutSummary = {
+      orderId: checkoutResult.orderId,
+      currency: checkoutResult.currency,
+      totalAmount: checkoutResult.totalAmount,
+      ...(checkoutResult.quote || {}),
+      confirmationRequired: true,
+    };
+    result.message =
+      `the merchant returned a final ${checkoutResult.currency} ${checkoutResult.totalAmount} quote. `
+      + "review the full breakdown and choose proceed with order or do not place order.";
+    result.nextAction = {
+      type: "ucp_quote_confirmation",
+      orderId: checkoutResult.orderId,
+      actions: checkoutResult.actions,
+    };
   }
+  return result;
+}
+
+async function runHermesMediaBackend({
+  req,
+  userId,
+  messages,
+  language,
+  dataBase64,
+  mimeType,
+  declaredType,
+}) {
+  const inspection = await hermes.inspectShoppingMedia({
+    dataBase64,
+    mimeType,
+    language,
+    declaredType,
+  });
+  const isPrescription =
+    String(declaredType || "").toLowerCase() === "prescription"
+    || inspection.documentType === "prescription";
+  if (isPrescription) {
+    const names = inspection.items.map((item) => item.name).filter(Boolean);
+    if (!names.length) {
+      return {
+        message: "i could not read a clear medicine name from that prescription. upload a sharper image or type the names.",
+        mediaInspection: { documentType: "prescription", items: [] },
+        prescriptionReviewItems: [],
+      };
+    }
+    const sourceHash = nodeCrypto
+      .createHash("sha256")
+      .update(Buffer.from(String(dataBase64 || ""), "base64"))
+      .digest("hex");
+    const prescriptionReviewItems = await db.savePrescriptionReviewItems(
+      userId,
+      names,
+      sourceHash
+    );
+    await db.upsertHermesMemory(userId, {
+      type: "health_context",
+      cue: "medicines extracted from current prescription",
+      value: { medicines: names, verificationRequired: true },
+      confidence: 0.85,
+    });
+    return {
+      message:
+        `i extracted ${names.join(", ")} and added ${names.length === 1 ? "it" : "them"} to prescription review. `
+        + "checkout is blocked until a licensed pharmacy verifies the prescription; i will not infer dosage or substitute medicines.",
+      mediaInspection: {
+        documentType: "prescription",
+        items: inspection.items,
+      },
+      prescriptionReviewItems,
+      productChoices: [],
+    };
+  }
+  const queries = inspection.items.map((item) => item.name).filter(Boolean).slice(0, 5);
+  const productQuery = inspection.query || queries.join(", ");
+  if (!productQuery) {
+    return {
+      message: "i could not identify a product from that image. upload a clearer front-label photo or type the product name.",
+      mediaInspection: inspection,
+      productChoices: [],
+    };
+  }
+  const priorMessages = Array.isArray(messages) ? messages : [];
+  const request = queries.length > 1
+    ? `find 3 preferred options for each of these products from the upload: ${queries.join(", ")}`
+    : `find 3 preferred options matching this uploaded product: ${productQuery}`;
+  const result = await runHermesBackend({
+    req,
+    userId,
+    messages: [...priorMessages, { role: "user", content: request }],
+    language,
+  });
+  result.mediaInspection = inspection;
   return result;
 }
 
@@ -6022,15 +7349,26 @@ async function maybeVerifyHermesZeptoOtp(userId, messages) {
 
 async function executeHermesTool(req, userId, toolName, args) {
   if (toolName === HERMES_UCP_SEARCH_TOOL.name) {
+    const market = String(args?.market || "").trim().toUpperCase();
+    if (market && market !== "IN") {
+      return ucp.searchGlobalMarket(args?.query, {
+        limit: 10,
+        offset: args?.offset,
+        market,
+        merchant: args?.merchant,
+        baseUrl: BASE_URL,
+      });
+    }
     return ucp.searchAll(args?.query, {
-      limit: 50,
+      limit: 10,
       offset: args?.offset,
       market: args?.market,
+      merchant: args?.merchant,
       baseUrl: BASE_URL,
     });
   }
   if (toolName === HERMES_UCP_CHECKOUT_TOOL.name) {
-    return createUcpCheckoutWithPayment(userId, args);
+    return createUcpCheckoutQuote(userId, args);
   }
   if (toolName === HERMES_ZEPTO_RECONNECT_TOOL.name) {
     const result = await auth.startMerchantAuth(userId, "zepto", BASE_URL);
@@ -6117,30 +7455,55 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   });
 });
 
+route("POST", "/api/integrations/telegram/hermes/cart-country-retry", async (req, res) => {
+  await requireTelegramIntegration(req);
+  const body = await parseBody(req);
+  const chatId = telegramChatIdentifier(body);
+  const user = await telegramFamilyUser(body, chatId);
+  req.tokkoServiceUserId = Number(user.id);
+  const history = await db.getTelegramHermesMessages(chatId, 23);
+  const lastUserIndex = history.map((message) => message.role).lastIndexOf("user");
+  const retryMessages = lastUserIndex >= 0
+    ? history.slice(0, lastUserIndex + 1)
+    : [];
+  const retryQuery = latestUserMessageText(retryMessages);
+  if (!retryQuery) {
+    throw Object.assign(new Error("No previous product search is available to retry"), {
+      status: 409,
+    });
+  }
+  await db.clearUcpCart(Number(user.id));
+  const result = await runHermesBackend({
+    req,
+    userId: Number(user.id),
+    clerkUserId: user.clerk_user_id || null,
+    messages: retryMessages.map((message) => ({
+      role: message.role,
+      content: message.content,
+    })),
+    language: body.language || body.locale || "en-IN",
+  });
+  if (result.message) {
+    await db.saveTelegramHermesMessage(chatId, "assistant", result.message);
+  }
+  sendJson(res, 200, {
+    ...result,
+    cartCountryConflict: null,
+    cartCleared: true,
+    retriedQuery: retryQuery,
+    telegram: { chatId, familyLinked: true },
+  });
+});
+
 route(
   "POST",
   "/api/integrations/telegram/hermes/payment-choice",
   async (req, res) => {
     await requireTelegramIntegration(req);
-    const body = await parseBody(req);
-    const chatId = telegramChatIdentifier(body);
-    const user = await telegramFamilyUser(body, chatId);
-    const result = await selectUcpSavedCard(
-      Number(user.id),
-      String(body.token || "")
+    throw Object.assign(
+      new Error("Use the confirmed order payment endpoint; merchant redirects are disabled"),
+      { status: 410 }
     );
-    await db.saveTelegramHermesMessage(
-      chatId,
-      "assistant",
-      `saved ${result.savedCard.brand} ending ${result.savedCard.last4} selected for ${result.merchantName} checkout`
-    );
-    sendJson(res, 200, {
-      ...result,
-      message:
-        `${result.savedCard.brand} ending ${result.savedCard.last4} is selected. `
-        + "The merchant may still ask you to confirm the card because it does not advertise a Prava payment handler.",
-      telegram: { chatId, familyLinked: true },
-    });
   }
 );
 
@@ -6179,6 +7542,8 @@ async function handler(req, res) {
       if (!res.headersSent) {
         sendJson(res, status, {
           error: error.status ? error.message : "Internal server error",
+          ...(error.code ? { code: error.code } : {}),
+          ...(error.conflict ? { conflict: error.conflict } : {}),
         });
       }
     }
@@ -6189,6 +7554,460 @@ async function handler(req, res) {
   }
   return serveStatic(res, pathname);
 }
+
+
+// ==== Family-care verticals grafted from main ====
+// ===== HELPERS =====
+
+function optionalMoney(value, field) {
+  if (value === undefined || value === null || value === "") return null;
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0 || amount > 1_000_000) {
+    throw Object.assign(new Error(`${field} must be between 0 and 1,000,000`), {
+      status: 400,
+    });
+  }
+  return Math.round(amount * 100) / 100;
+}
+
+function careRulesInput(value = {}) {
+  const approvalMode = String(value.approvalMode || "ask_every_time").trim();
+  if (!CARE_APPROVAL_MODES.has(approvalMode)) {
+    throw Object.assign(new Error("Choose a valid purchase approval mode"), {
+      status: 400,
+    });
+  }
+  const currency = String(value.currency || "INR").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw Object.assign(new Error("currency must use a three-letter code"), {
+      status: 400,
+    });
+  }
+  const monthlyCap = optionalMoney(value.monthlyCap, "monthlyCap");
+  const perOrderCap = optionalMoney(value.perOrderCap, "perOrderCap");
+  if (approvalMode === "auto_essentials" && (!monthlyCap || !perOrderCap)) {
+    throw Object.assign(
+      new Error("Automatic essentials need both monthly and per-order limits"),
+      { status: 400 }
+    );
+  }
+  if (monthlyCap && perOrderCap && perOrderCap > monthlyCap) {
+    throw Object.assign(
+      new Error("The per-order limit cannot exceed the monthly limit"),
+      { status: 400 }
+    );
+  }
+  const allowedCategories = [...new Set(
+    (Array.isArray(value.allowedCategories) ? value.allowedCategories : [])
+      .map((item) => String(item).trim().toLowerCase())
+      .filter((item) => CARE_CATEGORIES.has(item))
+  )];
+  const blockedItems = [...new Set(
+    (Array.isArray(value.blockedItems) ? value.blockedItems : [])
+      .map((item) => String(item).trim().slice(0, 80))
+      .filter(Boolean)
+  )].slice(0, 30);
+  if (approvalMode === "auto_essentials" && allowedCategories.length === 0) {
+    throw Object.assign(
+      new Error("Choose at least one category for automatic essentials"),
+      { status: 400 }
+    );
+  }
+  return {
+    approvalMode,
+    monthlyCap: approvalMode === "auto_essentials" ? monthlyCap : null,
+    perOrderCap: approvalMode === "auto_essentials" ? perOrderCap : null,
+    currency,
+    repeatKnownEssentials:
+      approvalMode === "auto_essentials" && value.repeatKnownEssentials === true,
+    allowedCategories:
+      approvalMode === "auto_essentials" ? allowedCategories : [],
+    blockedItems,
+  };
+}
+
+function publicCareRules(rules) {
+  if (!rules) return null;
+  const numberOrNull = (value) =>
+    value === null || value === undefined ? null : Number(value);
+  return {
+    approvalMode: rules.approval_mode,
+    monthlyCap: numberOrNull(rules.monthly_cap),
+    perOrderCap: numberOrNull(rules.per_order_cap),
+    currency: rules.currency || "INR",
+    repeatKnownEssentials: rules.repeat_known_essentials === true,
+    allowedCategories: rules.allowed_categories || [],
+    blockedItems: rules.blocked_items || [],
+    updatedAt: rules.updated_at || null,
+  };
+}
+
+function preferenceInput(value = {}, current = null) {
+  const pick = (key, column, fallback) =>
+    typeof value[key] === "boolean" ? value[key] : current?.[column] ?? fallback;
+  return {
+    decisionAlerts: pick("decisionAlerts", "decision_alerts", true),
+    deliveryUpdates: pick("deliveryUpdates", "delivery_updates", true),
+    weeklyDigest: pick("weeklyDigest", "weekly_digest", false),
+  };
+}
+
+function publicPreferences(preferences) {
+  const values = preferenceInput({}, preferences);
+  return {
+    ...values,
+    updatedAt: preferences?.updated_at || null,
+  };
+}
+
+function decisionRequestInput(value = {}) {
+  const requiredText = (key, max) => {
+    const text = String(value[key] || "").trim();
+    if (!text) {
+      throw Object.assign(new Error(`${key} is required`), { status: 400 });
+    }
+    return text.slice(0, max);
+  };
+  const optionalText = (key, max) => {
+    const text = String(value[key] || "").trim();
+    return text ? text.slice(0, max) : null;
+  };
+  const requestType = String(value.requestType || "purchase_approval").trim();
+  if (!new Set([
+    "purchase_approval",
+    "substitution",
+    "address_confirmation",
+    "safety_stop",
+  ]).has(requestType)) {
+    throw Object.assign(new Error("requestType is invalid"), { status: 400 });
+  }
+  const numericId = (key) => {
+    if (value[key] === undefined || value[key] === null || value[key] === "") {
+      return null;
+    }
+    const id = Number(value[key]);
+    if (!Number.isSafeInteger(id) || id <= 0) {
+      throw Object.assign(new Error(`${key} is invalid`), { status: 400 });
+    }
+    return id;
+  };
+  const amount = optionalMoney(value.amount, "amount");
+  const currency = String(value.currency || "INR").trim().toUpperCase();
+  if (!/^[A-Z]{3}$/.test(currency)) {
+    throw Object.assign(new Error("currency must use a three-letter code"), {
+      status: 400,
+    });
+  }
+  let expiresAt = null;
+  if (value.expiresAt) {
+    const parsed = new Date(value.expiresAt);
+    if (Number.isNaN(parsed.getTime()) || parsed.getTime() <= Date.now()) {
+      throw Object.assign(new Error("expiresAt must be in the future"), {
+        status: 400,
+      });
+    }
+    expiresAt = parsed.toISOString();
+  }
+  const jsonObject = (key) =>
+    value[key] && typeof value[key] === "object" && !Array.isArray(value[key])
+      ? value[key]
+      : {};
+  return {
+    id: nodeCrypto.randomUUID(),
+    memberId: numericId("memberId"),
+    addressId: numericId("addressId"),
+    requestType,
+    title: requiredText("title", 180),
+    originalRequest: optionalText("originalRequest", 1_000),
+    merchantName: optionalText("merchantName", 160),
+    product: jsonObject("product"),
+    amount,
+    currency,
+    reasonCode: optionalText("reasonCode", 60),
+    reasonText: requiredText("reasonText", 1_000),
+    paymentContext: jsonObject("paymentContext"),
+    actionContext: jsonObject("actionContext"),
+    expiresAt,
+  };
+}
+
+function publicDecision(decision) {
+  if (!decision) return null;
+  return {
+    id: decision.id,
+    memberId: decision.member_id ? String(decision.member_id) : null,
+    memberName: decision.member_name || null,
+    requestType: decision.request_type,
+    status: decision.status,
+    title: decision.title,
+    originalRequest: decision.original_request || null,
+    merchantName: decision.merchant_name || null,
+    product: decision.product || {},
+    amount: decision.amount === null ? null : Number(decision.amount),
+    currency: decision.currency,
+    addressId: decision.address_id ? String(decision.address_id) : null,
+    addressLabel: decision.address_label || null,
+    formattedAddress: decision.formatted_address || null,
+    reasonCode: decision.reason_code || null,
+    reasonText: decision.reason_text,
+    resolution: decision.resolution || null,
+    resolutionNote: decision.resolution_note || null,
+    expiresAt: decision.expires_at || null,
+    resolvedAt: decision.resolved_at || null,
+    createdAt: decision.created_at,
+    updatedAt: decision.updated_at,
+  };
+}
+
+function publicActivity(event) {
+  return {
+    id: String(event.id),
+    eventType: event.event_type,
+    title: event.title,
+    detail: event.detail || null,
+    entityType: event.entity_type || null,
+    entityId: event.entity_id || null,
+    metadata: event.metadata || {},
+    createdAt: event.created_at,
+  };
+}
+
+// ===== ROUTES =====
+
+route("POST", "/api/auth/clerk/session", async (req, res) => {
+  const { identity, email } = await auth.authenticateClerkUser(req);
+  const user = await db.getOrCreateWebsiteUser(identity.userId, email);
+  await createBrowserSession(req, res, user);
+});
+
+route("PUT", "/api/addresses/:id", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const body = await parseBody(req);
+    const updated = await db.updateFamilyAddress(
+      user.userId,
+      params.id,
+      familyAddressInput(body, { requireContact: true })
+    );
+    if (!updated) return sendJson(res, 404, { error: "Tokko address not found" });
+    await db.assignFamilyAddress(user.userId, params.id, body.memberIds);
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_updated",
+      title: `${updated.label} address updated`,
+      detail: updated.formatted_address,
+      entityType: "address",
+      entityId: params.id,
+    });
+    return sendJson(
+      res,
+      200,
+      familyAddressPayload(await db.getFamilyAddresses(user.userId))
+    );
+  } catch (error) {
+    return sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("DELETE", "/api/addresses/:id", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const removed = await db.deleteFamilyAddress(user.userId, params.id);
+    if (!removed) return sendJson(res, 404, { error: "Tokko address not found" });
+    await db.recordActivityEvent(user.userId, {
+      eventType: "address_removed",
+      title: "Delivery address removed",
+      entityType: "address",
+      entityId: params.id,
+    });
+    return sendJson(
+      res,
+      200,
+      familyAddressPayload(await db.getFamilyAddresses(user.userId))
+    );
+  } catch (error) {
+    return sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("GET", "/api/care-rules", async (req, res) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, { careRules: publicCareRules(await db.getCareRules(user.userId)) });
+});
+
+route("PUT", "/api/care-rules", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const rules = await db.saveCareRules(
+      user.userId,
+      careRulesInput(await parseBody(req))
+    );
+    await db.recordActivityEvent(user.userId, {
+      eventType: "care_rules_updated",
+      title: rules.approval_mode === "auto_essentials"
+        ? "Automatic essentials configured"
+        : "Approval required for every order",
+      detail: rules.approval_mode === "auto_essentials"
+        ? `${rules.currency} ${Number(rules.per_order_cap)} per order · ${rules.currency} ${Number(rules.monthly_cap)} monthly`
+        : "Tokko will ask before every purchase",
+      entityType: "care_rules",
+    });
+    sendJson(res, 200, { careRules: publicCareRules(rules) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("GET", "/api/preferences", async (req, res) => {
+  const user = await auth.requireUser(req);
+  sendJson(res, 200, {
+    preferences: publicPreferences(await db.getUserPreferences(user.userId)),
+  });
+});
+
+route("PUT", "/api/preferences", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const current = await db.getUserPreferences(user.userId);
+    const preferences = await db.saveUserPreferences(
+      user.userId,
+      preferenceInput(await parseBody(req), current)
+    );
+    sendJson(res, 200, { preferences: publicPreferences(preferences) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("GET", "/api/decisions", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const query = getQuery(req);
+    const status = !query.status || query.status === "all" ? null : query.status;
+    if (status && !new Set(["pending", "resolved", "expired"]).has(status)) {
+      throw Object.assign(new Error("status is invalid"), { status: 400 });
+    }
+    const limit = Math.min(Math.max(Number.parseInt(query.limit, 10) || 50, 1), 100);
+    const decisions = await db.getDecisionRequests(user.userId, { status, limit });
+    sendJson(res, 200, { decisions: decisions.map(publicDecision) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("POST", "/api/decisions/:id/resolve", async (req, res, params) => {
+  try {
+    const user = await auth.requireUser(req);
+    const body = await parseBody(req);
+    const resolution = String(body.resolution || "").trim();
+    if (!new Set(["approve", "decline"]).has(resolution)) {
+      throw Object.assign(new Error("resolution must be approve or decline"), {
+        status: 400,
+      });
+    }
+    const note = String(body.note || "").trim().slice(0, 500) || null;
+    const current = (await db.getDecisionRequests(user.userId, { limit: 100 }))
+      .find((entry) => entry.id === params.id);
+    if (current?.request_type === "safety_stop" && resolution === "approve") {
+      throw Object.assign(
+        new Error("A safety stop cannot be approved; review or decline the request"),
+        { status: 409 }
+      );
+    }
+    const result = await db.resolveDecisionRequest(
+      user.userId,
+      params.id,
+      resolution,
+      note
+    );
+    if (result.outcome === "not_found") {
+      return sendJson(res, 404, { error: "Decision request not found" });
+    }
+    if (result.outcome === "conflict") {
+      return sendJson(res, 409, {
+        error: "This request was already resolved differently",
+        decision: publicDecision(result.decision),
+      });
+    }
+    if (result.outcome === "expired") {
+      return sendJson(res, 409, {
+        error: "This request has expired",
+        decision: publicDecision(result.decision),
+      });
+    }
+    if (result.outcome === "resolved") {
+      await db.recordActivityEvent(user.userId, {
+        eventType: `decision_${resolution}d`,
+        title: resolution === "approve" ? "Request approved" : "Request declined",
+        detail: current?.title || null,
+        entityType: "decision",
+        entityId: params.id,
+        metadata: { resolution },
+      });
+    }
+    sendJson(res, 200, {
+      outcome: result.outcome,
+      decision: publicDecision(result.decision),
+    });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("GET", "/api/activity", async (req, res) => {
+  try {
+    const user = await auth.requireUser(req);
+    const limit = Math.min(
+      Math.max(Number.parseInt(getQuery(req).limit, 10) || 50, 1),
+      100
+    );
+    sendJson(res, 200, {
+      activity: (await db.getActivityEvents(user.userId, limit)).map(publicActivity),
+    });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
+
+route("POST", "/api/v1/decisions", async (req, res) => {
+  try {
+    await auth.requireService(req);
+    const body = await parseBody(req);
+    let user = null;
+    if (body.userId || body.familyUserId) {
+      user = await db.getUserById(parseOnboardingId(body.userId || body.familyUserId));
+    } else if (body.email || body.familyEmail) {
+      user = await db.getUserByEmail(body.email || body.familyEmail);
+    } else if (body.phone || body.familyPhone) {
+      const userId = await resolveOnboardingUserId(body.phone || body.familyPhone);
+      user = await db.getUserById(userId);
+    }
+    if (!user) {
+      throw Object.assign(
+        new Error("A valid userId, email, or family phone is required"),
+        { status: 404 }
+      );
+    }
+    const input = decisionRequestInput(body);
+    const decision = await db.createDecisionRequest(Number(user.id), input);
+    if (!decision) {
+      throw Object.assign(
+        new Error("The selected family member or address was not found"),
+        { status: 404 }
+      );
+    }
+    await db.recordActivityEvent(Number(user.id), {
+      eventType: "decision_requested",
+      title: input.title,
+      detail: input.reasonText,
+      entityType: "decision",
+      entityId: input.id,
+      metadata: { requestType: input.requestType },
+    });
+    sendJson(res, 201, { decision: publicDecision(decision) });
+  } catch (error) {
+    sendJson(res, error.status || 400, { error: error.message });
+  }
+});
 
 const server = http.createServer(handler);
 
@@ -6227,9 +8046,8 @@ Object.assign(server, {
   HERMES_ZEPTO_RECONNECT_TOOL,
   MERCHANT_CONSENT_TEXT,
   canonicalPravaCustomerId,
-  careRulesInput,
+  continueUcpOrderPayment,
   createUcpCheckoutWithPayment,
-  decisionRequestInput,
   familyAddressInput,
   familyAddressPayload,
   handler,
@@ -6239,18 +8057,25 @@ Object.assign(server, {
   pravaReturnCallback,
   pravaPaymentHandoff,
   readRawBody,
+  requestedCartAction,
+  ucpCartCountryConflict,
   savedAddressInput,
   selectUcpSavedCard,
   server,
   start,
   hermesOtpFromMessages,
   mandateListPayload,
+  listPravaMandatesForUser,
+  pravaCustomerIdCandidates,
   telegramChatIdentifier,
   telegramBotUsername,
   telegramMessageText,
   tokkoPaymentRoute,
   usablePravaMandatesForAmount,
   usablePravaMandatesForMerchant,
+  ucpPurchaseContext,
+  ucpQuoteWithForexCharge,
+  ucpCartPayload,
   zeptoAddressLocationContext,
   zeptoSavedAddressRows,
   zeptoOrderId,
