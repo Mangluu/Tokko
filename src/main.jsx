@@ -411,7 +411,7 @@ function Landing({ page, setPage, theme, onTheme }) {
     <section className={`tokko-image-screen tokko-entry-screen ${page === 'landing' ? 'is-active' : ''}`} aria-labelledby="tokko-landing-title" aria-hidden={page !== 'landing'} inert={page !== 'landing'}>
       <img src="/assets/trakko/storefront-tokko.png" alt="" aria-hidden="true" />
       <div className="tokko-shade" />
-      <div className="tokko-entry-top"><Brand /><ThemeButton theme={theme} onToggle={onTheme} /></div>
+      <div className="tokko-entry-top"><Brand /></div>
       <div className="tokko-entry-copy"><span className="tokko-eyebrow"><Sparkles size={15} /> Everyday care, beautifully handled</span><h1 id="tokko-landing-title">Care feels<br /><em>lighter</em> here.</h1><p>Tokko turns family messages into safe, thoughtful health and wellness orders—while you keep the final say.</p><div className="tokko-entry-actions"><button className="tokko-button tokko-button-primary" type="button" onClick={() => goTo('explainer')}>Enter Tokko <ArrowRight size={18} /></button><span><MessageCircle size={16} /> Familiar as a family group chat</span></div></div>
       <button className="tokko-scroll-cue" type="button" aria-label="Discover how Tokko works" onClick={() => goTo('explainer')}><span>Discover how</span><i><ArrowRight size={15} /></i></button>
     </section>
