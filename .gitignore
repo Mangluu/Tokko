@@ -9,6 +9,7 @@ node_modules/
 npm-debug.log*
 playwright-report/
 test-results/
+audit/
 cookies*.txt
 *.pem
 *.key

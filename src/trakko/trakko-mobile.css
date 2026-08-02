@@ -77,9 +77,17 @@ html {
 body {
   min-width: 320px;
   min-height: 100vh;
+  min-height: 100dvh;
   margin: 0;
+  overflow-x: clip;
   color: var(--ink);
   background: var(--bg);
+}
+
+#root {
+  min-height: 100vh;
+  min-height: 100dvh;
+  overflow-x: clip;
 }
 
 button,
@@ -114,6 +122,29 @@ a {
   overflow: hidden;
 }
 
+.tokko-landing-flow {
+  height: 100svh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior-y: contain;
+  scroll-behavior: smooth;
+  scroll-snap-type: y mandatory;
+  scrollbar-width: none;
+  touch-action: pan-y;
+  -webkit-overflow-scrolling: touch;
+}
+
+.tokko-landing-flow::-webkit-scrollbar {
+  display: none;
+}
+
+.tokko-landing-flow .tokko-image-screen {
+  height: 100svh;
+  min-height: 100svh;
+  scroll-snap-align: start;
+  scroll-snap-stop: always;
+}
+
 .tokko-image-screen {
   position: relative;
   display: grid;
@@ -138,6 +169,15 @@ a {
   object-position: center 43%;
   transform: scale(1.06);
   animation: tokko-image-drift 22s ease-in-out infinite alternate;
+}
+
+.tokko-landing-flow .tokko-image-screen > img {
+  animation-play-state: paused;
+  will-change: transform;
+}
+
+.tokko-landing-flow .tokko-image-screen.is-active > img {
+  animation-play-state: running;
 }
 
 .tokko-shade {
@@ -167,7 +207,7 @@ a {
   justify-content: space-between;
   max-width: 1440px;
   margin: 0 auto;
-  padding: 25px 36px;
+  padding: max(25px, env(safe-area-inset-top)) max(36px, env(safe-area-inset-right)) 25px max(36px, env(safe-area-inset-left));
 }
 
 .tokko-brand {
@@ -226,8 +266,8 @@ a {
 .tokko-icon-button {
   position: relative;
   display: grid;
-  width: 39px;
-  height: 39px;
+  width: 44px;
+  height: 44px;
   padding: 0;
   place-items: center;
   border: 1px solid var(--line);
@@ -255,7 +295,8 @@ a {
   width: min(655px, calc(100% - 72px));
   margin-left: max(36px, calc((100vw - 1368px) / 2));
   padding: 94px 0 68px;
-  animation: tokko-rise 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
+  opacity: 0;
+  transform: translateY(24px);
 }
 
 .tokko-eyebrow {
@@ -316,7 +357,8 @@ a {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0;
+  min-height: 44px;
+  padding: 5px 0 5px 8px;
   border: 0;
   color: rgba(255, 255, 255, 0.74);
   background: transparent;
@@ -332,8 +374,8 @@ a {
 
 .tokko-scroll-cue i {
   display: grid;
-  width: 33px;
-  height: 33px;
+  width: 36px;
+  height: 36px;
   place-items: center;
   border: 1px solid rgba(255, 255, 255, 0.3);
   border-radius: 50%;
@@ -345,6 +387,7 @@ a {
   display: inline-flex;
   align-items: center;
   gap: 7px;
+  min-height: 44px;
   padding: 9px 12px;
   border: 1px solid rgba(255, 255, 255, 0.22);
   border-radius: 10px;
@@ -359,6 +402,12 @@ a {
   width: min(760px, calc(100% - 72px));
   margin-left: max(36px, calc((100vw - 1368px) / 2));
   padding: 92px 0 42px;
+  opacity: 0;
+  transform: translateY(24px);
+}
+
+.tokko-landing-flow .tokko-image-screen.is-active .tokko-entry-copy,
+.tokko-landing-flow .tokko-image-screen.is-active .tokko-hero-copy {
   animation: tokko-rise 700ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
@@ -399,6 +448,10 @@ a {
   display: flex;
   width: max-content;
   animation: tokko-marquee 30s linear infinite;
+}
+
+.tokko-logo-marquee:hover .tokko-logo-track {
+  animation-play-state: paused;
 }
 
 .tokko-logo-tile {
@@ -624,16 +677,20 @@ a {
   box-shadow: var(--shadow-md);
 }
 
-.tokko-google-button span {
+.tokko-google-mark {
   display: grid;
   width: 30px;
   height: 30px;
   place-items: center;
   border: 1px solid var(--line);
   border-radius: 9px;
-  color: #4285f4;
   background: white;
-  font-size: 17px;
+}
+
+.tokko-google-mark img {
+  width: 18px;
+  height: 18px;
+  object-fit: contain;
 }
 
 .tokko-google-button svg {
@@ -2166,7 +2223,7 @@ a {
 @media (max-width: 820px) {
   .tokko-entry-top,
   .tokko-hero-nav {
-    padding: 18px 20px;
+    padding: max(18px, env(safe-area-inset-top)) max(20px, env(safe-area-inset-right)) 18px max(20px, env(safe-area-inset-left));
   }
 
   .tokko-entry-copy,
@@ -2329,21 +2386,49 @@ a {
   }
 
   .tokko-scroll-cue {
-    display: none;
+    right: max(18px, env(safe-area-inset-right));
+    bottom: max(15px, env(safe-area-inset-bottom));
+    display: grid;
+    width: 46px;
+    height: 46px;
+    padding: 0;
+    place-items: center;
+  }
+
+  .tokko-scroll-cue span {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    padding: 0;
+    overflow: hidden;
+    clip: rect(0, 0, 0, 0);
+    white-space: nowrap;
+  }
+
+  .tokko-scroll-cue i {
+    width: 44px;
+    height: 44px;
   }
 
   .tokko-agent-path {
-    gap: 5px;
-    overflow-x: auto;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1.28fr) minmax(0, 0.78fr) minmax(0, 1fr);
+    gap: 6px;
+    overflow: visible;
+    font-size: 8.5px;
+    letter-spacing: 0.02em;
   }
 
   .tokko-agent-path span {
-    padding: 6px 8px;
+    padding: 7px 4px;
+    overflow: visible;
+    text-align: center;
+    text-overflow: clip;
     white-space: nowrap;
   }
 
   .tokko-agent-path svg {
-    flex: 0 0 auto;
+    display: none;
   }
 
   .tokko-logo-marquee {
@@ -2499,6 +2584,42 @@ a {
   .tokko-rules-list article > b {
     grid-column: 2;
     width: fit-content;
+  }
+}
+
+@media (max-width: 600px) and (max-height: 720px) {
+  .tokko-entry-copy {
+    padding-top: 82px;
+    padding-bottom: 58px;
+  }
+
+  .tokko-hero-copy {
+    padding-top: 72px;
+    padding-bottom: 26px;
+  }
+
+  .tokko-entry-copy h1,
+  .tokko-hero-copy h1 {
+    font-size: clamp(42px, 13vw, 51px);
+  }
+
+  .tokko-entry-copy > p,
+  .tokko-hero-copy > p {
+    font-size: 14px;
+    line-height: 1.5;
+  }
+
+  .tokko-entry-actions,
+  .tokko-hero-copy > .tokko-actions {
+    margin-top: 20px;
+  }
+
+  .tokko-agent-path {
+    margin-top: 16px;
+  }
+
+  .tokko-logo-marquee {
+    margin-block: 13px;
   }
 }
 

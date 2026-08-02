@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import {
   Activity, ArrowLeft, ArrowRight, Bell, Check, CheckCircle2, ChevronRight,
@@ -107,7 +107,7 @@ function ThemeButton({ theme, onToggle }) {
   return <button className="tokko-icon-button" type="button" onClick={onToggle} aria-label={`Use ${theme === 'light' ? 'dark' : 'light'} mode`}>{theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}</button>;
 }
 function LogoMarquee() {
-  return <div className="tokko-logo-marquee" aria-label="Health and wellness merchant network"><div className="tokko-logo-track">{[...MERCHANTS, ...MERCHANTS].map(([name, src], index) => <figure className="tokko-logo-tile" key={`${name}-${index}`}><img src={src} alt={`${name} logo`} /></figure>)}</div></div>;
+  return <div className="tokko-logo-marquee" aria-label="Health and wellness merchant network"><div className="tokko-logo-track">{[...MERCHANTS, ...MERCHANTS].map(([name, src], index) => { const duplicate = index >= MERCHANTS.length; return <figure className="tokko-logo-tile" aria-hidden={duplicate || undefined} key={`${name}-${index}`}><img src={src} alt={duplicate ? '' : `${name} logo`} /></figure>; })}</div></div>;
 }
 function BusyIcon({ busy, icon: Icon = ArrowRight }) {
   return busy ? <LoaderCircle className="tokko-spinner" size={18} /> : <Icon size={18} />;
@@ -127,6 +127,7 @@ function AccountAccess({ onAuthenticated, initialEmail = '', initialStatus = '' 
   const [status, setStatus] = useState(initialStatus);
   const [busy, setBusy] = useState(false);
   const verifyingSignup = mode === 'signup' && Boolean(signupChallenge);
+  const statusIsProgress = /sent to|signing|verifying|sending|opening/i.test(status);
   const changeMode = (nextMode) => { setMode(nextMode); setSignupChallenge(null); setEmailOtp(''); setStatus(''); };
   const signInWithGoogle = async () => {
     setBusy(true); setStatus('Opening secure Google sign-in…');
@@ -157,12 +158,12 @@ function AccountAccess({ onAuthenticated, initialEmail = '', initialStatus = '' 
     finally { setBusy(false); }
   };
   return <form className="tokko-auth-form" onSubmit={submit}>
-    <button className="tokko-google-button" type="button" onClick={signInWithGoogle} disabled={busy}><span aria-hidden="true">G</span>Continue with Google<BusyIcon busy={busy} /></button>
+    <button className="tokko-google-button" type="button" onClick={signInWithGoogle} disabled={busy}><span className="tokko-google-mark" aria-hidden="true"><img src="/assets/google-g.svg" alt="" /></span>Continue with Google<BusyIcon busy={busy} /></button>
     <div className="tokko-auth-divider"><span>or use email</span></div>
-    <div className="tokko-auth-modes" aria-label="Account access method"><button className={mode === 'login' ? 'is-active' : ''} type="button" onClick={() => changeMode('login')}>Sign in</button><button className={mode === 'signup' ? 'is-active' : ''} type="button" onClick={() => changeMode('signup')}>Create account</button></div>
+    <div className="tokko-auth-modes" aria-label="Account access method"><button className={mode === 'login' ? 'is-active' : ''} type="button" aria-pressed={mode === 'login'} onClick={() => changeMode('login')}>Sign in</button><button className={mode === 'signup' ? 'is-active' : ''} type="button" aria-pressed={mode === 'signup'} onClick={() => changeMode('signup')}>Create account</button></div>
     <div className="tokko-auth-fields"><label><span>Email</span><input type="email" autoComplete="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@example.com" required disabled={verifyingSignup} /></label>{!verifyingSignup && <label><span>Password</span><input type="password" autoComplete={mode === 'signup' ? 'new-password' : 'current-password'} value={password} onChange={(event) => setPassword(event.target.value)} placeholder={mode === 'signup' ? 'At least 10 characters' : 'Your password'} minLength={10} required /></label>}{verifyingSignup && <label><span>Six-digit code</span><input inputMode="numeric" autoComplete="one-time-code" value={emailOtp} onChange={(event) => setEmailOtp(event.target.value.replace(/\D/g, '').slice(0, 6))} placeholder="123456" pattern="[0-9]{6}" required autoFocus /></label>}</div>
     <button className="tokko-button tokko-button-primary tokko-auth-submit" type="submit" disabled={busy}><BusyIcon busy={busy} icon={ShieldCheck} />{verifyingSignup ? 'Verify and continue' : mode === 'signup' ? 'Create secure account' : 'Sign in to Tokko'}{!busy && <ArrowRight size={17} />}</button>
-    {status && <p className={/sent to|signing|verifying|sending|opening/i.test(status) ? 'tokko-form-status' : 'tokko-form-status is-error'} role="status">{status}</p>}
+    {status && <p className={statusIsProgress ? 'tokko-form-status' : 'tokko-form-status is-error'} role={statusIsProgress ? 'status' : 'alert'} aria-live={statusIsProgress ? 'polite' : 'assertive'}>{status}</p>}
     <div className="tokko-safe-note"><ShieldCheck size={16} /><span>Google identity stays with Clerk. Tokko uses an HttpOnly session and never stores your password in the browser.</span></div>
   </form>;
 }
@@ -370,9 +371,57 @@ function SettingsView({ state, onState }) {
 }
 
 function Landing({ page, setPage, theme, onTheme }) {
-  if (page === 'landing') return <section className="tokko-image-screen tokko-entry-screen"><img src="/assets/trakko/storefront-tokko.png" alt="A warm Tokko health and wellness storefront" /><div className="tokko-shade" /><div className="tokko-entry-top"><Brand /><ThemeButton theme={theme} onToggle={onTheme} /></div><div className="tokko-entry-copy"><span className="tokko-eyebrow"><Sparkles size={15} /> Everyday care, beautifully handled</span><h1>Care feels<br /><em>lighter</em> here.</h1><p>Tokko turns family messages into safe, thoughtful health and wellness orders—while you keep the final say.</p><div className="tokko-entry-actions"><button className="tokko-button tokko-button-primary" type="button" onClick={() => setPage('explainer')}>Enter Tokko <ArrowRight size={18} /></button><span><MessageCircle size={16} /> Familiar as a family group chat</span></div></div><button className="tokko-scroll-cue" type="button" onClick={() => setPage('explainer')}><span>Discover how</span><i><ArrowRight size={15} /></i></button></section>;
-  if (page === 'explainer') return <section className="tokko-image-screen tokko-hero-screen"><img src="/assets/trakko/storefront-tokko.png" alt="Tokko family care storefront" /><div className="tokko-shade tokko-shade-soft" /><div className="tokko-hero-nav"><Brand compact /><button type="button" onClick={() => setPage('landing')}><ArrowLeft size={17} /> Exit</button></div><div className="tokko-hero-copy"><span className="tokko-eyebrow"><MessageCircle size={15} /> Messaging is the front door</span><h1>Your family asks.<br /><em>Tokko takes care.</em></h1><p>It understands the message, finds the right essential, checks your rules and only pauses when a decision truly needs you.</p><div className="tokko-agent-path" aria-label="How Tokko works"><span>Message</span><ArrowRight size={14} /><span>Understand</span><ArrowRight size={14} /><span>Check</span><ArrowRight size={14} /><span>Deliver</span></div><LogoMarquee /><div className="tokko-actions"><button className="tokko-button tokko-button-ghost" type="button" onClick={() => setPage('landing')}><ArrowLeft size={18} /> Back</button><button className="tokko-button tokko-button-primary" type="button" onClick={() => setPage('auth')}>Set up my family <ArrowRight size={18} /></button></div></div></section>;
-  return null;
+  const flowRef = useRef(null);
+  const initialPageRef = useRef(page);
+  const currentPageRef = useRef(page);
+  const scrollFrameRef = useRef(null);
+
+  useEffect(() => { currentPageRef.current = page; }, [page]);
+  useLayoutEffect(() => {
+    const flow = flowRef.current;
+    if (flow && initialPageRef.current === 'explainer') flow.scrollTo({ top: flow.clientHeight, behavior: 'auto' });
+    return () => {
+      if (scrollFrameRef.current) window.cancelAnimationFrame(scrollFrameRef.current);
+    };
+  }, []);
+
+  const goTo = (nextPage) => {
+    const flow = flowRef.current;
+    if (!flow) return;
+    currentPageRef.current = nextPage;
+    setPage(nextPage);
+    const reducedMotion = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    flow.scrollTo({ top: nextPage === 'explainer' ? flow.clientHeight : 0, behavior: reducedMotion ? 'auto' : 'smooth' });
+  };
+  const syncPageToScroll = () => {
+    if (scrollFrameRef.current) return;
+    scrollFrameRef.current = window.requestAnimationFrame(() => {
+      scrollFrameRef.current = null;
+      const flow = flowRef.current;
+      if (!flow) return;
+      const nextPage = flow.scrollTop >= flow.clientHeight * 0.5 ? 'explainer' : 'landing';
+      if (nextPage !== currentPageRef.current) {
+        currentPageRef.current = nextPage;
+        setPage(nextPage);
+      }
+    });
+  };
+
+  return <main ref={flowRef} className="tokko-landing-flow" data-page={page} onScroll={syncPageToScroll} aria-label="Tokko introduction">
+    <section className={`tokko-image-screen tokko-entry-screen ${page === 'landing' ? 'is-active' : ''}`} aria-labelledby="tokko-landing-title" aria-hidden={page !== 'landing'} inert={page !== 'landing'}>
+      <img src="/assets/trakko/storefront-tokko.png" alt="" aria-hidden="true" />
+      <div className="tokko-shade" />
+      <div className="tokko-entry-top"><Brand /><ThemeButton theme={theme} onToggle={onTheme} /></div>
+      <div className="tokko-entry-copy"><span className="tokko-eyebrow"><Sparkles size={15} /> Everyday care, beautifully handled</span><h1 id="tokko-landing-title">Care feels<br /><em>lighter</em> here.</h1><p>Tokko turns family messages into safe, thoughtful health and wellness orders—while you keep the final say.</p><div className="tokko-entry-actions"><button className="tokko-button tokko-button-primary" type="button" onClick={() => goTo('explainer')}>Enter Tokko <ArrowRight size={18} /></button><span><MessageCircle size={16} /> Familiar as a family group chat</span></div></div>
+      <button className="tokko-scroll-cue" type="button" aria-label="Discover how Tokko works" onClick={() => goTo('explainer')}><span>Discover how</span><i><ArrowRight size={15} /></i></button>
+    </section>
+    <section className={`tokko-image-screen tokko-hero-screen ${page === 'explainer' ? 'is-active' : ''}`} aria-labelledby="tokko-explainer-title" aria-hidden={page !== 'explainer'} inert={page !== 'explainer'}>
+      <img src="/assets/trakko/storefront-tokko.png" alt="" aria-hidden="true" />
+      <div className="tokko-shade tokko-shade-soft" />
+      <div className="tokko-hero-nav"><Brand compact /><button type="button" onClick={() => goTo('landing')}><ArrowLeft size={17} /> Exit</button></div>
+      <div className="tokko-hero-copy"><span className="tokko-eyebrow"><MessageCircle size={15} /> Messaging is the front door</span><h1 id="tokko-explainer-title">Your family asks.<br /><em>Tokko takes care.</em></h1><p>It understands the message, finds the right essential, checks your rules and only pauses when a decision truly needs you.</p><div className="tokko-agent-path" aria-label="How Tokko works"><span>Message</span><ArrowRight size={14} /><span>Reason</span><ArrowRight size={14} /><span>Check</span><ArrowRight size={14} /><span>Deliver</span></div><LogoMarquee /><div className="tokko-actions"><button className="tokko-button tokko-button-ghost" type="button" onClick={() => goTo('landing')}><ArrowLeft size={18} /> Back</button><button className="tokko-button tokko-button-primary" type="button" onClick={() => setPage('auth')}>Set up my family <ArrowRight size={18} /></button></div></div>
+    </section>
+  </main>;
 }
 
 function App() {

@@ -22,5 +22,10 @@ module.exports = defineConfig({
       name: "Desktop Chromium",
       use: { ...devices["Desktop Chrome"] },
     },
+    {
+      name: "iPhone WebKit",
+      testMatch: /landing-motion\.spec\.js/,
+      use: { ...devices["iPhone 15 Pro"] },
+    },
   ],
 });
