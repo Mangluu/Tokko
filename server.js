@@ -745,6 +745,24 @@ function canonicalPravaCustomerId(userId) {
   return `tokko_family_${id}`;
 }
 
+function legacyPravaCustomerId(userId) {
+  const id = Number(userId);
+  if (!Number.isInteger(id) || id <= 0) {
+    throw Object.assign(new Error("A valid family user ID is required"), {
+      status: 400,
+    });
+  }
+  return `tokko_user_${id}`;
+}
+
+function pravaCustomerIdCandidates(userId, currentCustomerId) {
+  return [...new Set([
+    String(currentCustomerId || "").trim(),
+    canonicalPravaCustomerId(userId),
+    legacyPravaCustomerId(userId),
+  ].filter(Boolean))];
+}
+
 async function getOrCreateFamilyPaymentCustomer(userId) {
   const existing = await db.getPaymentCustomer(userId);
   if (existing) return existing;
@@ -1211,6 +1229,37 @@ function telegramMandateIntent(input = {}) {
     frequency,
     merchantScope,
   };
+}
+
+async function listPravaMandatesForUser(userId, currentCustomerId) {
+  const settled = await Promise.allSettled(
+    pravaCustomerIdCandidates(userId, currentCustomerId).map((customerId) =>
+      payments.listMandates(customerId)
+    )
+  );
+  const successful = settled.filter((result) => result.status === "fulfilled");
+  const rejected = settled.filter((result) => result.status === "rejected");
+  if (!successful.length) {
+    throw rejected[0]?.reason
+      || Object.assign(new Error("Prava mandate list is unavailable"), {
+        status: 502,
+      });
+  }
+  const mandates = [...new Map(
+    successful
+      .flatMap((result) => result.value || [])
+      .filter((mandate) => mandate?.id)
+      .map((mandate) => [String(mandate.id), mandate])
+  ).values()];
+  if (!mandates.length && rejected.length) throw rejected[0].reason;
+  if (rejected.length) {
+    console.warn("[payments] Some Prava customer aliases could not be listed", {
+      attemptedAliasCount: settled.length,
+      failedAliasCount: rejected.length,
+      recoveredMandateCount: mandates.length,
+    });
+  }
+  return mandates;
 }
 
 async function prepareTelegramMandateChoices(userId, input = {}) {
@@ -2403,7 +2452,7 @@ async function resolveUcpCheckoutPayment(userId, baseResult) {
   }
   let mandates;
   try {
-    mandates = await payments.listMandates(identity.customerId);
+    mandates = await listPravaMandatesForUser(userId, identity.customerId);
   } catch (error) {
     return ucpSavedCardResult(
       userId,
@@ -2659,7 +2708,7 @@ function tokkoPaymentRoute({ mandates, paymentMethods, amount }) {
 
 async function selectPravaMandateForAmount(userId, requestedId, amount) {
   const { customerId } = await pravaMandateIdentity(userId);
-  const mandates = await payments.listMandates(customerId);
+  const mandates = await listPravaMandatesForUser(userId, customerId);
   const usable = usablePravaMandatesForAmount(mandates, amount);
   if (requestedId) {
     const selected = usable.find(
@@ -2844,7 +2893,7 @@ async function executeHermesCheckoutPolicy(req, userId, args = {}) {
   let mandateCheckError = null;
   if (identity?.customerId) {
     try {
-      mandates = await payments.listMandates(identity.customerId);
+      mandates = await listPravaMandatesForUser(userId, identity.customerId);
     } catch (error) {
       mandateCheckError = error.message;
     }
@@ -4227,7 +4276,7 @@ route("GET", "/api/payments/mandates", async (req, res) => {
   try {
     const user = await auth.requireUser(req);
     const { customerId } = await pravaMandateIdentity(user.userId);
-    const mandates = await payments.listMandates(customerId);
+    const mandates = await listPravaMandatesForUser(user.userId, customerId);
     sendJson(res, 200, mandateListPayload(mandates, getQuery(req)));
   } catch (error) {
     sendJson(res, error.status || 500, { error: error.message });
@@ -4520,7 +4569,7 @@ route(
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
     const { customerId } = await pravaMandateIdentity(userId);
-    const mandates = await payments.listMandates(customerId);
+    const mandates = await listPravaMandatesForUser(userId, customerId);
     sendJson(res, 200, {
       userId,
       customerId,
@@ -6945,6 +6994,7 @@ Object.assign(server, {
   familyAddressPayload,
   handler,
   initializeApplication,
+  listPravaMandatesForUser,
   matchRoute,
   parseBody,
   pravaReturnCallback,

@@ -268,6 +268,22 @@ class PhoneNormalizationTests(unittest.TestCase):
         self.assertIn("OZiva", message)
         self.assertIn("activity: 2026-08-01", message)
 
+    def test_any_merchant_mandate_is_labeled_without_a_fake_merchant(self):
+        message = bot._mandates_text(
+            [{
+                "id": "mandate-any",
+                "status": "active",
+                "merchantScope": "any",
+                "merchantName": "Tokko Health & Wellness",
+                "currency": "INR",
+                "approvedAmount": "1000",
+                "remaining": "1000",
+                "frequency": "one_time",
+            }]
+        )
+        self.assertIn("Any merchant", message)
+        self.assertNotIn("Tokko Health & Wellness", message)
+
 
 class OnboardingRedirectTests(unittest.TestCase):
     def test_unknown_phone_redirects_to_hosted_onboarding(self):

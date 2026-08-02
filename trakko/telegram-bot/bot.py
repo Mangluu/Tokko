@@ -1713,7 +1713,7 @@ def _mandates_text(
     if history and not visible:
         return "No Prava mandate activity was found in the last 30 days."
     if not visible:
-        return "No standing Prava mandates are available. Choose Create Mandate to add one."
+        return "No Prava mandates are available. Choose Create Mandate to add one."
     heading = (
         f"Prava mandate history, last 30 days: {len(visible)}"
         if history
@@ -1726,7 +1726,11 @@ def _mandates_text(
         currency = str(mandate.get("currency") or "INR")
         approved = str(mandate.get("approvedAmount") or "0")
         remaining = str(mandate.get("remaining") or approved)
-        merchant = str(mandate.get("merchantName") or "Zepto")
+        merchant = (
+            "Any merchant"
+            if str(mandate.get("merchantScope") or "").lower() == "any"
+            else str(mandate.get("merchantName") or "Listed merchant")
+        )
         rows.append(
             f"{index}. {status}, {merchant}, {currency} {remaining} remaining "
             f"of {approved} per charge, {frequency}"

@@ -496,6 +496,119 @@ test(
 );
 
 test(
+  "Prava mandate listing accepts wrapped snake-case records and retries an empty standing view",
+  { concurrency: false },
+  async () => {
+    const envNames = ["PRAVA_PUBLISHABLE_KEY", "PRAVA_SECRET_KEY", "PRAVA_API_BASE_URL"];
+    const originalEnv = Object.fromEntries(
+      envNames.map((name) => [name, process.env[name]])
+    );
+    const originalFetch = global.fetch;
+    const requests = [];
+    try {
+      process.env.PRAVA_PUBLISHABLE_KEY = "pk_test_example";
+      process.env.PRAVA_SECRET_KEY = "sk_test_example";
+      delete process.env.PRAVA_API_BASE_URL;
+      global.fetch = async (url) => {
+        requests.push(String(url));
+        if (String(url).includes("standing_only=true")) {
+          return Response.json({ data: { mandates: [] } });
+        }
+        return Response.json({
+          data: {
+            mandates: [{
+              mandate_id: "mdt_any_123",
+              mandate_status: "ACTIVE",
+              state: "AVAILABLE",
+              recurring_frequency: "one_time",
+              merchant_scope: "any",
+              merchant_name: "Tokko Health & Wellness",
+              approved_amount: "1000.00",
+              remaining_amount: "1000.00",
+              currency: "inr",
+              valid_until: "2030-01-07T00:00:00Z",
+              created_at: "2030-01-01T00:00:00Z",
+            }],
+          },
+        });
+      };
+
+      assert.deepEqual(await listMandates("tokko_user_42"), [{
+        id: "mdt_any_123",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        merchantName: "Tokko Health & Wellness",
+        approvedAmount: "1000.00",
+        remaining: "1000.00",
+        currency: "INR",
+        validUntil: "2030-01-07T00:00:00Z",
+        renewsAt: null,
+        createdAt: "2030-01-01T00:00:00Z",
+        lastCharge: null,
+      }]);
+      assert.equal(requests.length, 2);
+      assert.match(requests[0], /standing_only=true$/);
+      assert.doesNotMatch(requests[1], /standing_only=/);
+    } finally {
+      global.fetch = originalFetch;
+      for (const name of envNames) {
+        if (originalEnv[name] === undefined) delete process.env[name];
+        else process.env[name] = originalEnv[name];
+      }
+    }
+  }
+);
+
+test(
+  "Prava mandate listing falls back to the unfiltered endpoint after standing-list errors",
+  { concurrency: false },
+  async () => {
+    const envNames = ["PRAVA_PUBLISHABLE_KEY", "PRAVA_SECRET_KEY", "PRAVA_API_BASE_URL"];
+    const originalEnv = Object.fromEntries(
+      envNames.map((name) => [name, process.env[name]])
+    );
+    const originalFetch = global.fetch;
+    let attempts = 0;
+    try {
+      process.env.PRAVA_PUBLISHABLE_KEY = "pk_test_example";
+      process.env.PRAVA_SECRET_KEY = "sk_test_example";
+      delete process.env.PRAVA_API_BASE_URL;
+      global.fetch = async (url) => {
+        attempts += 1;
+        if (String(url).includes("standing_only=true")) {
+          return Response.json(
+            { error: { code: "INTERNAL_ERROR", message: "An internal error occurred" } },
+            { status: 500 }
+          );
+        }
+        return Response.json({ mandates: [{
+          id: "mdt_fallback",
+          status: "active",
+          recurringFrequency: "one_time",
+          merchantScope: "any",
+          approvedAmount: "500.00",
+          remaining: "500.00",
+          currency: "INR",
+        }] });
+      };
+
+      const mandates = await listMandates("tokko_user_42");
+      assert.equal(attempts, 4);
+      assert.equal(mandates[0].id, "mdt_fallback");
+      assert.equal(mandates[0].merchantScope, "any");
+    } finally {
+      global.fetch = originalFetch;
+      for (const name of envNames) {
+        if (originalEnv[name] === undefined) delete process.env[name];
+        else process.env[name] = originalEnv[name];
+      }
+    }
+  }
+);
+
+test(
   "Prava mandate charge returns ephemeral credentials and reports the outcome",
   { concurrency: false },
   async () => {

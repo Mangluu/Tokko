@@ -21,6 +21,36 @@ test("server.js exports the HTTP server expected by Vercel", () => {
   );
 });
 
+test("Prava mandate lookup merges current and historical family customer IDs", { concurrency: false }, async () => {
+  const original = payments.listMandates;
+  const requested = [];
+  try {
+    payments.listMandates = async (customerId) => {
+      requested.push(customerId);
+      if (customerId === "tokko_user_42") {
+        return [{
+          id: "mdt_legacy_active",
+          status: "active",
+          merchantScope: "any",
+          remaining: "150.00",
+          approvedAmount: "150.00",
+          currency: "INR",
+        }];
+      }
+      return [];
+    };
+    const mandates = await server.listPravaMandatesForUser(
+      42,
+      "tokko_family_42"
+    );
+    assert.deepEqual(requested.sort(), ["tokko_family_42", "tokko_user_42"]);
+    assert.equal(mandates.length, 1);
+    assert.equal(mandates[0].id, "mdt_legacy_active");
+  } finally {
+    payments.listMandates = original;
+  }
+});
+
 test("Hermes UCP search fans out without a merchant filter and returns only three", async () => {
   const originalSearchAll = ucp.searchAll;
   let capturedOptions;
@@ -497,6 +527,14 @@ test("UCP mandate routing requires active balance and matching merchant scope", 
       remaining: "300.00",
       currency: "INR",
     },
+    {
+      id: "mdt-any-merchant",
+      status: "active",
+      merchantScope: "any",
+      merchantName: "Tokko Health & Wellness",
+      remaining: "275.00",
+      currency: "INR",
+    },
   ];
   const usable = server.usablePravaMandatesForMerchant(
     mandates,
@@ -505,6 +543,7 @@ test("UCP mandate routing requires active balance and matching merchant scope", 
     "https://himalayawellness.in"
   );
   assert.deepEqual(usable.map((mandate) => mandate.id), [
+    "mdt-any-merchant",
     "mdt-himalaya-small",
     "mdt-himalaya-large",
   ]);
