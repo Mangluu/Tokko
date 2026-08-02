@@ -2128,6 +2128,21 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
       savedCards
     );
   }
+  if (checkoutResult.totalIsAuthoritative === false) {
+    // The merchant did not return an authoritative total, so the amount is a
+    // stale search-time estimate. Do not mint a mandate credential against an
+    // unverified amount; route to a saved card so the person reviews and pays.
+    return ucpSavedCardResult(
+      userId,
+      baseResult,
+      {
+        checked: true,
+        checkedMandateCount: mandates.length,
+        status: "total_not_authoritative",
+      },
+      savedCards
+    );
+  }
   const active = mandates.filter((mandate) =>
     String(mandate.status || "").toLowerCase() === "active"
     || String(mandate.state || "").toLowerCase() === "available"
