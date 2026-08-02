@@ -1703,10 +1703,14 @@ function usablePravaMandatesForAmount(mandates, amount) {
     );
 }
 
-function merchantIdentityMatches(mandate, merchantName, merchantUrl) {
+function merchantIdentityMatches(mandate, merchantName, merchantUrl, namesEchoed = false) {
   if (String(mandate?.merchantScope || "").toLowerCase() === "any") return true;
   const configured = String(mandate?.merchantName || "").trim().toLowerCase();
-  if (!configured) return true;
+  // A mandate with no merchant identity used to match every merchant. Keep that
+  // permissive fallback only when the provider is not echoing merchant names at
+  // all; once any mandate in the set carries a name, a nameless one is an
+  // anomaly and must not be charged against an arbitrary merchant.
+  if (!configured) return namesEchoed ? false : true;
   const requestedName = String(merchantName || "").trim().toLowerCase();
   let requestedHost = "";
   try {
@@ -1725,8 +1729,12 @@ function merchantIdentityMatches(mandate, merchantName, merchantUrl) {
 }
 
 function usablePravaMandatesForMerchant(mandates, amount, merchantName, merchantUrl) {
+  const list = Array.isArray(mandates) ? mandates : [];
   const amountValue = Number(amount);
-  return (Array.isArray(mandates) ? mandates : [])
+  const namesEchoed = list.some(
+    (mandate) => String(mandate?.merchantName || "").trim() !== ""
+  );
+  return list
     .filter((mandate) => {
       const remaining = Number(mandate.remaining ?? mandate.approvedAmount);
       const active =
@@ -1737,7 +1745,7 @@ function usablePravaMandatesForMerchant(mandates, amount, merchantName, merchant
         && String(mandate.currency || "").toUpperCase() === "INR"
         && Number.isFinite(remaining)
         && remaining >= amountValue
-        && merchantIdentityMatches(mandate, merchantName, merchantUrl)
+        && merchantIdentityMatches(mandate, merchantName, merchantUrl, namesEchoed)
       );
     })
     .sort(
@@ -2171,9 +2179,19 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
   }
 
   const selectedMandate = eligible[0];
+  // The dedup reference must be stable across retries of the same purchase
+  // intent so a retried checkout reuses the existing single-use credential
+  // instead of minting a second one. checkoutId is assigned fresh by the
+  // merchant on every create_checkout, and the total can drift between calls,
+  // so key off the signed selection token (fixed at search time) plus the
+  // chosen quantity and the mandate.
+  const dedupBasis = `${input.selectionToken || checkoutResult.checkoutId}:${Math.max(
+    1,
+    Math.round(Number(input.quantity) || 1)
+  )}:${selectedMandate.id}`;
   const chargeReference = `tokko_ucp_${nodeCrypto
     .createHash("sha256")
-    .update(`${checkoutResult.checkoutId}:${selectedMandate.id}`)
+    .update(dedupBasis)
     .digest("hex")
     .slice(0, 40)}`;
   let charge;
@@ -4525,7 +4543,15 @@ route("POST", "/api/addresses", async (req, res) => {
       user.userId,
       familyAddressInput(body, { requireContact: true })
     );
-    await db.assignFamilyAddress(user.userId, address.id, body.memberIds);
+    try {
+      await db.assignFamilyAddress(user.userId, address.id, body.memberIds);
+    } catch (assignError) {
+      // Member assignment validates the ids and can reject (404) after the
+      // address row already committed. Remove the orphan so a corrected retry
+      // does not pile up dangling addresses, then surface the original error.
+      await db.deleteFamilyAddress(user.userId, address.id).catch(() => {});
+      throw assignError;
+    }
     await db.recordActivityEvent(user.userId, {
       eventType: "address_added",
       title: `${address.label} address added`,
