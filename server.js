@@ -5830,12 +5830,13 @@ async function runHermesBackend({
       tool.status === "completed"
     )?.result;
   if (Array.isArray(searchResult?.products)) {
-    result.productChoices = searchResult.products;
+    const shownProducts = searchResult.products.slice(0, 3);
+    result.productChoices = shownProducts;
     result.merchantStatuses = searchResult.merchants || [];
     result.productQuery = searchResult.query;
     result.productPagination = searchResult.pagination || null;
-    result.message = searchResult.products.length
-      ? `i found ${searchResult.products.length} options with images, grouped by delivery market and currency, with the lowest price first inside each group. select the one you want.`
+    result.message = shownProducts.length
+      ? `i found ${shownProducts.length} good option${shownProducts.length === 1 ? "" : "s"} for you, best value first. select the one you want.`
       : "i could not find an image-backed match for that search. try a broader product name.";
   }
   const checkoutResult = [...(result.tools || [])]

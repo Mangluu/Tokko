@@ -212,7 +212,7 @@ test("Hermes signs mutating Zepto actions and executes only after approval", asy
         throw new Error("approved actions must not spend another model request");
       },
     });
-    assert.equal(approved.message, "done, 1 approved zepto action is complete.");
+    assert.equal(approved.message, "done, 1 approved action is complete.");
     assert.deepEqual(calls, [{
       name: "add_saved_address",
       args: { name: "home", flatDetails: "12a" },
