@@ -166,6 +166,29 @@
 .tf-member-assignment label:has(input:checked) { border-color: color-mix(in srgb, var(--sage) 40%, var(--line)); background: color-mix(in srgb, var(--sage-soft) 60%, var(--surface-muted)); }
 .tf-member-assignment label.is-contact { border-color: var(--sage); background: var(--sage-soft); color: var(--ink); font-weight: 600; }
 .tf-member-assignment label.is-contact svg { color: var(--sage); }
+.tf-analytics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; margin: 4px 0 18px; }
+.tf-analytics-grid > div { display: flex; flex-direction: column; gap: 3px; padding: 14px; border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-sm); }
+.tf-analytics-grid svg { color: var(--sage); }
+.tf-analytics-grid strong { font-size: 20px; font-weight: 700; color: var(--ink); }
+.tf-analytics-grid span { color: var(--muted); font-size: 11px; }
+.tf-order-list { display: flex; flex-direction: column; gap: 10px; }
+.tf-order-card { border: 1px solid var(--line); border-radius: 16px; background: var(--surface); box-shadow: var(--shadow-sm); overflow: hidden; }
+.tf-order-card.is-open { border-color: color-mix(in srgb, var(--sage) 40%, var(--line)); }
+.tf-order-head { display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto; align-items: center; gap: 12px; width: 100%; padding: 14px; background: none; border: 0; text-align: left; cursor: pointer; }
+.tf-order-head strong { display: block; font-size: 14px; color: var(--ink); overflow-wrap: anywhere; }
+.tf-order-head small { color: var(--faint); font-size: 11px; }
+.tf-order-amount { font-weight: 700; color: var(--ink); font-size: 14px; white-space: nowrap; }
+.tf-order-caret { color: var(--faint); transition: transform .2s; }
+.tf-order-card.is-open .tf-order-caret { transform: rotate(90deg); }
+.tf-order-detail { padding: 0 14px 14px; border-top: 1px solid var(--line); }
+.tf-order-items { list-style: none; margin: 12px 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.tf-order-items li { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--muted); }
+.tf-order-items em { color: var(--faint); font-style: normal; }
+.tf-order-meta { display: flex; flex-direction: column; gap: 6px; margin: 0; }
+.tf-order-meta div { display: flex; justify-content: space-between; gap: 12px; font-size: 12px; }
+.tf-order-meta dt { color: var(--faint); }
+.tf-order-meta dd { margin: 0; color: var(--ink); text-align: right; overflow-wrap: anywhere; }
+.tf-order-ref { font-family: ui-monospace, monospace; font-size: 11px; }
 .tf-address-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 13px; padding: 17px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-sm); }
 .tf-address-card.is-selected { border-color: color-mix(in srgb, var(--sage) 42%, transparent); background: linear-gradient(110deg, var(--surface), var(--sage-soft)); }
 .tf-address-card p { margin: 5px 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; line-height: 1.45; }
