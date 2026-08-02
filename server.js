@@ -179,7 +179,14 @@ function matchRoute(method, url) {
     let matches = true;
     for (let index = 0; index < patternParts.length; index += 1) {
       if (patternParts[index].startsWith(":")) {
-        params[patternParts[index].slice(1)] = decodeURIComponent(urlParts[index]);
+        try {
+          params[patternParts[index].slice(1)] = decodeURIComponent(urlParts[index]);
+        } catch {
+          // A malformed percent-encoding must not throw out of the router and
+          // hang the request; treat it as a non-match so routing returns 404.
+          matches = false;
+          break;
+        }
       } else if (patternParts[index] !== urlParts[index]) {
         matches = false;
         break;
@@ -747,7 +754,11 @@ function parseOnboardingId(value) {
 
 async function resolveOnboardingUserId(value) {
   if (/^[1-9]\d*$/.test(String(value || ""))) {
-    return parseOnboardingId(value);
+    const id = parseOnboardingId(value);
+    if (!(await db.getUserById(id))) {
+      throw Object.assign(new Error("Onboarding not found"), { status: 404 });
+    }
+    return id;
   }
   const phone = validation.e164(value, "family phone");
   const matches = await db.getFamilyUsersByPhone(phone);
@@ -2098,6 +2109,21 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
         checked: true,
         status: "check_failed",
         message: error.message,
+      },
+      savedCards
+    );
+  }
+  const checkoutCurrency = String(checkoutResult.currency || "").toUpperCase();
+  if (checkoutCurrency && checkoutCurrency !== "INR") {
+    // Prava mandates are INR-only. A non-INR total must never be matched
+    // one-to-one against a rupee mandate, so route it to a saved card.
+    return ucpSavedCardResult(
+      userId,
+      baseResult,
+      {
+        checked: true,
+        checkedMandateCount: mandates.length,
+        status: "currency_not_mandate_eligible",
       },
       savedCards
     );
@@ -4334,7 +4360,6 @@ route(
   async (req, res, params) => {
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
-    await db.clearDeliveryPreference(userId, "zepto");
     sendJson(res, 200, familyAddressPayload(await db.getFamilyAddresses(userId)));
   }
 );
