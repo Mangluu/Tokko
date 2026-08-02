@@ -12,6 +12,21 @@ class PhoneNormalizationTests(unittest.TestCase):
     def test_normalizes_telegram_contact(self):
         self.assertEqual(bot._normalize_phone("91 98765-43210"), "+919876543210")
 
+    def test_carousel_markup_navigation_bounds(self):
+        product = {
+            "choiceId": "12345678-1234-1234-1234-123456789012",
+            "available": True,
+        }
+        first = [b.text for row in bot._ucp_carousel_markup(product, 0, 3).inline_keyboard for b in row]
+        self.assertNotIn("‹ Prev", first)
+        self.assertIn("Next ›", first)
+        self.assertIn("✓ Select this product", first)
+        last = [b.text for row in bot._ucp_carousel_markup(product, 2, 3).inline_keyboard for b in row]
+        self.assertIn("‹ Prev", last)
+        self.assertNotIn("Next ›", last)
+        blocked = [b.text for row in bot._ucp_carousel_markup({"choiceId": "", "available": False}, 0, 1).inline_keyboard for b in row]
+        self.assertNotIn("✓ Select this product", blocked)
+
     def test_expands_indian_local_dependent_number(self):
         self.assertEqual(
             bot._normalize_dependent_phone("9900112233", "+919876543210"),

@@ -2231,6 +2231,7 @@ function ucpSavedCardResult(userId, baseResult, mandateCheck, cards) {
         toolName: "select_ucp_saved_card",
         args: {
           checkoutId: baseResult.checkoutId,
+          tokkoFlowId: baseResult.tokkoFlowId || null,
           merchant: baseResult.merchant,
           merchantName: baseResult.merchantName,
           merchantHandoffUrl: baseResult.merchantHandoffUrl,
@@ -2274,6 +2275,31 @@ async function selectUcpSavedCard(userId, token) {
     });
   }
   const savedCard = publicUcpCard(selected);
+  // Preferred path: open a Prava-hosted card-approval session and hand the buyer
+  // the Prava approval URL (not the raw Shopify checkout). Needs the Tokko
+  // checkout flow, which only the cart/decision path threads through as
+  // tokkoFlowId. The session-auth path has no flow, so it falls back below.
+  if (input.tokkoFlowId) {
+    const flow = await db.getCheckoutFlow(userId, input.tokkoFlowId);
+    if (flow) {
+      try {
+        const session = await startHermesPravaCardSession({
+          userId,
+          flow,
+          card: selected,
+          amount: Number(input.totalAmount),
+        });
+        return {
+          ...session,
+          merchant: input.merchant,
+          merchantName: input.merchantName,
+          savedCard,
+        };
+      } catch (error) {
+        // Prava session could not start — fall back to the merchant handoff.
+      }
+    }
+  }
   const paymentSelection = {
     policy: "active_mandate_then_saved_card",
     selected: true,
@@ -4879,7 +4905,7 @@ route(
     try {
       const result = await resolveUcpCheckoutPayment(
         userId,
-        claimed.price_breakdown
+        { ...claimed.price_breakdown, tokkoFlowId: orderId }
       );
       await db.saveCheckoutFlow(
         flowRecord(claimed, {

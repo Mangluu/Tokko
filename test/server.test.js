@@ -846,6 +846,114 @@ test(
   }
 );
 
+test(
+  "selectUcpSavedCard returns the Prava approval URL (not the Shopify handoff) when a Tokko flow is threaded",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      configuration: payments.configuration,
+      listCards: payments.listCards,
+      createPaymentSession: payments.createPaymentSession,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      getPaymentCustomer: db.getPaymentCustomer,
+      getPaymentMethods: db.getPaymentMethods,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
+    };
+    try {
+      payments.configuration = () => ({ configured: true, environment: "sandbox" });
+      payments.listCards = async () => [];
+      db.getUserById = async () => ({ id: 55, email: "flow@example.com" });
+      db.getProfile = async () => ({
+        user_id: 55,
+        primary_parent_name: "Flow Parent",
+        primary_parent_phone: "+919900112233",
+      });
+      db.getPaymentCustomer = async () => ({
+        provider: "prava",
+        provider_customer_id: "tokko_family_55",
+      });
+      db.getPaymentMethods = async () => [{
+        id: 9,
+        provider: "prava",
+        provider_payment_method_id: "card_saved_9",
+        brand: "visa",
+        last4: "2259",
+        is_default: true,
+      }];
+      db.getCheckoutFlow = async () => ({
+        id: "flow-55",
+        user_id: 55,
+        platform: "ucp",
+        status: "UCP_APPROVED",
+        address_id: 1,
+        card_brand: null,
+        card_last4: null,
+        card_failure_count: 0,
+        card_payment_received: false,
+        allow_cod_fallback: false,
+        fallback_to_cod: false,
+        payment_route: "merchant_checkout",
+        price_breakdown: {},
+        cart_snapshot: [],
+      });
+      db.saveCheckoutFlow = async (flow) => flow;
+      let sessionArgs = null;
+      payments.createPaymentSession = async (args) => {
+        sessionArgs = args;
+        return {
+          provider: "prava",
+          sessionId: "sess_1",
+          approvalUrl: "https://sandbox.prava.space/approve/sess_1",
+          orderId: null,
+          expiresAt: null,
+          amount: "101.97",
+          currency: "INR",
+        };
+      };
+      const token = hermes.signApproval({
+        userId: 55,
+        toolName: "select_ucp_saved_card",
+        args: {
+          checkoutId: "gid://shopify/Checkout/x",
+          tokkoFlowId: "flow-55",
+          merchant: "himalayawellness",
+          merchantName: "Himalaya Wellness",
+          merchantHandoffUrl: "https://merchant.example/cart/c/x",
+          totalAmount: "101.97",
+          currency: "INR",
+          paymentMethodId: "9",
+        },
+      });
+      const result = await server.selectUcpSavedCard(55, token);
+      assert.equal(result.paymentRoute, "prava_card");
+      assert.equal(result.nextAction.type, "prava_card_approval");
+      assert.equal(
+        result.nextAction.url,
+        "https://sandbox.prava.space/approve/sess_1"
+      );
+      assert.notEqual(result.nextAction.url, "https://merchant.example/cart/c/x");
+      assert.equal(result.savedCard.last4, "2259");
+      assert.equal(sessionArgs.cardId, "card_saved_9");
+    } finally {
+      Object.assign(payments, {
+        configuration: originals.configuration,
+        listCards: originals.listCards,
+        createPaymentSession: originals.createPaymentSession,
+      });
+      Object.assign(db, {
+        getUserById: originals.getUserById,
+        getProfile: originals.getProfile,
+        getPaymentCustomer: originals.getPaymentCustomer,
+        getPaymentMethods: originals.getPaymentMethods,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
+      });
+    }
+  }
+);
+
 test("Zepto online-order helpers accept structured MCP response variants", () => {
   assert.equal(
     server.zeptoOrderId({ data: { id: "order-structured-1" } }),

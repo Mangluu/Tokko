@@ -279,6 +279,12 @@ def _init_db() -> None:
             "choices_json TEXT NOT NULL, "
             "expires_at INTEGER NOT NULL)"
         )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS pending_ucp_product_choices ("
+            "chat_id INTEGER PRIMARY KEY, "
+            "products_json TEXT NOT NULL, "
+            "expires_at INTEGER NOT NULL)"
+        )
         legacy_rows = conn.execute(
             "SELECT chat_id, family_id FROM family_ids"
         ).fetchall()
@@ -506,6 +512,86 @@ def _get_pending_ucp_card_sync(chat_id: int, index: int) -> dict | None:
         return choices[index] if 0 <= index < len(choices) else None
     finally:
         conn.close()
+
+
+def _set_pending_ucp_products_sync(chat_id: int, products: list) -> None:
+    safe = [
+        {
+            "choiceId": str(p.get("choiceId") or ""),
+            "productName": str(p.get("productName") or "product"),
+            "merchantName": str(p.get("merchantName") or "merchant"),
+            "variantName": str(p.get("optionText") or p.get("variantName") or ""),
+            "currency": str(p.get("currency") or "INR"),
+            "price": p.get("price") or 0,
+            "available": bool(p.get("available")),
+            "imageUrl": str(p.get("imageUrl") or ""),
+        }
+        for p in products[:50]
+    ]
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "INSERT INTO pending_ucp_product_choices "
+            "(chat_id, products_json, expires_at) VALUES (?, ?, CAST(strftime('%s', 'now') AS INTEGER) + 600) "
+            "ON CONFLICT(chat_id) DO UPDATE SET "
+            "products_json = excluded.products_json, expires_at = excluded.expires_at",
+            (chat_id, json.dumps(safe)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _get_pending_ucp_products_sync(chat_id: int) -> list:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute(
+            "DELETE FROM pending_ucp_product_choices "
+            "WHERE expires_at <= CAST(strftime('%s', 'now') AS INTEGER)"
+        )
+        row = conn.execute(
+            "SELECT products_json FROM pending_ucp_product_choices WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        conn.commit()
+        return json.loads(row[0]) if row else []
+    finally:
+        conn.close()
+
+
+def _ucp_carousel_caption(product: dict, index: int, total: int) -> str:
+    name = str(product.get("productName") or "product")
+    variant = str(product.get("variantName") or product.get("optionText") or "")
+    merchant = str(product.get("merchantName") or "merchant")
+    currency = str(product.get("currency") or "INR")
+    price = product.get("price") or 0
+    lines = [name]
+    if variant:
+        lines.append(variant)
+    tail = f"{currency} {price} · {merchant}"
+    if not product.get("available"):
+        tail += " · unavailable"
+    lines.append(tail)
+    lines.append(f"({index + 1} of {total})")
+    return "\n".join(lines)[:1024]
+
+
+def _ucp_carousel_markup(product: dict, index: int, total: int) -> InlineKeyboardMarkup:
+    nav = []
+    if index > 0:
+        nav.append(InlineKeyboardButton("‹ Prev", callback_data=f"ucpcarousel:{index - 1}"))
+    nav.append(InlineKeyboardButton(f"{index + 1}/{total}", callback_data="ucpcarousel:noop"))
+    if index < total - 1:
+        nav.append(InlineKeyboardButton("Next ›", callback_data=f"ucpcarousel:{index + 1}"))
+    rows = [nav]
+    choice_id = str(product.get("choiceId") or "")
+    if product.get("available") and re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f-]{27}", choice_id, re.IGNORECASE
+    ):
+        rows.append([InlineKeyboardButton(
+            "✓ Select this product", callback_data=f"product:add:{choice_id}"
+        )])
+    return InlineKeyboardMarkup(rows)
 
 
 def _clear_pending_ucp_cards_sync(chat_id: int) -> None:
@@ -2192,9 +2278,15 @@ async def _send_hermes_result(
         )
     checkout_summary = result.get("checkoutSummary") or {}
     checkout_totals = checkout_summary.get("totals") or []
-    if checkout_totals:
+    confirmation_required = bool(checkout_summary.get("confirmationRequired"))
+    order_id = str(checkout_summary.get("orderId") or "")
+    # Render the itemised quote ONCE, at the review step. The payment step reuses
+    # the same checkoutSummary, so re-rendering here duplicated the whole block.
+    # Explanatory prose (forex method, mandate-coverage note, shipping caveat) is
+    # dropped: it repeated every message and is not needed to approve a price.
+    if checkout_totals and confirmation_required:
         currency = str(checkout_summary.get("currency") or "INR").upper()
-        total_lines = ["Merchant quote:"]
+        total_lines = ["Quote:"]
         for line in checkout_totals:
             label = str(line.get("label") or line.get("type") or "Amount")
             try:
@@ -2209,11 +2301,6 @@ async def _send_hermes_result(
                 except (TypeError, ValueError):
                     detail_amount = 0
                 total_lines.append(f"  {detail_label}: {currency} {detail_amount:.2f}")
-        total_lines.append(
-            "Shipping is included in this merchant quote."
-            if checkout_summary.get("shippingQuoted")
-            else "The merchant did not return a shipping charge. Tokko will not invent one."
-        )
         delivery = checkout_summary.get("deliveryWindow") or {}
         delivery_period = " to ".join(str(value) for value in (
             delivery.get("description"),
@@ -2222,43 +2309,21 @@ async def _send_hermes_result(
         ) if value)
         if delivery_period:
             total_lines.append(f"Delivery: {delivery_period}")
-        forex = checkout_summary.get("forex") or {}
-        if forex.get("appliedByTokko"):
-            try:
-                forex_base = int(forex.get("baseAmountMinor") or 0) / 100
-            except (TypeError, ValueError):
-                forex_base = 0
-            total_lines.append(
-                f"{forex.get('ratePercent') or 3}% forex is calculated on the complete "
-                f"merchant cart value of {currency} {forex_base:.2f}. "
-                "Mandate coverage uses the final total payable."
-            )
-        elif forex.get("returnedByMerchant"):
-            total_lines.append(
-                "Merchant-returned foreign-exchange charges are included above."
-            )
-        else:
-            total_lines.append(
-                "No separate forex charge was returned; the card network may apply one later."
-            )
         await update.effective_message.reply_text("\n".join(total_lines))
-        order_id = str(checkout_summary.get("orderId") or "")
-        if checkout_summary.get("confirmationRequired") and re.fullmatch(
-            r"[0-9a-fA-F-]{36}", order_id
-        ):
-            await update.effective_message.reply_text(
-                "Confirm this final price:",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton(
-                        "Approve Checkout",
-                        callback_data=f"ucporder:yes:{order_id}",
-                    ),
-                    InlineKeyboardButton(
-                        "Do Not Place Order",
-                        callback_data=f"ucporder:no:{order_id}",
-                    ),
-                ]]),
-            )
+    if confirmation_required and re.fullmatch(r"[0-9a-fA-F-]{36}", order_id):
+        await update.effective_message.reply_text(
+            "Confirm this final price:",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "Approve Checkout",
+                    callback_data=f"ucporder:yes:{order_id}",
+                ),
+                InlineKeyboardButton(
+                    "Do Not Place Order",
+                    callback_data=f"ucporder:no:{order_id}",
+                ),
+            ]]),
+        )
     card_choices = [
         choice for choice in (result.get("cardChoices") or [])
         if choice.get("token") and (
@@ -2327,47 +2392,31 @@ async def _send_hermes_result(
     products = list(result.get("productChoices") or [])[:10]
     pagination = result.get("productPagination") or {}
     offset = max(0, int(pagination.get("offset") or 0))
-    for product in products:
-        merchant = str(product.get("merchantName") or "merchant")
-        name = str(product.get("productName") or "product")
-        variant = str(product.get("optionText") or product.get("variantName") or "")
-        currency = str(product.get("currency") or "INR")
-        price = product.get("price") or 0
-        availability = "available" if product.get("available") else "unavailable"
-        caption = (
-            f"{product.get('searchQuery') or ''}\n{name}\n{variant}\n"
-            f"{merchant} · {currency} {price} · {availability}"
-        )[:1024]
-        choice_id = str(product.get("choiceId") or "")
-        product_markup = None
-        if product.get("available") and re.fullmatch(
-            r"[0-9a-f]{8}-[0-9a-f-]{27}", choice_id, re.IGNORECASE
-        ):
-            product_markup = InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    "Add to Cart",
-                    callback_data=f"product:add:{choice_id}",
-                )
-            ]])
-        image_url = str(product.get("imageUrl") or "")
+    # Single-message carousel: one product per page (photo + caption), navigated
+    # in place with Prev/Next (see navigate_product_carousel). Replaces the old
+    # one-message-per-product wall.
+    if products:
+        await asyncio.to_thread(_set_pending_ucp_products_sync, chat_id, products)
+        total = len(products)
+        first = products[0]
+        caption = _ucp_carousel_caption(first, 0, total)
+        markup = _ucp_carousel_markup(first, 0, total)
+        image_url = str(first.get("imageUrl") or "")
+        sent = False
         if image_url.startswith("https://"):
             try:
                 await update.effective_message.reply_photo(
-                    photo=image_url,
-                    caption=caption,
-                    reply_markup=product_markup,
+                    photo=image_url, caption=caption, reply_markup=markup,
                 )
-                continue
+                sent = True
             except Exception:
-                log.exception("Could not send one Telegram product image")
-        await update.effective_message.reply_text(
-            caption,
-            reply_markup=product_markup,
-        )
+                log.exception("Could not send Telegram product carousel image")
+        if not sent:
+            await update.effective_message.reply_text(caption, reply_markup=markup)
     if pagination.get("hasMore"):
         next_offset = int(pagination.get("nextOffset") or offset + len(products))
         await update.effective_message.reply_text(
-            f"Showing {len(products)} results from the most relevant merchant.",
+            "More matches are available.",
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "Show 10 More",
@@ -2465,6 +2514,43 @@ async def modify_ucp_cart(
     except Exception as exc:
         log.exception("Could not update UCP cart")
         await query.message.reply_text(f"I couldn't update your cart: {exc}")
+
+
+async def navigate_product_carousel(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    del context
+    query = update.callback_query
+    token = query.data.rsplit(":", 1)[-1]
+    if token == "noop":
+        await query.answer()
+        return
+    try:
+        index = int(token)
+    except ValueError:
+        await query.answer()
+        return
+    chat_id = update.effective_chat.id
+    products = await asyncio.to_thread(_get_pending_ucp_products_sync, chat_id)
+    if not products or not (0 <= index < len(products)):
+        await query.answer("That product list expired. Search again.", show_alert=True)
+        return
+    await query.answer()
+    product = products[index]
+    total = len(products)
+    caption = _ucp_carousel_caption(product, index, total)
+    markup = _ucp_carousel_markup(product, index, total)
+    image_url = str(product.get("imageUrl") or "")
+    try:
+        if image_url.startswith("https://"):
+            await query.edit_message_media(
+                media=InputMediaPhoto(media=image_url, caption=caption),
+                reply_markup=markup,
+            )
+        else:
+            await query.edit_message_caption(caption=caption, reply_markup=markup)
+    except Exception:
+        log.exception("Could not update product carousel")
 
 
 async def add_ucp_product_to_cart(
@@ -3684,6 +3770,11 @@ def build_application() -> Application:
     )
     app.add_handler(
         CallbackQueryHandler(show_more_products, pattern=r"^products:more:\d+$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            navigate_product_carousel, pattern=r"^ucpcarousel:(?:\d+|noop)$"
+        )
     )
     app.add_handler(
         CallbackQueryHandler(
