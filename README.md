@@ -26,9 +26,10 @@ The React frontend is connected to the backend's real contracts:
 - a persisted **Needs You** decision inbox and activity timeline
 - notification preferences and honest empty/provider-error states
 
-The current backend exposes Hermes through Telegram and LINQ/service adapters.
-The UI keeps the broader family-messaging product language; a native iMessage
-transport adapter is not yet implemented and should not be represented as live.
+The current backend exposes Hermes through Telegram and LINQ. A signed LINQ
+`message.received` webhook resolves the sender to the registered family, runs the
+same Hermes backend used by Telegram, persists the conversation, and replies to
+the existing iMessage, RCS, or SMS chat through LINQ V3.
 
 This Node application supports two onboarding channels:
 
@@ -51,7 +52,8 @@ compatibility but are not part of the Tokko web onboarding or dashboard.
 - `POST /api/v1/onboarding` lets trusted Telegram or service integrations create
   the normal Tokko family profile without requiring LINQ provisioning.
 - `/api/webhooks/linq` verifies Standard Webhooks HMAC signatures and rejects deliveries
-  older than five minutes.
+  older than five minutes. It deduplicates event IDs, ignores outbound/status events,
+  and uses LINQ idempotency keys for replies.
 - Card setup opens Prava's hosted page in a separate tab. Card number and CVC
   never enter Tokko's page or backend.
   PostgreSQL stores only the Prava enrollment ID, brand, last four digits, and expiry.
@@ -119,8 +121,9 @@ Open `http://localhost:3456`.
    publishable/secret keys and enable email/password signup with email-code
    verification in that Clerk instance.
 5. In LINQ, use a provisioned partner line and create a webhook subscription pointing to
-   `https://YOUR_DOMAIN/api/webhooks/linq?version=2026-02-03`. Put the returned signing
-   secret in `LINQ_WEBHOOK_SECRET`.
+   `https://YOUR_DOMAIN/api/webhooks/linq?version=2026-02-03`, subscribed to
+   `message.received` (optionally filtered to `LINQ_PHONE_NUMBER`). Put the returned
+   one-time signing secret in `LINQ_WEBHOOK_SECRET`.
 6. Deploy. Database tables and configured merchant rows are created idempotently at
    startup.
 
@@ -131,7 +134,9 @@ Hermes configuration, its chat contract, and the approval flow are in
 
 LINQ does not offer a self-serve V3 endpoint that creates or deletes phone numbers.
 Numbers must first be provisioned on the partner account by a LINQ representative. The
-onboarding API consistently assigns one of those usable lines and returns it.
+onboarding API consistently assigns one of those usable lines and returns it. When
+`LINQ_PHONE_NUMBER` is configured, a registered family member can also establish the
+binding simply by messaging that number; no separate chat-link command is required.
 
 ## External integration API
 
