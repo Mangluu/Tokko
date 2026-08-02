@@ -189,6 +189,22 @@
 .tf-order-meta dt { color: var(--faint); }
 .tf-order-meta dd { margin: 0; color: var(--ink); text-align: right; overflow-wrap: anywhere; }
 .tf-order-ref { font-family: ui-monospace, monospace; font-size: 11px; }
+.tf-messaging-connect { margin-bottom: 18px; padding-bottom: 18px; border-bottom: 1px solid var(--line); }
+.tf-messaging-head { display: flex; gap: 10px; margin-bottom: 12px; }
+.tf-messaging-icon { display: grid; place-items: center; width: 34px; height: 34px; flex: none; border-radius: 10px; background: var(--sage-soft); color: var(--sage); }
+.tf-messaging-head strong { display: block; font-size: 14px; color: var(--ink); }
+.tf-messaging-head small { color: var(--muted); font-size: 12px; line-height: 1.4; }
+.tf-channel-list { display: flex; flex-direction: column; gap: 8px; }
+.tf-channel { display: flex; align-items: center; gap: 11px; padding: 11px 13px; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); text-decoration: none; color: inherit; }
+.tf-channel[aria-disabled="true"] { opacity: .6; }
+a.tf-channel { cursor: pointer; transition: border-color .15s, background .15s; }
+a.tf-channel:hover { border-color: var(--sage); background: var(--sage-soft); }
+.tf-channel-icon { display: grid; place-items: center; width: 32px; height: 32px; flex: none; border-radius: 9px; background: var(--surface-muted); color: var(--ink); }
+.tf-channel.is-telegram .tf-channel-icon { background: color-mix(in srgb, #2AABEE 18%, var(--surface-muted)); color: #2AABEE; }
+.tf-channel > div { flex: 1; min-width: 0; }
+.tf-channel strong { display: block; font-size: 13px; color: var(--ink); }
+.tf-channel small { color: var(--faint); font-size: 11px; }
+.tf-soon-badge { padding: 3px 8px; border-radius: 999px; background: var(--surface-muted); color: var(--faint); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; }
 .tf-address-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 13px; padding: 17px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-sm); }
 .tf-address-card.is-selected { border-color: color-mix(in srgb, var(--sage) 42%, transparent); background: linear-gradient(110deg, var(--surface), var(--sage-soft)); }
 .tf-address-card p { margin: 5px 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; line-height: 1.45; }
