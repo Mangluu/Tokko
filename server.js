@@ -896,6 +896,12 @@ async function getUserState(userId, clerkUserId = null) {
     db.getUserPreferences(userId),
     db.getDecisionRequests(userId, { status: "pending", limit: 100 }),
   ]);
+  if (!user) {
+    throw Object.assign(
+      new Error("Your session is no longer valid. Please sign in again."),
+      { status: 401 }
+    );
+  }
   const paymentConfigured = payments.configuration().configured;
   const publicAddresses = familyAddressPayload(familyAddresses);
   const publicRules = publicCareRules(careRules);
