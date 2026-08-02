@@ -2262,14 +2262,28 @@ async def _send_hermes_result(
         ]])
 
     reply = str(result.get("message") or "Tokko completed the request.")
-    chunks = [reply[offset : offset + 4000] for offset in range(0, len(reply), 4000)]
-    if not chunks:
-        chunks = ["Tokko completed the request."]
-    for index, chunk in enumerate(chunks):
-        await update.effective_message.reply_text(
-            chunk,
-            reply_markup=markup if index == len(chunks) - 1 else None,
-        )
+    _review = result.get("checkoutSummary") or {}
+    review_step = bool(
+        _review.get("confirmationRequired")
+        and (_review.get("totals") or [])
+        and re.fullmatch(r"[0-9a-fA-F-]{36}", str(_review.get("orderId") or ""))
+    )
+    # The saved-card payment step renders its own concise prompt below; its
+    # narration ("…returned a final quote… no mandate…") just duplicates it.
+    card_step = bool(result.get("cardChoices")) and not (
+        result.get("mandateSetup") or result.get("mandate")
+    )
+    # The checkout review / card step each render one consolidated message below,
+    # so skip the narration that would just duplicate them.
+    if not review_step and not card_step:
+        chunks = [reply[offset : offset + 4000] for offset in range(0, len(reply), 4000)]
+        if not chunks:
+            chunks = ["Tokko completed the request."]
+        for index, chunk in enumerate(chunks):
+            await update.effective_message.reply_text(
+                chunk,
+                reply_markup=markup if index == len(chunks) - 1 else None,
+            )
     if "cartSummary" in result:
         cart_summary = result.get("cartSummary") or {}
         await update.effective_message.reply_text(
@@ -2280,27 +2294,29 @@ async def _send_hermes_result(
     checkout_totals = checkout_summary.get("totals") or []
     confirmation_required = bool(checkout_summary.get("confirmationRequired"))
     order_id = str(checkout_summary.get("orderId") or "")
-    # Render the itemised quote ONCE, at the review step. The payment step reuses
-    # the same checkoutSummary, so re-rendering here duplicated the whole block.
-    # Explanatory prose (forex method, mandate-coverage note, shipping caveat) is
-    # dropped: it repeated every message and is not needed to approve a price.
-    if checkout_totals and confirmation_required:
+    # One consolidated review message: a compact quote breakdown with the
+    # approve/cancel buttons attached. Replaces the 3-message stack (narration +
+    # "Quote:" block + "Confirm this final price:") the user saw before.
+    if checkout_totals and confirmation_required and re.fullmatch(
+        r"[0-9a-fA-F-]{36}", order_id
+    ):
         currency = str(checkout_summary.get("currency") or "INR").upper()
-        total_lines = ["Quote:"]
+        merchant = str(checkout_summary.get("merchantName") or "your order")
+        review_lines = [f"Review your order — {merchant}", ""]
         for line in checkout_totals:
             label = str(line.get("label") or line.get("type") or "Amount")
             try:
                 amount = int(line.get("amountMinor") or 0) / 100
             except (TypeError, ValueError):
                 amount = 0
-            total_lines.append(f"{label}: {currency} {amount:.2f}")
+            review_lines.append(f"{label}: {currency} {amount:.2f}")
             for detail in line.get("lines") or []:
                 detail_label = str(detail.get("label") or "Detail")
                 try:
                     detail_amount = int(detail.get("amountMinor") or 0) / 100
                 except (TypeError, ValueError):
                     detail_amount = 0
-                total_lines.append(f"  {detail_label}: {currency} {detail_amount:.2f}")
+                review_lines.append(f"  {detail_label}: {currency} {detail_amount:.2f}")
         delivery = checkout_summary.get("deliveryWindow") or {}
         delivery_period = " to ".join(str(value) for value in (
             delivery.get("description"),
@@ -2308,11 +2324,9 @@ async def _send_hermes_result(
             delivery.get("latest"),
         ) if value)
         if delivery_period:
-            total_lines.append(f"Delivery: {delivery_period}")
-        await update.effective_message.reply_text("\n".join(total_lines))
-    if confirmation_required and re.fullmatch(r"[0-9a-fA-F-]{36}", order_id):
+            review_lines.append(f"Delivery: {delivery_period}")
         await update.effective_message.reply_text(
-            "Confirm this final price:",
+            "\n".join(review_lines),
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
                     "Approve Checkout",
@@ -2372,7 +2386,7 @@ async def _send_hermes_result(
             (
                 "Choose a saved Prava card for this mandate, or add a new saved card:"
                 if mandate_choice
-                else "No active mandate covers the checkout total. Choose a saved Prava card:"
+                else "Choose a card to pay with Prava:"
             ),
             reply_markup=InlineKeyboardMarkup(choice_buttons),
         )
@@ -2434,9 +2448,9 @@ def _ucp_cart_text(cart: dict) -> str:
     lines = [f"Cart: {int(cart.get('itemCount') or 0)} item(s)"]
     for group in groups:
         lines.append(f"\n{group.get('merchantName') or group.get('merchant') or 'Merchant'}")
-        for item in group.get("items") or []:
+        for idx, item in enumerate(group.get("items") or [], 1):
             lines.append(
-                f"• {item.get('productName') or 'Product'} × {int(item.get('quantity') or 1)}"
+                f"{idx}. {item.get('productName') or 'Product'} × {int(item.get('quantity') or 1)}"
             )
         for subtotal in group.get("subtotals") or []:
             lines.append(
@@ -2461,8 +2475,9 @@ def _ucp_cart_checkout_markup(cart: dict) -> InlineKeyboardMarkup | None:
         if not re.fullmatch(r"[1-9]\d*", item_id):
             continue
         name = str(item.get("productName") or "Product")
+        short = name if len(name) <= 38 else f"{name[:37]}…"
         rows.append([InlineKeyboardButton(
-            f"Remove {name}"[:64],
+            f"🗑 Remove {short}",
             callback_data=f"cart:remove:{item_id}",
         )])
     if cart.get("items"):

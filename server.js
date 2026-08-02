@@ -2296,9 +2296,21 @@ async function selectUcpSavedCard(userId, token) {
           savedCard,
         };
       } catch (error) {
-        // Prava session could not start — fall back to the merchant handoff.
+        // Prava session could not start — fall back to the merchant handoff,
+        // but log why so a live fallback is not silent.
+        console.warn(
+          `[ucp:card] Prava session failed for flow ${input.tokkoFlowId}; falling back to merchant handoff: ${error.message}`
+        );
       }
+    } else {
+      console.warn(
+        `[ucp:card] No checkout flow ${input.tokkoFlowId} for user ${userId}; falling back to merchant handoff`
+      );
     }
+  } else {
+    console.warn(
+      "[ucp:card] select_ucp_saved_card token had no tokkoFlowId; using merchant handoff (session-auth path or pre-fix token)"
+    );
   }
   const paymentSelection = {
     policy: "active_mandate_then_saved_card",
@@ -7168,16 +7180,19 @@ route(
       });
     }
     const result = await selectUcpSavedCard(Number(user.id), body.token);
+    const pravaSession = result.nextAction?.type === "prava_card_approval";
+    const cardLabel = `${result.savedCard.brand} ending ${result.savedCard.last4}`;
     await db.saveTelegramHermesMessage(
       chatId,
       "assistant",
-      `saved ${result.savedCard.brand} ending ${result.savedCard.last4} selected for ${result.merchantName} checkout`
+      `saved ${cardLabel} selected for ${result.merchantName} checkout`
     );
     sendJson(res, 200, {
       ...result,
-      message:
-        `${result.savedCard.brand} ending ${result.savedCard.last4} is selected. `
-        + "The merchant may still ask you to confirm the card because it does not advertise a Prava payment handler.",
+      message: pravaSession
+        ? `Generating your Prava session for ${cardLabel}. Approve it securely below.`
+        : `${cardLabel} is selected. `
+          + "The merchant may still ask you to confirm the card because it does not advertise a Prava payment handler.",
       telegram: { chatId, familyLinked: true },
     });
   }
