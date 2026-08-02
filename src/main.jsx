@@ -141,6 +141,19 @@ function AccountAccess({ onAuthenticated, initialEmail = '', initialStatus = '' 
   const [emailOtp, setEmailOtp] = useState('');
   const [status, setStatus] = useState(initialStatus);
   const [busy, setBusy] = useState(false);
+  useEffect(() => {
+    // busy is set before redirecting to Google, then the page navigates away. If
+    // the user returns with Back, the restored page keeps that spinner going
+    // forever. Clear it, and the progress text, whenever the screen is shown again.
+    const clear = () => {
+      setBusy(false);
+      setStatus((prev) => /opening|signing in|verifying|sending/i.test(prev || '') ? '' : prev);
+    };
+    const onVisible = () => { if (document.visibilityState === 'visible') clear(); };
+    window.addEventListener('pageshow', clear);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => { window.removeEventListener('pageshow', clear); document.removeEventListener('visibilitychange', onVisible); };
+  }, []);
   const verifyingSignup = mode === 'signup' && Boolean(signupChallenge);
   const statusIsProgress = /sent to|signing|verifying|sending|opening/i.test(status);
   const changeMode = (nextMode) => { setMode(nextMode); setSignupChallenge(null); setEmailOtp(''); setStatus(''); };
@@ -478,26 +491,21 @@ function App() {
     return () => { active = false; };
   }, []);
   useEffect(() => {
-    // A page restored from the browser back/forward cache is a full in-memory
-    // snapshot that never re-runs our data fetching, so it shows stale content.
-    // Reload it so the user always comes back to the current app and state.
-    const onPageShow = (event) => { if (event.persisted) window.location.reload(); };
-    window.addEventListener('pageshow', onPageShow);
-    return () => window.removeEventListener('pageshow', onPageShow);
-  }, []);
-  useEffect(() => {
     if (session !== 'authenticated') return undefined;
-    // When the tab becomes visible again, re-sync server state (throttled) so a
-    // user returning after a while sees current data, and an expired session is
-    // detected and sent back to sign-in instead of showing a dead logged-in view.
+    // On return to an authenticated session keep things current. A page restored
+    // from the browser back/forward cache is a stale in-memory snapshot, so reload
+    // it. On tab focus, re-sync state (throttled) and route an expired session to
+    // sign-in instead of leaving a dead logged-in view.
+    const onPageShow = (event) => { if (event.persisted) window.location.reload(); };
     const sync = async () => {
       if (document.visibilityState !== 'visible' || Date.now() - syncedAtRef.current < 15000) return;
       syncedAtRef.current = Date.now();
       try { setState(await api('/api/me')); }
       catch (error) { if (error?.status === 401) { setState(null); setSession('guest'); setPage('auth'); } }
     };
+    window.addEventListener('pageshow', onPageShow);
     document.addEventListener('visibilitychange', sync);
-    return () => document.removeEventListener('visibilitychange', sync);
+    return () => { window.removeEventListener('pageshow', onPageShow); document.removeEventListener('visibilitychange', sync); };
   }, [session]);
   const logout = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch {} try { const clerk = await browserClerk(); if (clerk?.session) await clerk.signOut(); } catch {} setState(null); setSession('guest'); setPage('auth'); };
   if (page === 'loading') return <div className="tf-app-loading"><Brand /><LoaderCircle className="tokko-spinner" /><span>Waking your care circle…</span></div>;
