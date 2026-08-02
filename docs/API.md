@@ -204,6 +204,8 @@ for the tested India and US fulfillment matrix.
 | `POST` | `/api/v1/onboarding/:id/merchant/zepto/address/confirm` | Activate and persist one family delivery address |
 | `POST` | `/api/v1/onboarding/:id/merchant/zepto/tools/:toolName` | Call an allowlisted Zepto MCP tool |
 | `POST` | `/api/integrations/telegram/hermes` | Send a Telegram conversation turn to the family-scoped Hermes shopper |
+| `POST` | `/api/integrations/telegram/hermes/mandate-options` | Return masked saved-card and add-card choices for a Telegram mandate |
+| `POST` | `/api/integrations/telegram/hermes/payment-choice` | Apply a signed saved-card/add-card choice and continue checkout or mandate setup |
 
 ### Telegram Hermes endpoint
 
@@ -262,6 +264,35 @@ After they confirm, repeat the request with the returned token in
 `approvalToken`. Send the response's `message` back with Telegram's
 `sendMessage` API. The endpoint stores a short, family-scoped chat history, so
 the bot does not need to resend the entire conversation.
+
+For mandate setup, a message such as `create a ₹500 any-merchant mandate`
+returns `cardChoices`. Each existing choice contains masked card metadata and a
+signed `token`; the final choice has `type: "add_card"`. Render all choices as
+Telegram buttons without exposing the token in message text. When the user
+selects one, post its token to the payment-choice endpoint:
+
+```sh
+curl -sS "$HERMES_ENDPOINT_URL/payment-choice" \
+  -H "X-API-Key: $HERMES_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "telegramChatId": "123456789",
+    "botUsername": "TokkoShopperBot",
+    "token": "signed-card-choice-token"
+  }' | jq
+```
+
+A saved-card choice immediately returns the mandate `approvalUrl`. The add-card
+choice returns a secure Prava card-enrollment URL and stores the pending mandate
+on the Telegram chat. After enrollment, Prava redirects to
+`/start payments_card_return`. Forward that ordinary Telegram update to the
+main Hermes endpoint; Tokko detects the return, identifies the newly saved card,
+and automatically creates the mandate approval session from it. The user must
+still open the second Prava URL and approve the mandate with their passkey.
+
+Bot adapters that do not use natural-language tool selection can call
+`$HERMES_ENDPOINT_URL/mandate-options` directly with `telegramChatId`, `amount`,
+`frequency`, and `merchantScope` to receive the same `cardChoices` contract.
 
 To reconnect Zepto entirely through Telegram, send `reconnect zepto with otp`,
 repeat the request with `approvalToken` after the user confirms, and then send
@@ -1267,6 +1298,30 @@ curl -sS \
 Open the returned `approvalUrl` to approve with Prava. The amount is a
 per-charge authorization cap, not stored balance, and creating the mandate
 does not deduct money.
+
+For a one-time mandate that the Telegram bot may use at any merchant, send
+`frequency: "one_time"` with `merchantScope: "any"`:
+
+```sh
+curl -sS \
+  -X POST \
+  "$BASE_URL/api/v1/onboarding/$USER_ID/payment/mandates/session" \
+  -H "X-API-Key: $TOKKO_API_KEY" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "paymentMethodId": "7",
+    "amount": "500.00",
+    "frequency": "one_time",
+    "merchantScope": "any",
+    "returnContext": {
+      "channel": "telegram",
+      "botUsername": "TokkoShopperBot"
+    }
+  }' | jq
+```
+
+Prava permits `any` only for one-time mandates. Weekly, monthly, and yearly
+mandates remain merchant-scoped and must use `merchantScope: "listed"`.
 
 `returnContext` is optional. When omitted, Prava returns to the Tokko website.
 For `channel: "telegram"`, Tokko validates the bot username, receives Prava's

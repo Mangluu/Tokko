@@ -154,6 +154,30 @@ class PhoneNormalizationTests(unittest.TestCase):
         offer.assert_awaited_once()
         hermes.assert_not_awaited()
 
+    def test_direct_product_search_uses_the_same_hermes_flow_as_other_messages(self):
+        message = SimpleNamespace(text="find milk")
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        search_result = {"message": "i found products from himalaya's live ucp"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "get_pending_action", AsyncMock(return_value=None)),
+            patch.object(bot, "_address_session_confirmed", AsyncMock(return_value=True)),
+            patch.object(bot, "_keep_typing", AsyncMock()),
+            patch.object(bot, "_call_hermes", AsyncMock(return_value=search_result)) as hermes,
+            patch.object(bot, "_send_hermes_result", AsyncMock()) as send_result,
+            patch.object(bot, "_family_api", AsyncMock()) as family_api,
+        ):
+            asyncio.run(bot.handle_message(update, context))
+        hermes.assert_awaited_once_with(1234, binding, "find milk")
+        send_result.assert_awaited_once_with(update, search_result, binding)
+        family_api.assert_not_awaited()
+
     def test_mandate_summary_only_shows_top_five(self):
         mandates = [
             {
@@ -199,6 +223,64 @@ class PhoneNormalizationTests(unittest.TestCase):
         self.assertIn("Kapiva", message)
         self.assertIn("OZiva", message)
         self.assertIn("activity: 2026-08-01", message)
+
+
+class OnboardingRedirectTests(unittest.TestCase):
+    def test_unknown_phone_redirects_to_hosted_onboarding(self):
+        message = SimpleNamespace(
+            contact=SimpleNamespace(user_id=99, phone_number="+919876543210"),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_user=SimpleNamespace(id=99),
+            message=message,
+        )
+        context = SimpleNamespace(user_data={"onboarding": {"legacy": True}})
+
+        with patch.object(bot, "_lookup_family", AsyncMock(return_value=None)):
+            result = asyncio.run(bot.handle_contact(update, context))
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        self.assertNotIn("onboarding", context.user_data)
+        reply_markup = message.reply_text.await_args.kwargs["reply_markup"]
+        button = reply_markup.inline_keyboard[0][0]
+        self.assertEqual(button.text, "Complete Tokko onboarding")
+        self.assertEqual(button.url, "https://tokko-drab.vercel.app")
+
+    def test_completed_family_keeps_existing_connection_flow(self):
+        binding = {
+            "userId": 42,
+            "customerId": "tokko_family_42",
+            "familyPhone": "+919876543210",
+            "profileComplete": True,
+        }
+        message = SimpleNamespace(
+            contact=SimpleNamespace(user_id=99, phone_number="+919876543210"),
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_user=SimpleNamespace(id=99),
+            message=message,
+        )
+        context = SimpleNamespace(user_data={})
+
+        with (
+            patch.object(bot, "_lookup_family", AsyncMock(return_value=binding)),
+            patch.object(bot, "set_family_binding", AsyncMock()) as save_binding,
+            patch.object(bot, "_offer_address_or_ready", AsyncMock()) as offer_address,
+        ):
+            result = asyncio.run(bot.handle_contact(update, context))
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        save_binding.assert_awaited_once_with(1234, binding)
+        offer_address.assert_awaited_once_with(
+            update,
+            binding,
+            "Found your family account. You're connected to Tokko.",
+        )
+        message.reply_text.assert_not_awaited()
 
 
 class BindingPersistenceTests(unittest.TestCase):
@@ -247,6 +329,19 @@ class BindingPersistenceTests(unittest.TestCase):
         self.assertEqual(saved, choices[0])
         bot._clear_pending_ucp_cards_sync(1234)
         self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 0))
+
+    def test_round_trips_add_card_choice_for_mandate_setup(self):
+        choices = [{
+            "type": "add_card",
+            "label": "Add a new saved card",
+            "token": "signed-add-card-choice",
+        }]
+        bot._set_pending_ucp_cards_sync(1234, choices)
+        saved = bot._get_pending_ucp_card_sync(1234, 0)
+        self.assertEqual(saved["type"], "add_card")
+        self.assertEqual(saved["token"], choices[0]["token"])
+        self.assertEqual(bot._card_choice_label(saved), choices[0]["label"])
+        bot._clear_pending_ucp_cards_sync(1234)
 
 
 if __name__ == "__main__":

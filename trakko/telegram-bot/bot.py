@@ -69,6 +69,7 @@ HERMES_TIMEOUT = httpx.Timeout(
 DB_PATH = os.environ.get("DB_PATH") or (
     "/tmp/bridge_state.db" if os.environ.get("VERCEL") else "bridge_state.db"
 )
+ONBOARDING_URL = "https://tokko-drab.vercel.app"
 
 (
     WAIT_CONTACT,
@@ -102,6 +103,9 @@ CONTACT_KEYBOARD = ReplyKeyboardMarkup(
     [[KeyboardButton("Share My Phone Number", request_contact=True)]],
     resize_keyboard=True,
     one_time_keyboard=True,
+)
+NEW_ONBOARDING_KEYBOARD = InlineKeyboardMarkup(
+    [[InlineKeyboardButton("Complete Tokko onboarding", url=ONBOARDING_URL)]]
 )
 RELATIONSHIP_KEYBOARD = ReplyKeyboardMarkup(
     [
@@ -137,6 +141,18 @@ PAYMENT_MENU_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
+MANDATE_AMOUNT_INLINE_KEYBOARD = InlineKeyboardMarkup(
+    [
+        [
+            InlineKeyboardButton("₹50", callback_data="mandateamt:50"),
+            InlineKeyboardButton("₹100", callback_data="mandateamt:100"),
+        ],
+        [
+            InlineKeyboardButton("₹500", callback_data="mandateamt:500"),
+            InlineKeyboardButton("₹1000", callback_data="mandateamt:1000"),
+        ],
+    ]
+)
 MANDATE_AMOUNT_KEYBOARD = ReplyKeyboardMarkup(
     [
         ["₹50", "₹100"],
@@ -148,7 +164,11 @@ MANDATE_AMOUNT_KEYBOARD = ReplyKeyboardMarkup(
     one_time_keyboard=True,
 )
 MANDATE_FREQUENCY_KEYBOARD = ReplyKeyboardMarkup(
-    [["Weekly", "Monthly", "Yearly"], ["Back to Payments"]],
+    [
+        ["One-Time (Any Merchant)"],
+        ["Weekly", "Monthly", "Yearly"],
+        ["Back to Payments"],
+    ],
     resize_keyboard=True,
     one_time_keyboard=True,
 )
@@ -427,6 +447,14 @@ def _set_pending_ucp_cards_sync(chat_id: int, choices: list) -> None:
             "last4": str(choice.get("last4") or ""),
             "isDefault": bool(choice.get("isDefault")),
             **(
+                {"type": str(choice.get("type"))}
+                if choice.get("type") else {}
+            ),
+            **(
+                {"label": str(choice.get("label"))}
+                if choice.get("label") else {}
+            ),
+            **(
                 {"paymentMethodId": str(choice.get("paymentMethodId"))}
                 if choice.get("paymentMethodId") else {}
             ),
@@ -441,7 +469,10 @@ def _set_pending_ucp_cards_sync(chat_id: int, choices: list) -> None:
         }
         for choice in choices[:50]
         if (choice.get("token") or choice.get("paymentMethodId"))
-        and re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
+        and (
+            str(choice.get("type") or "saved_card") == "add_card"
+            or re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
+        )
     ]
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -484,6 +515,39 @@ def _clear_pending_ucp_cards_sync(chat_id: int) -> None:
         conn.commit()
     finally:
         conn.close()
+
+
+def _card_choice_label(choice: dict, selected: bool = False) -> str:
+    prefix = "✓ " if selected else ""
+    if choice.get("type") == "add_card":
+        return f"{prefix}{str(choice.get('label') or 'Add a new saved card')}"
+    default = "✓ " if choice.get("isDefault") and not selected else ""
+    return (
+        f"{prefix}{default}{str(choice.get('brand') or 'Card').title()} "
+        f"•••• {choice.get('last4')}"
+    )
+
+
+def _mandate_frequency_inline_keyboard(amount: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton(
+                "One-Time (Any Merchant)",
+                callback_data=f"mandatefreq:{amount}:o:a",
+            )],
+            [
+                InlineKeyboardButton(
+                    "Weekly", callback_data=f"mandatefreq:{amount}:w:l"
+                ),
+                InlineKeyboardButton(
+                    "Monthly", callback_data=f"mandatefreq:{amount}:m:l"
+                ),
+                InlineKeyboardButton(
+                    "Yearly", callback_data=f"mandatefreq:{amount}:y:l"
+                ),
+            ],
+        ]
+    )
 
 
 def _normalize_phone(phone: str) -> str:
@@ -739,7 +803,12 @@ async def _retry_hermes_after_country_cart_clear(
     return data
 
 
-async def _select_ucp_card(chat_id: int, binding: dict, token: str) -> dict:
+async def _select_ucp_card(
+    chat_id: int,
+    binding: dict,
+    token: str,
+    bot_username: str | None = None,
+) -> dict:
     endpoint = _required_env("HERMES_ENDPOINT_URL").rstrip("/")
     if endpoint.endswith("/hermes"):
         endpoint = f"{endpoint}/payment-choice"
@@ -750,6 +819,8 @@ async def _select_ucp_card(chat_id: int, binding: dict, token: str) -> dict:
         "familyUserId": binding["userId"],
         "token": token,
     }
+    if bot_username:
+        payload["botUsername"] = bot_username
     async with httpx.AsyncClient(timeout=HERMES_TIMEOUT) as client:
         response = await client.post(
             endpoint,
@@ -761,6 +832,36 @@ async def _select_ucp_card(chat_id: int, binding: dict, token: str) -> dict:
     data = response.json()
     if not isinstance(data, dict):
         raise RuntimeError("Could not parse saved-card selection response")
+    return data
+
+
+async def _mandate_card_options(
+    chat_id: int,
+    binding: dict,
+    amount: str,
+    frequency: str,
+    merchant_scope: str,
+) -> dict:
+    endpoint = _required_env("HERMES_ENDPOINT_URL").rstrip("/")
+    endpoint = f"{endpoint}/mandate-options"
+    payload = {
+        "telegramChatId": chat_id,
+        "familyUserId": binding["userId"],
+        "amount": amount,
+        "frequency": frequency,
+        "merchantScope": merchant_scope,
+    }
+    async with httpx.AsyncClient(timeout=HERMES_TIMEOUT) as client:
+        response = await client.post(
+            endpoint,
+            json=payload,
+            headers={**_tokko_headers(), "Content-Type": "application/json"},
+        )
+    if response.status_code >= 400:
+        raise _api_error(response)
+    data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("Could not parse mandate card options")
     return data
 
 
@@ -984,6 +1085,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         f"still {result.get('pravaStatus') or 'pending'}. Use Continue Payment again in a moment."
                     )
             elif return_payload == "payments_card_return":
+                try:
+                    mandate_result = await _call_hermes(
+                        chat_id,
+                        binding,
+                        text="/start payments_card_return",
+                    )
+                except TokkoAPIError as exc:
+                    if exc.status_code not in {404, 410}:
+                        raise
+                    mandate_result = None
+                if mandate_result is not None:
+                    await _send_hermes_result(update, mandate_result, binding)
+                    await update.message.reply_text(
+                        "You are back in the same shopping conversation.",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    return ConversationHandler.END
                 result = await _family_api(binding, "GET", "payment-methods")
                 message = (
                     "You're back from Prava.\n\n"
@@ -1050,7 +1168,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return ConversationHandler.END
     await update.message.reply_text(
         "Hi, I'm Tokko. Share your own phone number so I can find your family account. "
-        "If you're new, I'll onboard you here first.",
+        "If you're new, I'll open Tokko's onboarding flow.",
         reply_markup=CONTACT_KEYBOARD,
     )
     return WAIT_CONTACT
@@ -1108,16 +1226,13 @@ async def handle_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return ConversationHandler.END
 
-    context.user_data["onboarding"] = {
-        "primaryParentPhone": phone,
-        "dependents": [],
-    }
+    context.user_data.pop("onboarding", None)
     await update.message.reply_text(
-        "I couldn't find a completed Tokko family for this number, so let's create one. "
-        "What is your full name?",
-        reply_markup=ReplyKeyboardRemove(),
+        "I couldn't find a completed Tokko family for this number. Complete onboarding "
+        "on Tokko, then return here and send /start to connect your new account.",
+        reply_markup=NEW_ONBOARDING_KEYBOARD,
     )
-    return ONBOARD_NAME
+    return ConversationHandler.END
 
 
 async def onboarding_name(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -1742,30 +1857,11 @@ async def payment_menu_action(
                 update, f"I couldn't load the last 30 days of mandate history: {exc}"
             )
     if action == "Create Mandate":
-        try:
-            result = await _family_api(binding, "GET", "payment-methods")
-            cards = result.get("paymentMethods") or []
-        except Exception as exc:
-            log.exception("Prava card list failed")
-            return await _show_payment_menu(update, f"I couldn't load saved cards: {exc}")
-        if not cards:
-            return await _show_payment_menu(
-                update, "Save a Prava card first, then create the mandate."
-            )
-        labels = {}
-        for index, card in enumerate(cards, start=1):
-            label = f"{index}. {str(card.get('brand') or 'Card').upper()} •••• {card.get('last4')}"
-            labels[label] = str(card.get("id"))
-        context.user_data["payment_setup"] = {"cardChoices": labels}
         await update.message.reply_text(
-            "Which saved card should back this Zepto mandate?",
-            reply_markup=ReplyKeyboardMarkup(
-                [[label] for label in labels] + [["Back to Payments"]],
-                resize_keyboard=True,
-                one_time_keyboard=True,
-            ),
+            "Choose the maximum amount for each charge. For a custom amount, send a message such as “create a ₹750 any-merchant mandate”.",
+            reply_markup=MANDATE_AMOUNT_INLINE_KEYBOARD,
         )
-        return MANDATE_CARD_STATE
+        return ConversationHandler.END
     return await _show_payment_menu(update, "Choose a payment option from the buttons.")
 
 
@@ -1779,7 +1875,12 @@ async def mandate_card_selected(
     if not payment_method_id:
         await update.message.reply_text("Choose one of the saved cards shown above.")
         return MANDATE_CARD_STATE
-    setup["paymentMethodId"] = payment_method_id
+    if payment_method_id == "__add_card__":
+        setup["addNewCard"] = True
+        setup.pop("paymentMethodId", None)
+    else:
+        setup["paymentMethodId"] = payment_method_id
+        setup.pop("addNewCard", None)
     context.user_data["payment_setup"] = setup
     await update.message.reply_text(
         "Choose the maximum amount Prava may authorize for each Zepto charge. "
@@ -1849,10 +1950,15 @@ async def mandate_frequency_selected(
     value = _text(update)
     if value == "Back to Payments":
         return await _show_payment_menu(update, "Mandate setup cancelled.")
-    frequency = value.lower()
-    if frequency not in {"weekly", "monthly", "yearly"}:
+    if value == "One-Time (Any Merchant)":
+        frequency = "one_time"
+        merchant_scope = "any"
+    else:
+        frequency = value.lower()
+        merchant_scope = "listed"
+    if frequency not in {"one_time", "weekly", "monthly", "yearly"}:
         await update.message.reply_text(
-            "Choose Weekly, Monthly, or Yearly.",
+            "Choose One-Time (Any Merchant), Weekly, Monthly, or Yearly.",
             reply_markup=MANDATE_FREQUENCY_KEYBOARD,
         )
         return MANDATE_FREQUENCY_STATE
@@ -1860,6 +1966,37 @@ async def mandate_frequency_selected(
     setup = context.user_data.get("payment_setup") or {}
     try:
         return_context = await _telegram_return_context(context)
+        if setup.get("addNewCard"):
+            options = await _mandate_card_options(
+                update.effective_chat.id,
+                binding,
+                setup["amount"],
+                frequency,
+                merchant_scope,
+            )
+            add_card = next(
+                (
+                    choice
+                    for choice in options.get("cardChoices") or []
+                    if choice.get("type") == "add_card" and choice.get("token")
+                ),
+                None,
+            )
+            if add_card is None:
+                raise RuntimeError("Tokko did not return an add-card option")
+            session = await _select_ucp_card(
+                update.effective_chat.id,
+                binding,
+                add_card["token"],
+                return_context["returnContext"]["botUsername"],
+            )
+            context.user_data.pop("payment_setup", None)
+            await _send_hermes_result(update, session, binding)
+            await update.message.reply_text(
+                "After saving the card, return here and Tokko will automatically prepare the mandate approval.",
+                reply_markup=PAYMENT_MENU_KEYBOARD,
+            )
+            return PAYMENT_MENU_STATE
         session = await _family_api(
             binding,
             "POST",
@@ -1868,6 +2005,7 @@ async def mandate_frequency_selected(
                 "paymentMethodId": setup["paymentMethodId"],
                 "amount": setup["amount"],
                 "frequency": frequency,
+                "merchantScope": merchant_scope,
                 **return_context,
             },
         )
@@ -1877,7 +2015,7 @@ async def mandate_frequency_selected(
         context.user_data.pop("payment_setup", None)
         return await _show_payment_menu(
             update,
-            f"Approve the {frequency} mandate with a ₹{setup['amount']} per-charge cap here:\n"
+            f"Approve the {frequency.replace('_', ' ')} mandate with a ₹{setup['amount']} per-charge cap here:\n"
             f"{approval_url}\n\nCreating the mandate does not deduct money. After approval, "
             "Prava returns to this chat and Tokko automatically requests a ₹1 sandbox token.",
         )
@@ -1892,6 +2030,121 @@ async def payment_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Payment setup closed. Back to shopping.", reply_markup=MAIN_KEYBOARD
     )
     return ConversationHandler.END
+
+
+async def select_mandate_amount(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    del context
+    query = update.callback_query
+    amount = query.data.split(":", 1)[1]
+    await query.answer("Amount selected")
+    await query.edit_message_text(
+        f"₹{amount} per charge. Choose the mandate frequency and merchant scope:",
+        reply_markup=_mandate_frequency_inline_keyboard(amount),
+    )
+
+
+async def prepare_mandate_card_choices(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    del context
+    query = update.callback_query
+    _, amount, frequency_code, scope_code = query.data.split(":", 3)
+    frequency = {
+        "o": "one_time",
+        "w": "weekly",
+        "m": "monthly",
+        "y": "yearly",
+    }[frequency_code]
+    merchant_scope = {"a": "any", "l": "listed"}[scope_code]
+    await query.answer("Loading saved cards...")
+    binding = await get_family_binding(update.effective_chat.id)
+    if binding is None:
+        await query.message.reply_text(
+            "Please send /start and connect your Tokko family again.",
+            reply_markup=CONTACT_KEYBOARD,
+        )
+        return
+    try:
+        result = await _mandate_card_options(
+            update.effective_chat.id,
+            binding,
+            amount,
+            frequency,
+            merchant_scope,
+        )
+        await query.edit_message_reply_markup(reply_markup=None)
+        await _send_hermes_result(update, result, binding)
+    except Exception as exc:
+        log.exception("Could not prepare mandate card choices")
+        await query.message.reply_text(f"I couldn't prepare the mandate: {exc}")
+
+
+async def select_mandate_card_choice(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    query = update.callback_query
+    _, amount, frequency_code, scope_code, choice_key = query.data.split(":", 4)
+    frequency = {
+        "o": "one_time",
+        "w": "weekly",
+        "m": "monthly",
+        "y": "yearly",
+    }[frequency_code]
+    merchant_scope = {"a": "any", "l": "listed"}[scope_code]
+    await query.answer("Applying card choice...")
+    chat_id = update.effective_chat.id
+    binding = await get_family_binding(chat_id)
+    if binding is None:
+        await query.message.reply_text(
+            "Please send /start and connect your Tokko family again.",
+            reply_markup=CONTACT_KEYBOARD,
+        )
+        return
+    try:
+        options = await _mandate_card_options(
+            chat_id,
+            binding,
+            amount,
+            frequency,
+            merchant_scope,
+        )
+        choice = next(
+            (
+                item
+                for item in options.get("cardChoices") or []
+                if (
+                    choice_key == "new" and item.get("type") == "add_card"
+                ) or (
+                    choice_key != "new"
+                    and item.get("type") != "add_card"
+                    and str(item.get("id")) == choice_key
+                )
+            ),
+            None,
+        )
+        if choice is None or not choice.get("token"):
+            raise RuntimeError("That card choice is no longer available")
+        return_context = await _telegram_return_context(context)
+        result = await _select_ucp_card(
+            chat_id,
+            binding,
+            choice["token"],
+            return_context["returnContext"]["botUsername"],
+        )
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    _card_choice_label(choice, selected=True),
+                    callback_data="selection:done",
+                )
+            ]])
+        )
+        await _send_hermes_result(update, result, binding)
+    except Exception as exc:
+        log.exception("Could not apply mandate card choice")
+        await query.message.reply_text(f"I couldn't apply that card choice: {exc}")
 
 
 async def _send_hermes_result(
@@ -2004,19 +2257,55 @@ async def _send_hermes_result(
             )
     card_choices = [
         choice for choice in (result.get("cardChoices") or [])
-        if choice.get("token") and re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
+        if choice.get("token") and (
+            choice.get("type") == "add_card"
+            or re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
+        )
     ][:8]
     if card_choices:
-        await asyncio.to_thread(_set_pending_ucp_cards_sync, chat_id, card_choices)
-        await update.effective_message.reply_text(
-            "No active mandate covers the checkout total. Choose a saved Prava card:",
-            reply_markup=InlineKeyboardMarkup([
+        mandate_setup = result.get("mandateSetup") or result.get("mandate") or {}
+        mandate_choice = bool(mandate_setup)
+        choice_buttons = None
+        if mandate_choice:
+            amount = _valid_mandate_amount(str(mandate_setup.get("amount") or ""))
+            frequency_code = {
+                "one_time": "o",
+                "weekly": "w",
+                "monthly": "m",
+                "yearly": "y",
+            }.get(str(mandate_setup.get("frequency") or ""))
+            scope_code = {
+                "any": "a",
+                "listed": "l",
+            }.get(str(mandate_setup.get("merchantScope") or ""))
+            if amount and frequency_code and scope_code:
+                choice_buttons = [
+                    [InlineKeyboardButton(
+                        _card_choice_label(choice),
+                        callback_data=(
+                            f"mandatecard:{amount}:{frequency_code}:{scope_code}:"
+                            f"{'new' if choice.get('type') == 'add_card' else choice.get('id')}"
+                        ),
+                    )]
+                    for choice in card_choices
+                    if choice.get("type") == "add_card" or choice.get("id") is not None
+                ]
+        if not choice_buttons:
+            await asyncio.to_thread(_set_pending_ucp_cards_sync, chat_id, card_choices)
+            choice_buttons = [
                 [InlineKeyboardButton(
-                    f"{'✓ ' if choice.get('isDefault') else ''}{str(choice.get('brand') or 'Card').title()} •••• {choice.get('last4')}",
+                    _card_choice_label(choice),
                     callback_data=f"ucpcard:{index}",
                 )]
                 for index, choice in enumerate(card_choices)
-            ]),
+            ]
+        await update.effective_message.reply_text(
+            (
+                "Choose a saved Prava card for this mandate, or add a new saved card:"
+                if mandate_choice
+                else "No active mandate covers the checkout total. Choose a saved Prava card:"
+            ),
+            reply_markup=InlineKeyboardMarkup(choice_buttons),
         )
     next_action = result.get("nextAction") or {}
     payment_url = str(next_action.get("url") or result.get("paymentLink") or "")
@@ -2031,10 +2320,7 @@ async def _send_hermes_result(
                 )
             ]]),
         )
-    products = [
-        product for product in (result.get("productChoices") or [])
-        if str(product.get("imageUrl") or "").startswith("https://")
-    ][:10]
+    products = list(result.get("productChoices") or [])[:10]
     pagination = result.get("productPagination") or {}
     offset = max(0, int(pagination.get("offset") or 0))
     for product in products:
@@ -2059,14 +2345,21 @@ async def _send_hermes_result(
                     callback_data=f"product:add:{choice_id}",
                 )
             ]])
-        try:
-            await update.effective_message.reply_photo(
-                photo=product["imageUrl"],
-                caption=caption,
-                reply_markup=product_markup,
-            )
-        except Exception:
-            log.exception("Could not send one Telegram product card")
+        image_url = str(product.get("imageUrl") or "")
+        if image_url.startswith("https://"):
+            try:
+                await update.effective_message.reply_photo(
+                    photo=image_url,
+                    caption=caption,
+                    reply_markup=product_markup,
+                )
+                continue
+            except Exception:
+                log.exception("Could not send one Telegram product image")
+        await update.effective_message.reply_text(
+            caption,
+            reply_markup=product_markup,
+        )
     if pagination.get("hasMore"):
         next_offset = int(pagination.get("nextOffset") or offset + len(products))
         await update.effective_message.reply_text(
@@ -2121,7 +2414,7 @@ def _ucp_cart_checkout_markup(cart: dict) -> InlineKeyboardMarkup | None:
         )])
     if cart.get("items"):
         rows.append([InlineKeyboardButton("Empty Cart", callback_data="cart:empty")])
-    if len(groups) != 1:
+    if len(groups) != 1 or cart.get("checkoutAvailable") is not True:
         return InlineKeyboardMarkup(rows) if rows else None
     for group in groups:
         merchant = str(group.get("merchant") or "").strip().lower()
@@ -2555,7 +2848,7 @@ async def select_ucp_saved_card(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
-    await query.answer("Selecting saved card...")
+    await query.answer("Applying card choice...")
     chat_id = update.effective_chat.id
     binding = await get_family_binding(chat_id)
     if binding is None:
@@ -2568,24 +2861,30 @@ async def select_ucp_saved_card(
     choice = await asyncio.to_thread(_get_pending_ucp_card_sync, chat_id, index)
     if not choice:
         await query.message.reply_text(
-            "That card choice expired. Ask Tokko to prepare checkout again."
+            "That card choice expired. Ask Tokko to prepare the payment again."
         )
         return
     try:
-        result = await _select_ucp_card(chat_id, binding, choice["token"])
+        return_context = await _telegram_return_context(context)
+        result = await _select_ucp_card(
+            chat_id,
+            binding,
+            choice["token"],
+            return_context["returnContext"]["botUsername"],
+        )
         await asyncio.to_thread(_clear_pending_ucp_cards_sync, chat_id)
         await query.edit_message_reply_markup(
             reply_markup=InlineKeyboardMarkup([[
                 InlineKeyboardButton(
-                    f"✓ {str(choice.get('brand') or 'Card').title()} •••• {choice.get('last4')}",
+                    _card_choice_label(choice, selected=True),
                     callback_data="selection:done",
                 )
             ]])
         )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
-        log.exception("Could not select saved Prava card")
-        await query.message.reply_text(f"I couldn't select that saved card: {exc}")
+        log.exception("Could not apply Prava card choice")
+        await query.message.reply_text(f"I couldn't apply that card choice: {exc}")
 
 
 async def confirm_delivery_address(
@@ -3186,6 +3485,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await _send_hermes_result(update, result, binding)
 
 
+async def handle_application_error(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    log.error("Unhandled Telegram update error", exc_info=context.error)
+    effective_message = getattr(update, "effective_message", None)
+    if effective_message is None:
+        return
+    try:
+        await effective_message.reply_text(
+            "Tokko hit a temporary service error. Please try again in a moment."
+        )
+    except Exception:
+        log.exception("Could not send Telegram error fallback")
+
+
 def build_application() -> Application:
     app = Application.builder().token(_required_env("TELEGRAM_BOT_TOKEN")).build()
     onboarding = ConversationHandler(
@@ -3293,6 +3608,21 @@ def build_application() -> Application:
         )
     )
     app.add_handler(
+        CallbackQueryHandler(select_mandate_amount, pattern=r"^mandateamt:\d+(?:\.\d{1,2})?$")
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            prepare_mandate_card_choices,
+            pattern=r"^mandatefreq:\d+(?:\.\d{1,2})?:[owmy]:[al]$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            select_mandate_card_choice,
+            pattern=r"^mandatecard:\d+(?:\.\d{1,2})?:[owmy]:[al]:(?:new|[1-9]\d*)$",
+        )
+    )
+    app.add_handler(
         CallbackQueryHandler(select_ucp_saved_card, pattern=r"^ucpcard:\d+$")
     )
     app.add_handler(
@@ -3384,6 +3714,7 @@ def build_application() -> Application:
         MessageHandler(filters.PHOTO | filters.Document.ALL, handle_shopping_upload)
     )
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(handle_application_error)
     return app
 
 

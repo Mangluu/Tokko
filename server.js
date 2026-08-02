@@ -96,6 +96,11 @@ const HERMES_UCP_SEARCH_TOOL = {
         enum: ["IN", "US"],
         description: "Delivery market derived from the selected saved address.",
       },
+      merchant: {
+        type: "string",
+        description:
+          "One merchant slug or name from Hermes merchant memory. Prefer the best remembered merchant persona for this request.",
+      },
     },
     required: ["query"],
   },
@@ -117,6 +122,32 @@ const HERMES_UCP_CHECKOUT_TOOL = {
       },
     },
     required: ["selectionToken"],
+  },
+};
+const HERMES_MANDATE_TOOL = {
+  name: "prepare_payment_mandate",
+  description:
+    "Prepare Prava mandate setup and return masked saved-card choices plus an add-new-card choice. Use this when the user asks to create, set up, or approve a payment mandate. Never choose a card on the user's behalf.",
+  inputSchema: {
+    type: "object",
+    properties: {
+      amount: {
+        type: "string",
+        description: "Per-charge mandate cap as a positive decimal amount.",
+      },
+      frequency: {
+        type: "string",
+        enum: ["one_time", "weekly", "monthly", "yearly"],
+        description: "Defaults to one_time.",
+      },
+      merchantScope: {
+        type: "string",
+        enum: ["any", "listed"],
+        description:
+          "Defaults to any for one_time and listed for recurring mandates.",
+      },
+    },
+    required: ["amount"],
   },
 };
 
@@ -1153,8 +1184,214 @@ async function createPravaMandateForUser(userId, input) {
     cardId: selected.provider_payment_method_id,
     amount: input.amount,
     frequency: input.frequency,
+    merchantScope: input.merchantScope ?? input.merchant_scope,
     callbackUrl,
   });
+}
+
+function telegramMandateIntent(input = {}) {
+  const value = Number(input.amount);
+  if (!Number.isFinite(value) || value <= 0) {
+    throw Object.assign(new Error("A positive mandate amount is required"), {
+      status: 400,
+    });
+  }
+  const frequency = String(input.frequency || "one_time").trim().toLowerCase();
+  if (!["one_time", "weekly", "monthly", "yearly"].includes(frequency)) {
+    throw Object.assign(
+      new Error("frequency must be one_time, weekly, monthly, or yearly"),
+      { status: 400 }
+    );
+  }
+  const merchantScope = String(
+    input.merchantScope
+      ?? input.merchant_scope
+      ?? (frequency === "one_time" ? "any" : "listed")
+  ).trim().toLowerCase();
+  if (!["any", "listed"].includes(merchantScope)) {
+    throw Object.assign(new Error("merchantScope must be any or listed"), {
+      status: 400,
+    });
+  }
+  if (merchantScope === "any" && frequency !== "one_time") {
+    throw Object.assign(
+      new Error("merchantScope any is only supported with frequency one_time"),
+      { status: 400 }
+    );
+  }
+  return {
+    amount: value.toFixed(2),
+    frequency,
+    merchantScope,
+  };
+}
+
+async function prepareTelegramMandateChoices(userId, input = {}) {
+  const intent = telegramMandateIntent(input);
+  const methods = await syncPravaPaymentMethodsForUser(userId);
+  const cardChoices = methods.map((method) => {
+    const card = publicPaymentMethod(method);
+    return {
+      ...card,
+      type: "saved_card",
+      label: `${card.brand || "Card"} •••• ${card.last4}${
+        card.isDefault ? " (default)" : ""
+      }`,
+      token: hermes.signApproval({
+        userId,
+        toolName: "create_mandate_with_saved_card",
+        args: {
+          ...intent,
+          paymentMethodId: String(card.id),
+        },
+      }),
+    };
+  });
+  cardChoices.push({
+    type: "add_card",
+    label: "Add a new saved card",
+    token: hermes.signApproval({
+      userId,
+      toolName: "create_mandate_with_new_card",
+      args: intent,
+    }),
+  });
+  return {
+    stage: "choose_card",
+    mandate: intent,
+    cardChoices,
+  };
+}
+
+function telegramBotUsernameFromBody(body = {}) {
+  return telegramBotUsername(
+    body.botUsername
+      || body.telegramBotUsername
+      || process.env.TELEGRAM_BOT_USERNAME
+  );
+}
+
+async function startTelegramMandateChoice(userId, chatId, body = {}) {
+  const approved = hermes.verifyApproval(String(body.token || ""), userId);
+  const returnContext = {
+    channel: "telegram",
+    botUsername: telegramBotUsernameFromBody(body),
+  };
+  if (approved.toolName === "create_mandate_with_saved_card") {
+    const intent = telegramMandateIntent(approved.args);
+    const session = await createPravaMandateForUser(userId, {
+      ...intent,
+      paymentMethodId: approved.args.paymentMethodId,
+      returnContext,
+    });
+    return {
+      stage: "mandate_approval",
+      mandate: intent,
+      approvalUrl: session.approvalUrl,
+      nextAction: {
+        type: "prava_mandate_approval",
+        label: "Approve mandate with Prava",
+        url: session.approvalUrl,
+      },
+      session,
+    };
+  }
+  if (approved.toolName !== "create_mandate_with_new_card") {
+    throw Object.assign(new Error("This is not a mandate card choice"), {
+      status: 400,
+    });
+  }
+  const intent = telegramMandateIntent(approved.args);
+  const methods = await syncPravaPaymentMethodsForUser(userId);
+  const session = await createTokenizationSessionForUser(userId, {
+    returnContext,
+  });
+  await db.saveTelegramMandateFlow(chatId, userId, {
+    ...intent,
+    botUsername: returnContext.botUsername,
+    providerPaymentMethodIdsBefore: methods
+      .map((method) => method.provider_payment_method_id)
+      .filter(Boolean),
+    tokenizationSessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+    createdAt: new Date().toISOString(),
+  });
+  return {
+    stage: "card_approval",
+    mandate: intent,
+    approvalUrl: session.approvalUrl,
+    autoCreateMandateAfterCard: true,
+    nextAction: {
+      type: "prava_card_enrollment",
+      label: "Add card securely with Prava",
+      url: session.approvalUrl,
+    },
+    session,
+  };
+}
+
+async function resumeTelegramMandateAfterCard(userId, chatId) {
+  const pending = await db.getTelegramMandateFlow(chatId, userId);
+  if (!pending) {
+    throw Object.assign(new Error("No pending Telegram mandate setup was found"), {
+      status: 404,
+    });
+  }
+  const expiry = new Date(pending.expiresAt || "").getTime();
+  if (Number.isFinite(expiry) && expiry < Date.now()) {
+    await db.clearTelegramMandateFlow(chatId, userId);
+    throw Object.assign(
+      new Error("The pending card setup expired. Start mandate setup again."),
+      { status: 410 }
+    );
+  }
+  const before = new Set(
+    (Array.isArray(pending.providerPaymentMethodIdsBefore)
+      ? pending.providerPaymentMethodIdsBefore
+      : []).map(String)
+  );
+  let selected = null;
+  for (let attempt = 0; attempt < 4 && !selected; attempt += 1) {
+    const methods = await syncPravaPaymentMethodsForUser(userId);
+    selected = methods.find(
+      (method) =>
+        method.provider_payment_method_id
+        && !before.has(String(method.provider_payment_method_id))
+    ) || null;
+    if (!selected && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  if (!selected) {
+    throw Object.assign(
+      new Error(
+        "The new card is not available yet. Finish Prava card setup, then return to this chat again."
+      ),
+      { status: 409 }
+    );
+  }
+  const intent = telegramMandateIntent(pending);
+  const session = await createPravaMandateForUser(userId, {
+    ...intent,
+    paymentMethodId: selected.id,
+    returnContext: {
+      channel: "telegram",
+      botUsername: telegramBotUsername(pending.botUsername),
+    },
+  });
+  await db.clearTelegramMandateFlow(chatId, userId);
+  return {
+    stage: "mandate_approval",
+    mandate: intent,
+    paymentMethod: publicPaymentMethod(selected),
+    approvalUrl: session.approvalUrl,
+    nextAction: {
+      type: "prava_mandate_approval",
+      label: "Approve mandate with Prava",
+      url: session.approvalUrl,
+    },
+    session,
+  };
 }
 
 async function completePaymentSetup(userId, sessionId, enrollmentId) {
@@ -3754,6 +3991,21 @@ route(
       await db.resetTelegramAddressSession(chatId);
       return sendJson(res, 200, { confirmed: false, selectedAddress: null });
     }
+    if (body.awaitingAddress === true) {
+      await db.resetTelegramAddressSession(chatId);
+      return sendJson(res, 200, {
+        confirmed: false,
+        awaitingAddress: true,
+        selectedAddress: null,
+      });
+    }
+    if (body.awaitingAddress === false) {
+      return sendJson(res, 200, {
+        confirmed: false,
+        awaitingAddress: false,
+        selectedAddress: null,
+      });
+    }
     const addressId = String(body.addressId || "").trim();
     if (!/^[1-9]\d*$/.test(addressId)) {
       throw Object.assign(new Error("addressId is required"), { status: 400 });
@@ -4319,12 +4571,90 @@ route(
       return sendJson(res, 404, { error: "Onboarding not found" });
     }
     const body = await parseBody(req);
-    sendJson(res, 200, await ucp.searchAll(body.query, {
-      limit: body.limit,
-      offset: body.offset,
-      market: body.market,
-      baseUrl: BASE_URL,
-    }));
+    sendJson(
+      res,
+      200,
+      await persistUcpProductChoices(
+        userId,
+        await ucp.searchAll(body.query, {
+          limit: body.limit,
+          offset: body.offset,
+          market: body.market,
+          baseUrl: BASE_URL,
+        })
+      )
+    );
+  }
+);
+
+route(
+  "GET",
+  "/api/v1/onboarding/:id/merchants/ucp/cart",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    sendJson(res, 200, publicUcpCart(await db.getUcpCart(userId)));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/items",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const body = await parseBody(req);
+    try {
+      const cart = await addUcpCartChoice(
+        userId,
+        String(body.choiceId || ""),
+        body.quantity,
+        body.replaceCart === true
+      );
+      sendJson(res, 200, { added: true, cart: publicUcpCart(cart) });
+    } catch (error) {
+      sendJson(res, error.status || 500, {
+        error: error.message,
+        ...(error.code ? { code: error.code } : {}),
+        ...(error.conflict ? { conflict: error.conflict } : {}),
+      });
+    }
+  }
+);
+
+route(
+  "DELETE",
+  "/api/v1/onboarding/:id/merchants/ucp/cart",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const cart = await db.clearUcpCart(userId);
+    sendJson(res, 200, { cleared: true, cart: publicUcpCart(cart) });
+  }
+);
+
+route(
+  "DELETE",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/items/:itemId",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const cart = await db.getUcpCart(userId);
+    const items = Array.isArray(cart.items) ? cart.items : [];
+    const removedItem = items.find(
+      (item) => String(item.id) === String(params.itemId)
+    );
+    if (!removedItem) {
+      return sendJson(res, 404, { error: "Cart item not found" });
+    }
+    const saved = await db.saveUcpCart(userId, {
+      items: items.filter((item) => String(item.id) !== String(params.itemId)),
+    });
+    sendJson(res, 200, {
+      removed: true,
+      removedItem: publicUcpCart({ items: [removedItem] }).items[0],
+      cart: publicUcpCart(saved),
+    });
   }
 );
 
@@ -5755,6 +6085,7 @@ async function runHermesBackend({
   const tools = [
     HERMES_UCP_SEARCH_TOOL,
     HERMES_UCP_CHECKOUT_TOOL,
+    HERMES_MANDATE_TOOL,
   ];
   const selectedDeliveryCountry = String(
     state.deliveryPreference?.countryCode || ""
@@ -5793,6 +6124,11 @@ async function runHermesBackend({
       confirmedDeliveryAddress:
         state.deliveryPreference?.formattedAddress || null,
       selectedDeliveryCountry: selectedDeliveryMarket,
+      eligibleMerchants: selectedDeliveryMarket
+        ? Object.values(ucp.HERMES_MERCHANTS)
+            .filter((merchant) => merchant.market === selectedDeliveryMarket)
+            .map((merchant) => ({ slug: merchant.slug, name: merchant.name }))
+        : [],
       responseLanguage: hermes.normalizeResponseLanguage(language),
       learnedMemories,
     },
@@ -5823,20 +6159,23 @@ async function runHermesBackend({
       )
     );
   }
-  const searchResult = [...(result.tools || [])]
+  const rawSearchResult = [...(result.tools || [])]
     .reverse()
     .find((tool) =>
       tool.name === HERMES_UCP_SEARCH_TOOL.name &&
       tool.status === "completed"
     )?.result;
+  const searchResult = Array.isArray(rawSearchResult?.products)
+    ? await persistUcpProductChoices(userId, rawSearchResult)
+    : rawSearchResult;
   if (Array.isArray(searchResult?.products)) {
     result.productChoices = searchResult.products;
     result.merchantStatuses = searchResult.merchants || [];
     result.productQuery = searchResult.query;
     result.productPagination = searchResult.pagination || null;
     result.message = searchResult.products.length
-      ? `i found ${searchResult.products.length} options with images, grouped by delivery market and currency, with the lowest price first inside each group. select the one you want.`
-      : "i could not find an image-backed match for that search. try a broader product name.";
+      ? `i found ${searchResult.products.length} options from the selected live merchant ucp. select the one you want.`
+      : "i could not find a match from the selected live merchant ucp. try a broader product name.";
   }
   const checkoutResult = [...(result.tools || [])]
     .reverse()
@@ -5844,6 +6183,19 @@ async function runHermesBackend({
       tool.name === HERMES_UCP_CHECKOUT_TOOL.name &&
       tool.status === "completed"
     )?.result;
+  const mandateResult = [...(result.tools || [])]
+    .reverse()
+    .find((tool) =>
+      tool.name === HERMES_MANDATE_TOOL.name &&
+      tool.status === "completed"
+    )?.result;
+  if (mandateResult?.stage === "choose_card") {
+    result.cardChoices = mandateResult.cardChoices || [];
+    result.mandateSetup = mandateResult.mandate;
+    result.message = mandateResult.cardChoices?.length > 1
+      ? "choose which saved prava card to use for this mandate, or add a new saved card."
+      : "add a card securely with prava, then tokko will automatically continue to mandate approval.";
+  }
   if (checkoutResult?.merchantHandoffUrl) {
     result.merchantHandoffUrl = checkoutResult.merchantHandoffUrl;
     result.paymentUrl = null;
@@ -5947,11 +6299,15 @@ async function maybeVerifyHermesZeptoOtp(userId, messages) {
 }
 
 async function executeHermesTool(req, userId, toolName, args) {
+  if (toolName === HERMES_MANDATE_TOOL.name) {
+    return prepareTelegramMandateChoices(userId, args);
+  }
   if (toolName === HERMES_UCP_SEARCH_TOOL.name) {
     return ucp.searchAll(args?.query, {
       limit: 50,
       offset: args?.offset,
       market: args?.market,
+      merchant: args?.merchant,
       baseUrl: BASE_URL,
     });
   }
@@ -5985,6 +6341,129 @@ function telegramMessageText(body) {
   return "";
 }
 
+function publicUcpCart(cart = {}) {
+  const items = (Array.isArray(cart.items) ? cart.items : []).map((item) => ({
+    id: String(item.id),
+    choiceId: String(item.choiceId),
+    merchant: item.merchant,
+    merchantName: item.merchantName,
+    productName: item.productName,
+    variantName: item.variantName || null,
+    imageUrl: item.imageUrl || null,
+    price: item.price,
+    currency: item.currency,
+    quantity: Number(item.quantity || 1),
+  }));
+  const groups = [];
+  for (const item of items) {
+    let group = groups.find((entry) => entry.merchant === item.merchant);
+    if (!group) {
+      group = {
+        merchant: item.merchant,
+        merchantName: item.merchantName,
+        items: [],
+      };
+      groups.push(group);
+    }
+    group.items.push(item);
+  }
+  return {
+    items,
+    itemCount: items.reduce((total, item) => total + item.quantity, 0),
+    merchantGroups: groups,
+    cartMerchant: groups.length === 1 ? groups[0].merchant : null,
+    checkoutAvailable: false,
+    prescriptionReviewItems: [],
+  };
+}
+
+async function persistUcpProductChoices(userId, searchResult) {
+  const products = Array.isArray(searchResult?.products)
+    ? searchResult.products
+    : [];
+  const choices = products
+    .filter((product) => product.selectionToken)
+    .map((product) => {
+      const id = nodeCrypto.randomUUID();
+      const { selectionToken, ...publicProduct } = product;
+      return {
+        id,
+        selectionToken,
+        product: {
+          ...publicProduct,
+          searchQuery: searchResult.query || null,
+        },
+      };
+    });
+  await db.saveUcpProductChoices(userId, choices);
+  return {
+    ...searchResult,
+    products: choices.map((choice) => ({
+      ...choice.product,
+      choiceId: choice.id,
+    })),
+  };
+}
+
+async function addUcpCartChoice(userId, choiceId, quantity, replaceCart = false) {
+  const choice = await db.getUcpProductChoice(userId, choiceId);
+  if (!choice) {
+    throw Object.assign(new Error("That product choice expired. Search again."), {
+      status: 404,
+    });
+  }
+  const product = choice.product || {};
+  const requestedMerchant = String(product.merchant || "");
+  const requestedMerchantName = String(product.merchantName || requestedMerchant);
+  const cart = await db.getUcpCart(userId);
+  let items = Array.isArray(cart.items) ? [...cart.items] : [];
+  const currentMerchant = String(items[0]?.merchant || "");
+  if (items.length && currentMerchant && currentMerchant !== requestedMerchant) {
+    if (!replaceCart) {
+      throw Object.assign(
+        new Error("This cart is locked to a different merchant"),
+        {
+          status: 409,
+          code: "merchant_cart_conflict",
+          conflict: {
+            currentMerchant,
+            currentMerchantName: items[0].merchantName || currentMerchant,
+            requestedMerchant,
+            requestedMerchantName,
+          },
+        }
+      );
+    }
+    items = [];
+  }
+  const normalizedQuantity = Math.min(Math.max(Number(quantity) || 1, 1), 20);
+  const existing = items.find((item) => item.choiceId === String(choice.id));
+  if (existing) {
+    existing.quantity = Math.min(Number(existing.quantity || 1) + normalizedQuantity, 20);
+  } else {
+    items.push({
+      id: Math.max(0, ...items.map((item) => Number(item.id) || 0)) + 1,
+      choiceId: String(choice.id),
+      selectionToken: choice.selection_token,
+      merchant: requestedMerchant,
+      merchantName: requestedMerchantName,
+      productName: product.productName || "Product",
+      variantName: product.variantName || product.optionText || null,
+      imageUrl: product.imageUrl || null,
+      price: product.price,
+      currency: product.currency || "INR",
+      quantity: normalizedQuantity,
+    });
+  }
+  return db.saveUcpCart(userId, { items });
+}
+
+function telegramCardReturnMessage(value) {
+  return /^\/start(?:@[A-Za-z0-9_]+)?\s+payments_card_return\s*$/i.test(
+    String(value || "").trim()
+  );
+}
+
 route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   await requireTelegramIntegration(req);
   const body = await parseBody(req);
@@ -5992,6 +6471,20 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   const user = await telegramFamilyUser(body, chatId);
   req.tokkoServiceUserId = Number(user.id);
   const text = telegramMessageText(body).slice(0, 6_000);
+  if (telegramCardReturnMessage(text)) {
+    const result = await resumeTelegramMandateAfterCard(Number(user.id), chatId);
+    const card = result.paymentMethod;
+    const message =
+      `${card.brand || "Card"} ending ${card.last4} was saved. `
+      + "Open the Prava approval below to activate the mandate.";
+    await db.saveTelegramHermesMessage(chatId, "user", text);
+    await db.saveTelegramHermesMessage(chatId, "assistant", message);
+    return sendJson(res, 200, {
+      ...result,
+      message,
+      telegram: { chatId, familyLinked: true },
+    });
+  }
   const suppliedMessages = Array.isArray(body.messages)
     ? body.messages
     : await db.getTelegramHermesMessages(chatId, 23);
@@ -6045,16 +6538,55 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
 
 route(
   "POST",
+  "/api/integrations/telegram/hermes/mandate-options",
+  async (req, res) => {
+    await requireTelegramIntegration(req);
+    const body = await parseBody(req);
+    const chatId = telegramChatIdentifier(body);
+    const user = await telegramFamilyUser(body, chatId);
+    const result = await prepareTelegramMandateChoices(Number(user.id), body);
+    sendJson(res, 200, {
+      ...result,
+      message: result.cardChoices.length > 1
+        ? "Choose a saved card or add a new saved card for this mandate."
+        : "Add a card securely with Prava to continue mandate setup.",
+      telegram: { chatId, familyLinked: true },
+    });
+  }
+);
+
+route(
+  "POST",
   "/api/integrations/telegram/hermes/payment-choice",
   async (req, res) => {
     await requireTelegramIntegration(req);
     const body = await parseBody(req);
     const chatId = telegramChatIdentifier(body);
     const user = await telegramFamilyUser(body, chatId);
-    const result = await selectUcpSavedCard(
-      Number(user.id),
-      String(body.token || "")
+    const approved = hermes.verifyApproval(
+      String(body.token || ""),
+      Number(user.id)
     );
+    if (
+      approved.toolName === "create_mandate_with_saved_card"
+      || approved.toolName === "create_mandate_with_new_card"
+    ) {
+      const result = await startTelegramMandateChoice(
+        Number(user.id),
+        chatId,
+        body
+      );
+      const message = result.stage === "card_approval"
+        ? "Open Prava to add the card securely. When you return here, Tokko will automatically prepare the mandate approval."
+        : "Open Prava to approve this mandate with the selected saved card.";
+      await db.saveTelegramHermesMessage(chatId, "assistant", message);
+      return sendJson(res, 200, {
+        ...result,
+        message,
+        telegram: { chatId, familyLinked: true },
+      });
+    }
+    const result = await selectUcpSavedCard(Number(user.id), body.token);
     await db.saveTelegramHermesMessage(
       chatId,
       "assistant",
@@ -6149,6 +6681,7 @@ if (require.main === module) {
 Object.assign(server, {
   CONSENT_POLICY_VERSION,
   HERMES_CHECKOUT_TOOL,
+  HERMES_MANDATE_TOOL,
   HERMES_UCP_CHECKOUT_TOOL,
   HERMES_ZEPTO_RECONNECT_TOOL,
   MERCHANT_CONSENT_TEXT,
@@ -6164,9 +6697,12 @@ Object.assign(server, {
   parseBody,
   pravaReturnCallback,
   pravaPaymentHandoff,
+  prepareTelegramMandateChoices,
+  publicUcpCart,
   readRawBody,
   savedAddressInput,
   selectUcpSavedCard,
+  startTelegramMandateChoice,
   server,
   start,
   hermesOtpFromMessages,
@@ -6174,6 +6710,9 @@ Object.assign(server, {
   telegramChatIdentifier,
   telegramBotUsername,
   telegramMessageText,
+  telegramCardReturnMessage,
+  telegramMandateIntent,
+  resumeTelegramMandateAfterCard,
   tokkoPaymentRoute,
   usablePravaMandatesForAmount,
   usablePravaMandatesForMerchant,

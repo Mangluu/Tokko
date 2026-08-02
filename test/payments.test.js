@@ -421,6 +421,81 @@ test(
 );
 
 test(
+  "Prava permits any-merchant scope only for one-time mandates",
+  { concurrency: false },
+  async () => {
+    const envNames = [
+      "PRAVA_PUBLISHABLE_KEY",
+      "PRAVA_SECRET_KEY",
+      "PRAVA_API_BASE_URL",
+    ];
+    const originalEnv = Object.fromEntries(
+      envNames.map((name) => [name, process.env[name]])
+    );
+    const originalFetch = global.fetch;
+    let createBody;
+    try {
+      process.env.PRAVA_PUBLISHABLE_KEY = "pk_test_example";
+      process.env.PRAVA_SECRET_KEY = "sk_test_example";
+      delete process.env.PRAVA_API_BASE_URL;
+      global.fetch = async (_url, options = {}) => {
+        createBody = JSON.parse(options.body);
+        return Response.json(
+          {
+            session_id: "sess_any_merchant_123",
+            iframe_url:
+              "https://checkout.sandbox.prava.space/s/sess_any_merchant_123",
+            expires_at: "2030-01-01T00:15:00Z",
+            authorizeOnly: true,
+          },
+          { status: 201 }
+        );
+      };
+
+      const session = await createMandateSession({
+        customerId: "tokko_user_42",
+        email: "member@example.com",
+        cardId: "enr_saved_123",
+        amount: 500,
+        frequency: "one_time",
+        merchantScope: "any",
+        callbackUrl: "https://tokko.example/payments/return",
+      });
+      assert.equal(session.frequency, "one_time");
+      assert.deepEqual(createBody.mandate_setup, {
+        intent: "mandate_setup",
+        recurring_frequency: "one_time",
+        merchant_scope: "any",
+        max_charges: 1,
+      });
+      assert.equal(
+        createBody.purchase_context[0].effective_until_minutes,
+        7 * 24 * 60
+      );
+
+      await assert.rejects(
+        createMandateSession({
+          customerId: "tokko_user_42",
+          email: "member@example.com",
+          cardId: "enr_saved_123",
+          amount: 500,
+          frequency: "monthly",
+          merchantScope: "any",
+          callbackUrl: "https://tokko.example/payments/return",
+        }),
+        /only supported with frequency one_time/
+      );
+    } finally {
+      global.fetch = originalFetch;
+      for (const name of envNames) {
+        if (originalEnv[name] === undefined) delete process.env[name];
+        else process.env[name] = originalEnv[name];
+      }
+    }
+  }
+);
+
+test(
   "Prava mandate charge returns ephemeral credentials and reports the outcome",
   { concurrency: false },
   async () => {

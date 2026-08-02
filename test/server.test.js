@@ -4,6 +4,7 @@ const http = require("node:http");
 process.env.HERMES_ACTION_SECRET ||= "test-hermes-action-secret";
 const server = require("../server.js");
 const db = require("../lib/db.js");
+const hermes = require("../lib/hermes.js");
 const payments = require("../lib/payments.js");
 const ucp = require("../lib/ucp.js");
 
@@ -85,6 +86,36 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
   );
   assert.ok(
     server.matchRoute(
+      "POST",
+      "/api/integrations/telegram/hermes/mandate-options"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
+      "POST",
+      "/api/integrations/telegram/hermes/payment-choice"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
+      "GET",
+      "/api/v1/onboarding/42/merchants/ucp/cart"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
+      "POST",
+      "/api/v1/onboarding/42/merchants/ucp/cart/items"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
+      "DELETE",
+      "/api/v1/onboarding/42/merchants/ucp/cart/items/7"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
       "GET",
       "/api/v1/integrations/telegram/bindings/7783253227"
     )
@@ -122,6 +153,10 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
     server.matchRoute("POST", "/api/v1/onboarding/42/merchants/ucp/search")
   );
   assert.equal(
+    server.matchRoute("POST", "/api/v1/onboarding/42/merchant/zepto/search"),
+    null
+  );
+  assert.equal(
     server.telegramChatIdentifier({ telegramChatId: 123456789 }),
     "123456789"
   );
@@ -155,6 +190,108 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
     null
   );
 });
+
+test("Telegram UCP cart groups safe product data without exposing selection tokens", () => {
+  const cart = server.publicUcpCart({
+    items: [{
+      id: 1,
+      choiceId: "11111111-1111-4111-8111-111111111111",
+      selectionToken: "must-not-leak",
+      merchant: "kapiva",
+      merchantName: "Kapiva",
+      productName: "Amla Juice",
+      currency: "INR",
+      price: 299,
+      quantity: 2,
+    }],
+  });
+  assert.equal(cart.itemCount, 2);
+  assert.equal(cart.merchantGroups[0].merchant, "kapiva");
+  assert.equal(cart.items[0].selectionToken, undefined);
+});
+
+test("Telegram mandate setup validates scope and recognizes Prava card returns", () => {
+  assert.deepEqual(server.telegramMandateIntent({ amount: "500" }), {
+    amount: "500.00",
+    frequency: "one_time",
+    merchantScope: "any",
+  });
+  assert.deepEqual(
+    server.telegramMandateIntent({ amount: 750, frequency: "monthly" }),
+    {
+      amount: "750.00",
+      frequency: "monthly",
+      merchantScope: "listed",
+    }
+  );
+  assert.throws(
+    () => server.telegramMandateIntent({
+      amount: 750,
+      frequency: "monthly",
+      merchantScope: "any",
+    }),
+    /only supported with frequency one_time/
+  );
+  assert.equal(
+    server.telegramCardReturnMessage("/start payments_card_return"),
+    true
+  );
+  assert.equal(server.telegramCardReturnMessage("payments_card_return"), false);
+});
+
+test(
+  "Telegram mandate setup returns every masked saved card and an add-card choice",
+  { concurrency: false },
+  async () => {
+    const originalGetMethods = db.getPaymentMethods;
+    const originalGetCustomer = db.getPaymentCustomer;
+    try {
+      db.getPaymentMethods = async () => [{
+        id: "7",
+        provider: "prava",
+        provider_payment_method_id: "card_saved_7",
+        type: "card",
+        brand: "visa",
+        last4: "4242",
+        exp_month: 12,
+        exp_year: 2030,
+        is_default: true,
+      }];
+      db.getPaymentCustomer = async () => null;
+
+      const result = await server.prepareTelegramMandateChoices(42, {
+        amount: "500.00",
+        frequency: "one_time",
+        merchantScope: "any",
+      });
+      assert.equal(result.stage, "choose_card");
+      assert.equal(result.cardChoices.length, 2);
+      assert.deepEqual(
+        result.cardChoices.map((choice) => choice.type),
+        ["saved_card", "add_card"]
+      );
+      assert.equal(result.cardChoices[0].last4, "4242");
+      assert.equal(
+        "provider_payment_method_id" in result.cardChoices[0],
+        false
+      );
+      const savedChoice = hermes.verifyApproval(
+        result.cardChoices[0].token,
+        42
+      );
+      assert.equal(savedChoice.toolName, "create_mandate_with_saved_card");
+      assert.equal(savedChoice.args.paymentMethodId, "7");
+      const addChoice = hermes.verifyApproval(
+        result.cardChoices[1].token,
+        42
+      );
+      assert.equal(addChoice.toolName, "create_mandate_with_new_card");
+    } finally {
+      db.getPaymentMethods = originalGetMethods;
+      db.getPaymentCustomer = originalGetCustomer;
+    }
+  }
+);
 
 test("Tokko-native addresses do not require merchant coordinates", () => {
   const address = server.familyAddressInput({

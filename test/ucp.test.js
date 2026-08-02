@@ -49,29 +49,27 @@ function product(title, variantId, amount, available = true) {
   };
 }
 
-test("aggregates advertised UCP catalogues and sorts strictly by price", async () => {
+test("searches only live UCP merchants present in Hermes memory", async () => {
+  const requestedUrls = [];
   const fakeFetch = async (url, options = {}) => {
-    if (url === "https://kapiva.in/.well-known/ucp") {
-      return Response.json(discovery("https://kapiva.in/api/ucp", {
-        catalog: false,
-        transport: "rest",
-      }));
-    }
-    if (url === "https://www.oziva.in/.well-known/ucp") {
-      return Response.json(discovery("https://oziva.test/mcp"));
+    requestedUrls.push(url);
+    if (url === "https://setu.in/.well-known/ucp") {
+      return Response.json(discovery("https://setu.test/mcp"));
     }
     if (url === "https://himalayawellness.in/.well-known/ucp") {
       return Response.json(discovery("https://himalaya.test/mcp"));
     }
+    if (!options.body) throw new Error(`Unavailable Hermes merchant: ${url}`);
     const request = JSON.parse(options.body);
     assert.equal(request.method, "tools/call");
     assert.equal(request.params.name, "search_catalog");
     assert.equal(
       request.params.arguments.meta["ucp-agent"].profile,
-      "https://tokko.example/.well-known/ucp"
+      "https://shopify.dev/ucp/agent-profiles/examples/2026-04-08/valid-with-capabilities.json"
     );
-    if (url === "https://oziva.test/mcp") {
-      return rpc({ products: [product("OZiva Ashwagandha Choice", "101", 59900)] });
+    assert.equal(options.headers["MCP-Protocol-Version"], "2026-04-08");
+    if (url === "https://setu.test/mcp") {
+      return rpc({ products: [product("Setu Ashwagandha Choice", "101", 59900)] });
     }
     if (url === "https://himalaya.test/mcp") {
       return rpc({
@@ -93,23 +91,27 @@ test("aggregates advertised UCP catalogues and sorts strictly by price", async (
     [
       "Unavailable Ashwagandha Deal",
       "Himalaya Ashwagandha Value",
-      "OZiva Ashwagandha Choice",
+      "Setu Ashwagandha Choice",
     ]
   );
   assert.equal(result.products[0].price, 99);
   assert.equal(result.pagination.limit, 50);
   assert.ok(result.products[0].selectionToken);
-  assert.match(
-    result.merchants.find((entry) => entry.merchant === "kapiva").error,
-    /does not advertise ucp catalog search/i
-  );
+  assert.equal(result.source, "live_hermes_merchant_ucp");
+  assert.equal(requestedUrls.includes("https://catalog.shopify.com/api/ucp/mcp"), false);
+  assert.equal(requestedUrls.includes("https://www.oziva.in/.well-known/ucp"), false);
 });
 
-test("uses Shopify Global Catalog UCP with market shipping filters", async () => {
-  let globalRequest;
+test("targets the remembered merchant UCP without Global Catalog fallback", async () => {
+  let merchantRequest;
+  const requestedUrls = [];
   const fakeFetch = async (url, options = {}) => {
-    if (url === "https://catalog.shopify.com/api/ucp/mcp") {
-      globalRequest = JSON.parse(options.body);
+    requestedUrls.push(url);
+    if (url === "https://www.livemomentous.com/.well-known/ucp") {
+      return Response.json(discovery("https://momentous.test/api/ucp/mcp"));
+    }
+    if (url === "https://momentous.test/api/ucp/mcp") {
+      merchantRequest = JSON.parse(options.body);
       return rpc({
         products: [{
           id: "gid://shopify/p/momentous-whey",
@@ -130,118 +132,45 @@ test("uses Shopify Global Catalog UCP with market shipping filters", async () =>
         pagination: { has_next_page: false },
       });
     }
-    throw new Error(`Unexpected direct merchant request: ${url}`);
+    throw new Error(`Unexpected merchant request: ${url}`);
   };
   const result = await ucp.searchAll("whey protein", {
     market: "US",
+    merchant: "momentous",
     baseUrl: "https://tokko.example",
     fetchImpl: fakeFetch,
   });
-  assert.equal(globalRequest.params.name, "search_catalog");
-  assert.equal(
-    globalRequest.params.arguments.catalog.filters.ships_to.country,
-    "US"
-  );
-  assert.equal(result.source, "shopify_global_catalog_and_live_merchant_ucp");
+  assert.equal(merchantRequest.params.name, "search_catalog");
+  assert.equal(merchantRequest.params.arguments.catalog.context.address_country, "US");
+  assert.equal(result.source, "live_hermes_merchant_ucp");
+  assert.equal(result.selectedMerchant, "momentous");
   assert.equal(result.products[0].merchant, "momentous");
   assert.equal(result.products[0].market, "US");
   assert.equal(result.products[0].currency, "USD");
-  assert.equal(result.products[0].discoverySource, "shopify_global_catalog");
+  assert.equal(requestedUrls.includes("https://catalog.shopify.com/api/ucp/mcp"), false);
 });
 
-test("creates a shipping quote through a merchant discovered by Global Catalog", async () => {
-  let submitted;
-  const fakeFetch = async (url, options = {}) => {
-    if (url === "https://catalog.shopify.com/api/ucp/mcp") {
-      return rpc({ products: [{
-        title: "Daily Wellness Powder",
-        media: [{ type: "image", url: "https://cdn.example/daily-wellness.jpg" }],
-        variants: [{
-          id: "gid://shopify/ProductVariant/global-wellness-1",
-          title: "30 servings",
-          url: "https://global-health.example/products/daily-wellness",
-          price: { amount: 2500, currency: "INR" },
-          availability: { available: true },
-        }],
-      }] });
-    }
-    if (url === "https://global-health.example/.well-known/ucp") {
-      return Response.json({ ucp: {
-        version: "2026-04-08",
-        services: { "dev.ucp.shopping": [{
-          transport: "mcp", endpoint: "https://global-health.example/api/ucp/mcp",
-        }] },
-        capabilities: {
-          "dev.ucp.shopping.catalog.search": [{ version: "2026-04-08" }],
-          "dev.ucp.shopping.checkout": [{ version: "2026-04-08" }],
-          "dev.ucp.shopping.fulfillment": [{ version: "2026-04-08" }],
-        },
-      } });
-    }
-    if (url === "https://global-health.example/api/ucp/mcp") {
-      const request = JSON.parse(options.body);
-      submitted = request.params.arguments.checkout;
-      return rpc({ checkout: {
-        id: "global-checkout-1",
-        status: "incomplete",
-        currency: "INR",
-        totals: [
-          { type: "subtotal", amount: 2500 },
-          { type: "fulfillment", display_text: "Shipping", amount: 500 },
-          { type: "total", amount: 3000 },
-        ],
-        fulfillment: { methods: [{
-          id: "global-shipping-1", type: "shipping",
-          selected_destination_id: "tokko_global_address",
-          destinations: submitted.fulfillment.methods[0].destinations,
-        }] },
-        continue_url: "https://global-health.example/checkouts/global-1",
-      } });
-    }
-    throw new Error(`Unavailable registry merchant: ${url}`);
-  };
-  const search = await ucp.searchAll("daily wellness", {
-    market: "IN", baseUrl: "https://tokko.example", fetchImpl: fakeFetch,
-  });
-  const result = await ucp.createCheckout(search.products[0].selectionToken, {
-    baseUrl: "https://tokko.example",
-    buyer: { email: "buyer@example.com", phone_number: "+919876543210" },
-    destination: {
-      id: "tokko_global_address", street_address: "12 Park Street",
-      address_locality: "Kolkata", address_region: "West Bengal",
-      postal_code: "700016", address_country: "IN",
-      phone_number: "+919876543210",
-    },
-    fetchImpl: fakeFetch,
-  });
-  assert.equal(result.merchantName, "global-health.example");
-  assert.equal(result.shippingMinor, 500);
-  assert.equal(result.totalMinor, 3000);
-  assert.equal(result.destinationSelected, true);
-  assert.equal(result.phoneAccepted, true);
-  assert.equal(submitted.buyer.phone_number, "+919876543210");
+test("rejects merchants outside Hermes merchant memory", async () => {
+  await assert.rejects(
+    ucp.searchAll("ashwagandha", {
+      market: "IN",
+      merchant: "oziva",
+      fetchImpl: async () => {
+        throw new Error("must not issue a request");
+      },
+    }),
+    /unsupported hermes ucp merchant/i
+  );
 });
 
 test("returns image-backed products in fifty-result price pages", async () => {
   const merchantProducts = (prefix, start) => Array.from(
-    { length: 40 },
+    { length: 80 },
     (_, index) => product(`${prefix} Wellness ${index + 1}`, `${start + index}`, (index + 1) * 100)
   );
   const fakeFetch = async (url, options = {}) => {
-    if (url === "https://kapiva.in/.well-known/ucp") {
-      return Response.json(discovery("https://kapiva.in/api/ucp", {
-        catalog: false,
-        transport: "rest",
-      }));
-    }
-    if (url === "https://www.oziva.in/.well-known/ucp") {
-      return Response.json(discovery("https://oziva.test/mcp"));
-    }
     if (url === "https://himalayawellness.in/.well-known/ucp") {
       return Response.json(discovery("https://himalaya.test/mcp"));
-    }
-    if (url === "https://oziva.test/mcp") {
-      return rpc({ products: merchantProducts("OZiva", 1000) });
     }
     if (url === "https://himalaya.test/mcp") {
       return rpc({ products: merchantProducts("Himalaya", 2000) });
@@ -251,6 +180,7 @@ test("returns image-backed products in fifty-result price pages", async () => {
 
   const first = await ucp.searchAll("wellness", {
     limit: 50,
+    merchant: "himalayawellness",
     baseUrl: "https://tokko.example",
     fetchImpl: fakeFetch,
   });
@@ -266,6 +196,7 @@ test("returns image-backed products in fifty-result price pages", async () => {
   const second = await ucp.searchAll("wellness", {
     limit: 50,
     offset: 50,
+    merchant: "himalayawellness",
     baseUrl: "https://tokko.example",
     fetchImpl: fakeFetch,
   });
@@ -276,28 +207,19 @@ test("returns image-backed products in fifty-result price pages", async () => {
 
 test("multi-word searches exclude cheaper products that match only one term", async () => {
   const fakeFetch = async (url, options = {}) => {
-    if (url === "https://kapiva.in/.well-known/ucp") {
-      return Response.json(discovery("https://kapiva.test/mcp", { catalog: false }));
-    }
-    if (url === "https://www.oziva.in/.well-known/ucp") {
-      return Response.json(discovery("https://oziva.test/mcp"));
-    }
     if (url === "https://himalayawellness.in/.well-known/ucp") {
       return Response.json(discovery("https://himalaya.test/mcp"));
     }
-    if (url === "https://oziva.test/mcp") {
-      return rpc({ products: [
-        product("Plant Protein + Pro-Digest", "protein-1", 69900),
-      ] });
-    }
     if (url === "https://himalaya.test/mcp") {
       return rpc({ products: [
+        product("Plant Protein + Pro-Digest", "protein-1", 69900),
         product("Natural Protein Conditioner", "shampoo-1", 9000),
       ] });
     }
     throw new Error(`Unexpected URL: ${url} ${options.method || "GET"}`);
   };
   const result = await ucp.searchAll("plant protein", {
+    merchant: "himalayawellness",
     baseUrl: "https://tokko.example",
     fetchImpl: fakeFetch,
   });
@@ -337,6 +259,7 @@ test("broadens an empty multi-word merchant query without hardcoded product alia
   };
 
   const result = await ucp.searchAll("cough syrup", {
+    merchant: "himalayawellness",
     baseUrl: "https://tokko.example",
     fetchImpl: fakeFetch,
   });

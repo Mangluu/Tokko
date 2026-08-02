@@ -215,6 +215,14 @@ This maps the sender plus assigned LINQ number to the Tokko `userId`.
 - Telegram callers may send
   `{"returnContext":{"channel":"telegram","botUsername":"TokkoShopperBot"}}`
   so the hosted flow returns to the originating bot instead of the web app.
+- Telegram callers may create a one-time, any-merchant mandate with
+  `{"frequency":"one_time","merchantScope":"any"}`. Recurring mandates must
+  remain `merchantScope: "listed"`.
+- Telegram mandate setup returns every masked saved card plus an add-new-card
+  choice. Selecting a saved card starts mandate approval immediately. Selecting
+  add-card opens Prava enrollment and persists the pending intent; when the bot
+  forwards `/start payments_card_return`, Tokko automatically continues with
+  the newly saved card and returns the mandate approval URL.
 - After the cardholder completes OTP and passkey verification, call
   `GET /api/v1/onboarding/:id/payment-methods` to synchronize and list cards.
 
