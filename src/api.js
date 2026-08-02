@@ -86,8 +86,6 @@ export const DEPENDENT_RELATIONSHIPS = [
   'Grandparent',
 ];
 
-const GENDER_OPTIONS = ['Woman', 'Man', 'Non-binary'];
-
 export function setupFromUserState(state, current) {
   const profile = state?.profile;
   const paymentMethods = Array.isArray(state?.paymentMethods)
@@ -100,19 +98,10 @@ export function setupFromUserState(state, current) {
     const savedRelationship = dependent.relationshipToUser || '';
     const isStandardRelationship =
       DEPENDENT_RELATIONSHIPS.includes(savedRelationship);
-    const savedGender = dependent.gender || '';
     return {
       id: dependent.id || `${dependent.phone}-${dependent.name}`,
       name: dependent.name,
       age: dependent.age ?? '',
-      gender: GENDER_OPTIONS.includes(savedGender)
-        ? savedGender
-        : savedGender
-          ? 'Self-described'
-          : '',
-      genderDescription: GENDER_OPTIONS.includes(savedGender)
-        ? ''
-        : savedGender,
       role: isStandardRelationship
         ? savedRelationship
         : 'Other dependent',
@@ -133,16 +122,6 @@ export function setupFromUserState(state, current) {
       ...current.profile,
       name: profile?.primaryParentName || current.profile.name,
       age: profile?.primaryParentAge ?? current.profile.age ?? '',
-      gender: GENDER_OPTIONS.includes(profile?.primaryParentGender)
-        ? profile.primaryParentGender
-        : profile?.primaryParentGender
-          ? 'Self-described'
-          : current.profile.gender || '',
-      genderDescription:
-        profile?.primaryParentGender &&
-        !GENDER_OPTIONS.includes(profile.primaryParentGender)
-          ? profile.primaryParentGender
-          : current.profile.genderDescription || '',
       countryCode: ownerPhone.countryCode,
       localPhone: ownerPhone.localPhone,
       phone: profile?.primaryParentPhone || current.profile.phone,
@@ -196,9 +175,6 @@ export function onboardingPayload(setup) {
       age: member.age === '' || member.age === null || member.age === undefined
         ? null
         : Number(member.age),
-      gender: member.gender === 'Self-described'
-        ? member.genderDescription?.trim() || null
-        : member.gender || null,
       phone: toE164(countryCode, localPhone),
       countryCode,
       localPhone,
@@ -226,9 +202,6 @@ export function onboardingPayload(setup) {
       setup.profile.age === undefined
         ? null
         : Number(setup.profile.age),
-    primaryParentGender: setup.profile.gender === 'Self-described'
-      ? setup.profile.genderDescription?.trim() || null
-      : setup.profile.gender || null,
     primaryParentPhone,
     primaryParentCountryCode: setup.profile.countryCode,
     primaryParentLocalPhone,
