@@ -2735,6 +2735,8 @@ function publicUcpOrderIntent(row) {
       ? { id: row.merchant_order_id, url: row.merchant_order_url || null }
       : null,
     failureMessage: row.failure_message || null,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
     quote,
   };
 }
@@ -4542,6 +4544,12 @@ route("POST", "/api/merchants/ucp/checkout", async (req, res) => {
   sendJson(res, 201, result);
 });
 
+route("GET", "/api/merchants/ucp/orders", async (req, res) => {
+  const user = await auth.requireUser(req);
+  const limit = Number.parseInt(getQuery(req).limit, 10) || 50;
+  const rows = await db.getUcpOrderIntents(user.userId, limit);
+  sendJson(res, 200, { orders: rows.map(publicUcpOrderIntent) });
+});
 route("GET", "/api/merchants/ucp/orders/:id", async (req, res, params) => {
   const user = await auth.requireUser(req);
   const row = await db.getUcpOrderIntent(user.userId, params.id);
