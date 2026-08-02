@@ -648,6 +648,7 @@ test(
       getPaymentCustomer: db.getPaymentCustomer,
       getPaymentMethods: db.getPaymentMethods,
       getFamilyAddresses: db.getFamilyAddresses,
+      saveCheckoutFlow: db.saveCheckoutFlow,
     };
     let chargeInput;
     let checkoutOptions;
@@ -726,6 +727,7 @@ test(
         contact_phone: "+919876543210",
         is_selected: true,
       }];
+      db.saveCheckoutFlow = async (flow) => flow;
 
       const quote = await server.createUcpCheckoutQuote(42, {
         selectionToken: "signed-selection",
@@ -786,6 +788,7 @@ test(
         getPaymentCustomer: originals.getPaymentCustomer,
         getPaymentMethods: originals.getPaymentMethods,
         getFamilyAddresses: originals.getFamilyAddresses,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
       });
     }
   }
@@ -800,11 +803,14 @@ test(
       configuration: payments.configuration,
       listCards: payments.listCards,
       listMandates: payments.listMandates,
+      createPaymentSession: payments.createPaymentSession,
       getUserById: db.getUserById,
       getProfile: db.getProfile,
       getPaymentCustomer: db.getPaymentCustomer,
       getPaymentMethods: db.getPaymentMethods,
       getFamilyAddresses: db.getFamilyAddresses,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
     };
     try {
       ucp.createCheckout = async () => ({
@@ -859,6 +865,40 @@ test(
         contact_phone: "+919900112233",
         is_selected: true,
       }];
+      // In-memory checkout-flow store so the agent path can persist a flow and
+      // selectUcpSavedCard can look it up (mirrors the real DB round-trip).
+      let savedFlow = null;
+      db.saveCheckoutFlow = async (flow) => {
+        savedFlow = {
+          id: flow.id,
+          user_id: flow.userId,
+          platform: flow.platform,
+          status: flow.status,
+          address_id: flow.addressId,
+          card_brand: flow.cardBrand || null,
+          card_last4: flow.cardLast4 || null,
+          card_failure_count: 0,
+          card_payment_received: false,
+          allow_cod_fallback: flow.allowCodFallback !== false,
+          fallback_to_cod: false,
+          payment_route: flow.paymentRoute || null,
+          prava_session_id: flow.pravaSessionId || null,
+          prava_session_approval_url: flow.pravaSessionApprovalUrl || null,
+          price_breakdown: flow.priceBreakdown || {},
+          cart_snapshot: flow.cartSnapshot || [],
+        };
+        return savedFlow;
+      };
+      db.getCheckoutFlow = async () => savedFlow;
+      payments.createPaymentSession = async () => ({
+        provider: "prava",
+        sessionId: "sess_79",
+        approvalUrl: "https://sandbox.prava.space/approve/sess_79",
+        orderId: null,
+        expiresAt: null,
+        amount: "999.00",
+        currency: "INR",
+      });
 
       const result = await server.createUcpCheckoutWithPayment(43, {
         selectionToken: "signed-card-selection",
@@ -874,13 +914,20 @@ test(
       assert.equal(result.paymentSelection.merchantInstrumentSelected, false);
       assert.equal(result.autofill.phoneLast4, "2233");
 
+      // The agent/Telegram path now persists a flow, so picking the card opens
+      // a Prava approval session instead of handing back the raw Shopify URL.
       const selected = await server.selectUcpSavedCard(
         43,
         result.cardChoices[0].token
       );
       assert.equal(selected.paymentRoute, "prava_card");
       assert.equal(selected.savedCard.last4, "4242");
+      assert.equal(selected.nextAction.type, "prava_card_approval");
       assert.equal(
+        selected.nextAction.url,
+        "https://sandbox.prava.space/approve/sess_79"
+      );
+      assert.notEqual(
         selected.nextAction.url,
         "https://merchant.example/cart/c/card-test"
       );
@@ -890,6 +937,7 @@ test(
         configuration: originals.configuration,
         listCards: originals.listCards,
         listMandates: originals.listMandates,
+        createPaymentSession: originals.createPaymentSession,
       });
       Object.assign(db, {
         getUserById: originals.getUserById,
@@ -897,6 +945,295 @@ test(
         getPaymentCustomer: originals.getPaymentCustomer,
         getPaymentMethods: originals.getPaymentMethods,
         getFamilyAddresses: originals.getFamilyAddresses,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
+      });
+    }
+  }
+);
+
+test(
+  "UCP checkout with NO saved card opens an all-in-one Prava session (never the merchant URL)",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      createCheckout: ucp.createCheckout,
+      configuration: payments.configuration,
+      listCards: payments.listCards,
+      listMandates: payments.listMandates,
+      createPaymentSession: payments.createPaymentSession,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      getPaymentCustomer: db.getPaymentCustomer,
+      getPaymentMethods: db.getPaymentMethods,
+      getFamilyAddresses: db.getFamilyAddresses,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
+    };
+    try {
+      ucp.createCheckout = async () => ({
+        merchant: "oziva",
+        merchantName: "OZiva",
+        merchantUrl: "https://www.oziva.in",
+        productName: "Plant Protein",
+        variantName: "1 kg",
+        variantId: "gid://shopify/ProductVariant/402",
+        quantity: 1,
+        currency: "INR",
+        totalMinor: 99900,
+        totalAmount: "999.00",
+        totals: [{ type: "total", label: "Total", amountMinor: 99900 }],
+        checkoutId: "gid://shopify/Checkout/no-card",
+        status: "requires_escalation",
+        checkoutUrl: "https://merchant.example/cart/c/no-card",
+        continueUrl: "https://merchant.example/cart/c/no-card",
+        paymentHandlers: ["dev.shopify.card"],
+      });
+      payments.configuration = () => ({ configured: true, environment: "sandbox" });
+      payments.listCards = async () => [];
+      payments.listMandates = async () => [];
+      db.getUserById = async () => ({ id: 44, email: "nocard@example.com" });
+      db.getProfile = async () => ({
+        user_id: 44,
+        primary_parent_name: "No Card Parent",
+        primary_parent_phone: "+919900112244",
+      });
+      db.getPaymentCustomer = async () => ({
+        provider: "prava",
+        provider_customer_id: "tokko_family_44",
+      });
+      db.getPaymentMethods = async () => [];
+      db.getFamilyAddresses = async () => [{
+        id: 103,
+        label: "Home",
+        formatted_address: "1 Lake Road, Kolkata 700029",
+        address_line1: "1 Lake Road",
+        city: "Kolkata",
+        state: "West Bengal",
+        postal_code: "700029",
+        country_code: "IN",
+        contact_name: "No Card Parent",
+        contact_phone: "+919900112244",
+        is_selected: true,
+      }];
+      let savedFlow = null;
+      db.saveCheckoutFlow = async (flow) => {
+        savedFlow = {
+          id: flow.id,
+          user_id: flow.userId,
+          platform: flow.platform,
+          status: flow.status,
+          address_id: flow.addressId,
+          card_brand: flow.cardBrand || null,
+          card_last4: flow.cardLast4 || null,
+          card_failure_count: 0,
+          card_payment_received: false,
+          allow_cod_fallback: flow.allowCodFallback !== false,
+          fallback_to_cod: false,
+          payment_route: flow.paymentRoute || null,
+          prava_session_id: flow.pravaSessionId || null,
+          prava_session_approval_url: flow.pravaSessionApprovalUrl || null,
+          price_breakdown: flow.priceBreakdown || {},
+          cart_snapshot: flow.cartSnapshot || [],
+        };
+        return savedFlow;
+      };
+      db.getCheckoutFlow = async () => savedFlow;
+      let sessionArgs = null;
+      payments.createPaymentSession = async (args) => {
+        sessionArgs = args;
+        return {
+          provider: "prava",
+          sessionId: "sess_nocard",
+          approvalUrl: "https://sandbox.prava.space/approve/sess_nocard",
+          orderId: null,
+          expiresAt: null,
+          amount: "1028.97",
+          currency: "INR",
+        };
+      };
+
+      const result = await server.createUcpCheckoutWithPayment(
+        44,
+        { selectionToken: "signed-no-card", quantity: 1 },
+        { channel: "telegram", botUsername: "TokkoBot" }
+      );
+      assert.equal(result.paymentRoute, "prava_card");
+      assert.equal(result.nextAction.type, "prava_card_approval");
+      assert.equal(
+        result.nextAction.url,
+        "https://sandbox.prava.space/approve/sess_nocard"
+      );
+      assert.equal(result.card, null);
+      assert.equal(result.merchantHandoffUrl, null);
+      // Prava session created with NO card_id — buyer enters a card on the hosted page.
+      assert.equal(sessionArgs.cardId, null);
+    } finally {
+      Object.assign(ucp, { createCheckout: originals.createCheckout });
+      Object.assign(payments, {
+        configuration: originals.configuration,
+        listCards: originals.listCards,
+        listMandates: originals.listMandates,
+        createPaymentSession: originals.createPaymentSession,
+      });
+      Object.assign(db, {
+        getUserById: originals.getUserById,
+        getProfile: originals.getProfile,
+        getPaymentCustomer: originals.getPaymentCustomer,
+        getPaymentMethods: originals.getPaymentMethods,
+        getFamilyAddresses: originals.getFamilyAddresses,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
+      });
+    }
+  }
+);
+
+test(
+  "a saved card still offers a 'different card' choice that opens a no-card Prava session",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      createCheckout: ucp.createCheckout,
+      configuration: payments.configuration,
+      listCards: payments.listCards,
+      listMandates: payments.listMandates,
+      createPaymentSession: payments.createPaymentSession,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      getPaymentCustomer: db.getPaymentCustomer,
+      getPaymentMethods: db.getPaymentMethods,
+      getFamilyAddresses: db.getFamilyAddresses,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
+    };
+    try {
+      ucp.createCheckout = async () => ({
+        merchant: "oziva",
+        merchantName: "OZiva",
+        merchantUrl: "https://www.oziva.in",
+        productName: "Plant Protein",
+        variantName: "1 kg",
+        variantId: "gid://shopify/ProductVariant/403",
+        quantity: 1,
+        currency: "INR",
+        totalMinor: 99900,
+        totalAmount: "999.00",
+        totals: [{ type: "total", label: "Total", amountMinor: 99900 }],
+        checkoutId: "gid://shopify/Checkout/diff-card",
+        status: "requires_escalation",
+        checkoutUrl: "https://merchant.example/cart/c/diff-card",
+        continueUrl: "https://merchant.example/cart/c/diff-card",
+        paymentHandlers: ["dev.shopify.card"],
+      });
+      payments.configuration = () => ({ configured: true, environment: "sandbox" });
+      payments.listCards = async () => [];
+      payments.listMandates = async () => [];
+      db.getUserById = async () => ({ id: 45, email: "diff@example.com" });
+      db.getProfile = async () => ({
+        user_id: 45,
+        primary_parent_name: "Diff Parent",
+        primary_parent_phone: "+919900112255",
+      });
+      db.getPaymentCustomer = async () => ({
+        provider: "prava",
+        provider_customer_id: "tokko_family_45",
+      });
+      db.getPaymentMethods = async () => [{
+        id: 7,
+        provider: "prava",
+        provider_payment_method_id: "card_saved_7",
+        brand: "visa",
+        last4: "4242",
+        is_default: true,
+      }];
+      db.getFamilyAddresses = async () => [{
+        id: 104,
+        label: "Home",
+        formatted_address: "1 Lake Road, Kolkata 700029",
+        address_line1: "1 Lake Road",
+        city: "Kolkata",
+        state: "West Bengal",
+        postal_code: "700029",
+        country_code: "IN",
+        contact_name: "Diff Parent",
+        contact_phone: "+919900112255",
+        is_selected: true,
+      }];
+      let savedFlow = null;
+      db.saveCheckoutFlow = async (flow) => {
+        savedFlow = {
+          id: flow.id,
+          user_id: flow.userId,
+          platform: flow.platform,
+          status: flow.status,
+          address_id: flow.addressId,
+          card_brand: flow.cardBrand || null,
+          card_last4: flow.cardLast4 || null,
+          card_failure_count: 0,
+          card_payment_received: false,
+          allow_cod_fallback: flow.allowCodFallback !== false,
+          fallback_to_cod: false,
+          payment_route: flow.paymentRoute || null,
+          prava_session_id: flow.pravaSessionId || null,
+          prava_session_approval_url: flow.pravaSessionApprovalUrl || null,
+          price_breakdown: flow.priceBreakdown || {},
+          cart_snapshot: flow.cartSnapshot || [],
+        };
+        return savedFlow;
+      };
+      db.getCheckoutFlow = async () => savedFlow;
+      let sessionArgs = null;
+      payments.createPaymentSession = async (args) => {
+        sessionArgs = args;
+        return {
+          provider: "prava",
+          sessionId: "sess_diff",
+          approvalUrl: "https://sandbox.prava.space/approve/sess_diff",
+          orderId: null,
+          expiresAt: null,
+          amount: "1028.97",
+          currency: "INR",
+        };
+      };
+
+      const result = await server.createUcpCheckoutWithPayment(45, {
+        selectionToken: "signed-diff-card",
+        quantity: 1,
+      });
+      assert.equal(result.paymentRoute, "card_selection_required");
+      // The saved card is offered AND a "different card" (add_card) option.
+      assert.equal(result.cardChoices[0].last4, "4242");
+      const addCard = result.cardChoices.find((c) => c.type === "add_card");
+      assert.ok(addCard, "expected a 'different card' choice");
+      assert.ok(addCard.token);
+
+      const selected = await server.selectUcpSavedCard(45, addCard.token);
+      assert.equal(selected.paymentRoute, "prava_card");
+      assert.equal(selected.nextAction.type, "prava_card_approval");
+      assert.equal(
+        selected.nextAction.url,
+        "https://sandbox.prava.space/approve/sess_diff"
+      );
+      assert.equal(selected.savedCard, null);
+      // No card_id — the buyer enters a card on Prava's hosted page.
+      assert.equal(sessionArgs.cardId, null);
+    } finally {
+      Object.assign(ucp, { createCheckout: originals.createCheckout });
+      Object.assign(payments, {
+        configuration: originals.configuration,
+        listCards: originals.listCards,
+        listMandates: originals.listMandates,
+        createPaymentSession: originals.createPaymentSession,
+      });
+      Object.assign(db, {
+        getUserById: originals.getUserById,
+        getProfile: originals.getProfile,
+        getPaymentCustomer: originals.getPaymentCustomer,
+        getPaymentMethods: originals.getPaymentMethods,
+        getFamilyAddresses: originals.getFamilyAddresses,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
       });
     }
   }

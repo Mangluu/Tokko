@@ -2224,23 +2224,47 @@ function ucpSavedCardResult(userId, baseResult, mandateCheck, cards) {
         : "card_selection_required",
     },
     savedCards: values.map(publicUcpCard),
-    cardChoices: values.map((card) => ({
-      ...publicUcpCard(card),
-      token: hermes.signApproval({
-        userId,
-        toolName: "select_ucp_saved_card",
-        args: {
-          checkoutId: baseResult.checkoutId,
-          tokkoFlowId: baseResult.tokkoFlowId || null,
-          merchant: baseResult.merchant,
-          merchantName: baseResult.merchantName,
-          merchantHandoffUrl: baseResult.merchantHandoffUrl,
-          totalAmount: baseResult.totalAmount,
-          currency: baseResult.currency,
-          paymentMethodId: String(card.id),
-        },
-      }),
-    })),
+    cardChoices: [
+      ...values.map((card) => ({
+        ...publicUcpCard(card),
+        token: hermes.signApproval({
+          userId,
+          toolName: "select_ucp_saved_card",
+          args: {
+            checkoutId: baseResult.checkoutId,
+            tokkoFlowId: baseResult.tokkoFlowId || null,
+            merchant: baseResult.merchant,
+            merchantName: baseResult.merchantName,
+            merchantHandoffUrl: baseResult.merchantHandoffUrl,
+            totalAmount: baseResult.totalAmount,
+            currency: baseResult.currency,
+            paymentMethodId: String(card.id),
+          },
+        }),
+      })),
+      {
+        // Lets the buyer skip their saved cards and pay with a new card on
+        // Prava's hosted page. `add_card` is the choice type the Telegram bot
+        // already renders; paymentMethodId:null makes selectUcpSavedCard open a
+        // no-card Prava session.
+        type: "add_card",
+        label: "Pay with a different card (via Prava)",
+        token: hermes.signApproval({
+          userId,
+          toolName: "select_ucp_saved_card",
+          args: {
+            checkoutId: baseResult.checkoutId,
+            tokkoFlowId: baseResult.tokkoFlowId || null,
+            merchant: baseResult.merchant,
+            merchantName: baseResult.merchantName,
+            merchantHandoffUrl: baseResult.merchantHandoffUrl,
+            totalAmount: baseResult.totalAmount,
+            currency: baseResult.currency,
+            paymentMethodId: null,
+          },
+        }),
+      },
+    ],
     paymentSelection: {
       policy: "active_mandate_then_saved_card",
       required: true,
@@ -2252,7 +2276,7 @@ function ucpSavedCardResult(userId, baseResult, mandateCheck, cards) {
   };
 }
 
-async function selectUcpSavedCard(userId, token) {
+async function selectUcpSavedCard(userId, token, returnContext) {
   const approved = hermes.verifyApproval(token, userId);
   if (approved.toolName !== "select_ucp_saved_card") {
     throw Object.assign(new Error("This is not a saved-card selection"), {
@@ -2260,82 +2284,57 @@ async function selectUcpSavedCard(userId, token) {
     });
   }
   const input = approved.args;
-  const methods = await syncPravaPaymentMethodsForUser(userId);
-  const selected = methods.find((method) =>
-    String(method.id) === String(input.paymentMethodId)
-  );
-  if (!selected) {
-    throw Object.assign(new Error("This saved Prava card is no longer available"), {
-      status: 404,
-    });
+  // paymentMethodId omitted → "pay with a different card": open a no-card Prava
+  // session (buyer enters a card on Prava's hosted page). Otherwise pin to the
+  // chosen saved card.
+  let selected = null;
+  let savedCard = null;
+  if (input.paymentMethodId) {
+    const methods = await syncPravaPaymentMethodsForUser(userId);
+    selected = methods.find((method) =>
+      String(method.id) === String(input.paymentMethodId)
+    );
+    if (!selected) {
+      throw Object.assign(new Error("This saved Prava card is no longer available"), {
+        status: 404,
+      });
+    }
+    savedCard = publicUcpCard(selected);
   }
   if (!/^https:\/\//.test(String(input.merchantHandoffUrl || ""))) {
     throw Object.assign(new Error("The merchant checkout link is no longer valid"), {
       status: 409,
     });
   }
-  const savedCard = publicUcpCard(selected);
-  // Preferred path: open a Prava-hosted card-approval session and hand the buyer
-  // the Prava approval URL (not the raw Shopify checkout). Needs the Tokko
-  // checkout flow, which only the cart/decision path threads through as
-  // tokkoFlowId. The session-auth path has no flow, so it falls back below.
-  if (input.tokkoFlowId) {
-    const flow = await db.getCheckoutFlow(userId, input.tokkoFlowId);
-    if (flow) {
-      try {
-        const session = await startHermesPravaCardSession({
-          userId,
-          flow,
-          card: selected,
-          amount: Number(input.totalAmount),
-        });
-        return {
-          ...session,
-          merchant: input.merchant,
-          merchantName: input.merchantName,
-          savedCard,
-        };
-      } catch (error) {
-        // Prava session could not start — fall back to the merchant handoff,
-        // but log why so a live fallback is not silent.
-        console.warn(
-          `[ucp:card] Prava session failed for flow ${input.tokkoFlowId}; falling back to merchant handoff: ${error.message}`
-        );
-      }
-    } else {
-      console.warn(
-        `[ucp:card] No checkout flow ${input.tokkoFlowId} for user ${userId}; falling back to merchant handoff`
-      );
-    }
-  } else {
-    console.warn(
-      "[ucp:card] select_ucp_saved_card token had no tokkoFlowId; using merchant handoff (session-auth path or pre-fix token)"
+  // Always open a Prava-hosted card-approval session and hand back the Prava
+  // approval URL — never the raw merchant checkout. This needs the Tokko
+  // checkout flow; if it is missing the checkout can't be resumed (no silent
+  // merchant-URL fallback).
+  if (!input.tokkoFlowId) {
+    throw Object.assign(
+      new Error("This checkout can no longer be resumed. Start the checkout again."),
+      { status: 409 }
     );
   }
-  const paymentSelection = {
-    policy: "active_mandate_then_saved_card",
-    selected: true,
-    route: "prava_card",
-    displayLabel: `${savedCard.brand} •••• ${savedCard.last4}`,
-    merchantInstrumentSelected: false,
-    reason: "merchant_did_not_advertise_a_prava_compatible_payment_handler",
-  };
+  const flow = await db.getCheckoutFlow(userId, input.tokkoFlowId);
+  if (!flow) {
+    throw Object.assign(
+      new Error("This checkout could not be found. Start the checkout again."),
+      { status: 409 }
+    );
+  }
+  const session = await startHermesPravaCardSession({
+    userId,
+    flow,
+    card: selected,
+    amount: Number(input.totalAmount),
+    returnContext,
+  });
   return {
-    checkoutId: input.checkoutId,
+    ...session,
     merchant: input.merchant,
     merchantName: input.merchantName,
-    merchantHandoffUrl: input.merchantHandoffUrl,
-    totalAmount: input.totalAmount,
-    currency: input.currency,
-    paymentRoute: "prava_card",
     savedCard,
-    paymentSelection,
-    nextAction: {
-      type: "merchant_ucp_checkout",
-      label: `Continue to ${input.merchantName} checkout`,
-      url: input.merchantHandoffUrl,
-      paymentSelection,
-    },
   };
 }
 
@@ -2460,7 +2459,7 @@ async function createUcpCheckoutQuote(userId, input = {}) {
   return baseResult;
 }
 
-async function resolveUcpCheckoutPayment(userId, baseResult) {
+async function resolveUcpCheckoutPayment(userId, baseResult, returnContext) {
   const checkoutResult = baseResult;
   const merchantHandoffUrl = checkoutResult.merchantHandoffUrl;
   if (!payments.configuration().configured) {
@@ -2522,6 +2521,29 @@ async function resolveUcpCheckoutPayment(userId, baseResult) {
     status: eligible.length ? "eligible_mandate_found" : "no_eligible_mandate",
   };
   if (!eligible.length) {
+    // No mandate covers this. With NO saved card, open an all-in-one Prava
+    // session (buyer enters a card on Prava's hosted page) instead of handing
+    // back the merchant URL. With saved cards, fall through so the buyer picks
+    // one (card_selection_required). Scoped to the agent/Telegram flow: the web
+    // decision route re-saves the flow from the pre-session row and would clobber
+    // the session we persist here.
+    if (
+      !savedCards.length
+      && baseResult.tokkoFlowId
+      && returnContext?.channel === "telegram"
+    ) {
+      const flow = await db.getCheckoutFlow(userId, baseResult.tokkoFlowId);
+      if (flow) {
+        const session = await startHermesPravaCardSession({
+          userId,
+          flow,
+          card: null,
+          amount: Number(baseResult.totalAmount),
+          returnContext,
+        });
+        return { ...baseResult, ...session, merchantHandoffUrl: null, mandateCheck };
+      }
+    }
     return ucpSavedCardResult(userId, baseResult, mandateCheck, savedCards);
   }
 
@@ -2581,10 +2603,32 @@ async function resolveUcpCheckoutPayment(userId, baseResult) {
   };
 }
 
-async function createUcpCheckoutWithPayment(userId, input = {}) {
+async function createUcpCheckoutWithPayment(userId, input = {}, returnContext) {
+  const quote = await createUcpCheckoutQuote(userId, input);
+  // Persist a checkout flow so saved-card selection can open a Prava session.
+  // The agent path (Telegram/Gemini) has no cart-decision route to create the
+  // flow, so without this the select_ucp_saved_card token carries a null
+  // tokkoFlowId and selectUcpSavedCard falls back to the raw merchant handoff.
+  const orderId = nodeCrypto.randomUUID();
+  await db.saveCheckoutFlow({
+    id: orderId,
+    userId,
+    platform: "ucp",
+    status: "UCP_REVIEW",
+    addressId: quote.autofill?.addressId || null,
+    allowCodFallback: false,
+    priceBreakdown: quote,
+    cartSnapshot: Array.isArray(input.items)
+      ? input.items.map((item) => ({
+          selectionToken: item.selectionToken,
+          quantity: item.quantity,
+        }))
+      : [{ selectionToken: input.selectionToken, quantity: input.quantity || 1 }],
+  });
   return resolveUcpCheckoutPayment(
     userId,
-    await createUcpCheckoutQuote(userId, input)
+    { ...quote, tokkoFlowId: orderId },
+    returnContext
   );
 }
 
@@ -2778,25 +2822,32 @@ async function startHermesPravaCardSession({
   flow,
   card,
   amount,
+  returnContext,
 }) {
   const { email, customerId } = await pravaMandateIdentity(userId);
-  if (!card?.provider_payment_method_id) {
-    throw Object.assign(new Error("No saved Prava card is available"), {
-      status: 409,
-    });
+  // Card is optional: with no saved card, Prava's hosted session collects a new
+  // card + passkey and charges the total in one shot (card_id omitted).
+  const cardId = card?.provider_payment_method_id || null;
+  // Telegram checkouts return through the same helper create-mandate uses, so
+  // the buyer lands back in the bot. Other surfaces keep the web return param.
+  let callbackUrl;
+  if (returnContext?.channel === "telegram") {
+    callbackUrl = pravaReturnCallback("card", returnContext);
+  } else {
+    const callbackBase = BASE_URL.startsWith("https://")
+      ? BASE_URL
+      : process.env.PRAVA_MERCHANT_URL || "https://zepto-shop.vercel.app";
+    const url = new URL(callbackBase);
+    url.searchParams.set("pravaCheckout", "return");
+    url.searchParams.set("checkoutId", flow.id);
+    callbackUrl = url.toString();
   }
-  const callbackBase = BASE_URL.startsWith("https://")
-    ? BASE_URL
-    : process.env.PRAVA_MERCHANT_URL || "https://zepto-shop.vercel.app";
-  const callbackUrl = new URL(callbackBase);
-  callbackUrl.searchParams.set("pravaCheckout", "return");
-  callbackUrl.searchParams.set("checkoutId", flow.id);
   const session = await payments.createPaymentSession({
     customerId,
     email,
-    cardId: card.provider_payment_method_id,
+    cardId,
     amount,
-    callbackUrl: callbackUrl.toString(),
+    callbackUrl,
     externalOrderRef: `tokko_checkout_${String(flow.id).replace(/-/g, "")}`,
     purchaseContext: zeptoPurchaseContext(flow, amount),
   });
@@ -2804,8 +2855,8 @@ async function startHermesPravaCardSession({
     flowRecord(flow, {
       status: "PRAVA_CARD_APPROVAL_REQUIRED",
       paymentRoute: "prava_card",
-      cardBrand: card.brand,
-      cardLast4: card.last4,
+      cardBrand: card?.brand || null,
+      cardLast4: card?.last4 || null,
       pravaMandateId: "",
       pravaTransactionId: "",
       pravaChargeReference: "",
@@ -2823,14 +2874,11 @@ async function startHermesPravaCardSession({
     checkedMandateCount: Number(flow.checkedMandateCount || 0),
     amount,
     currency: "INR",
-    card: {
-      brand: card.brand || "Card",
-      last4: card.last4,
-    },
+    card: card ? { brand: card.brand || "Card", last4: card.last4 } : null,
     checkoutFlow: checkoutFlow(saved),
     nextAction: {
       type: "prava_card_approval",
-      label: "Approve Card With Prava",
+      label: card ? "Approve Card With Prava" : "Pay Securely With Prava",
       url: session.approvalUrl,
       checkoutId: flow.id,
     },
@@ -6774,7 +6822,16 @@ async function runHermesBackend({
       ? "choose which saved prava card to use for this mandate, or add a new saved card."
       : "add a card securely with prava, then tokko will automatically continue to mandate approval.";
   }
-  if (checkoutResult?.merchantHandoffUrl) {
+  if (checkoutResult?.nextAction?.type === "prava_card_approval") {
+    // No-mandate / no-card checkout resolved to an all-in-one Prava session:
+    // hand the buyer the Prava approval URL, never the merchant checkout.
+    result.nextAction = checkoutResult.nextAction;
+    result.checkoutFlow = checkoutResult.checkoutFlow || null;
+    result.checkoutSummary = publicUcpCheckoutSummary(checkoutResult);
+    result.message = checkoutResult.card
+      ? "i prefilled the selected address and phone. no eligible mandate covered the total, so approve the payment with your saved prava card below."
+      : "i prefilled the selected address and phone. no eligible mandate or saved card covered the total, so approve the payment securely with prava below — you can add a card on the prava page.";
+  } else if (checkoutResult?.merchantHandoffUrl) {
     result.merchantHandoffUrl = checkoutResult.merchantHandoffUrl;
     result.paymentUrl = null;
     result.paymentHandoff = checkoutResult.paymentHandoff || null;
@@ -6905,7 +6962,7 @@ async function executeHermesTool(req, userId, toolName, args) {
     };
   }
   if (toolName === HERMES_UCP_CHECKOUT_TOOL.name) {
-    return createUcpCheckoutWithPayment(userId, args);
+    return createUcpCheckoutWithPayment(userId, args, req?.tokkoReturnContext);
   }
   if (toolName === HERMES_ZEPTO_RECONNECT_TOOL.name) {
     const result = await auth.startMerchantAuth(userId, "zepto", BASE_URL);
@@ -7063,6 +7120,12 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   const chatId = telegramChatIdentifier(body);
   const user = await telegramFamilyUser(body, chatId);
   req.tokkoServiceUserId = Number(user.id);
+  // Checkout Prava sessions started inside the agent loop return through the
+  // bot (same callback create-mandate uses).
+  req.tokkoReturnContext = {
+    channel: "telegram",
+    botUsername: telegramBotUsernameFromBody(body),
+  };
   const text = telegramMessageText(body).slice(0, 6_000);
   if (telegramCardReturnMessage(text)) {
     const result = await resumeTelegramMandateAfterCard(Number(user.id), chatId);
@@ -7179,13 +7242,18 @@ route(
         telegram: { chatId, familyLinked: true },
       });
     }
-    const result = await selectUcpSavedCard(Number(user.id), body.token);
+    const result = await selectUcpSavedCard(Number(user.id), body.token, {
+      channel: "telegram",
+      botUsername: telegramBotUsernameFromBody(body),
+    });
     const pravaSession = result.nextAction?.type === "prava_card_approval";
-    const cardLabel = `${result.savedCard.brand} ending ${result.savedCard.last4}`;
+    const cardLabel = result.savedCard
+      ? `${result.savedCard.brand} ending ${result.savedCard.last4}`
+      : "a new card via Prava";
     await db.saveTelegramHermesMessage(
       chatId,
       "assistant",
-      `saved ${cardLabel} selected for ${result.merchantName} checkout`
+      `${cardLabel} selected for ${result.merchantName} checkout`
     );
     sendJson(res, 200, {
       ...result,
