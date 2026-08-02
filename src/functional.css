@@ -163,6 +163,9 @@
 .tf-member-assignment legend, .tf-chip-field legend { width: 100%; margin-bottom: 6px; color: var(--muted); font-size: 11px; font-weight: 700; letter-spacing: .07em; text-transform: uppercase; }
 .tf-member-assignment label { display: flex; align-items: center; gap: 7px; padding: 6px 10px 6px 6px; border: 1px solid var(--line); border-radius: 999px; background: var(--surface-muted); font-size: 12px; cursor: pointer; }
 .tf-member-assignment input, .tf-chip-field input { position: absolute; opacity: 0; pointer-events: none; }
+.tf-member-assignment label:has(input:checked) { border-color: color-mix(in srgb, var(--sage) 40%, var(--line)); background: color-mix(in srgb, var(--sage-soft) 60%, var(--surface-muted)); }
+.tf-member-assignment label.is-contact { border-color: var(--sage); background: var(--sage-soft); color: var(--ink); font-weight: 600; }
+.tf-member-assignment label.is-contact svg { color: var(--sage); }
 .tf-address-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; gap: 13px; padding: 17px; border: 1px solid var(--line); border-radius: 18px; background: var(--surface); box-shadow: var(--shadow-sm); }
 .tf-address-card.is-selected { border-color: color-mix(in srgb, var(--sage) 42%, transparent); background: linear-gradient(110deg, var(--surface), var(--sage-soft)); }
 .tf-address-card p { margin: 5px 0; overflow-wrap: anywhere; color: var(--muted); font-size: 13px; line-height: 1.45; }
