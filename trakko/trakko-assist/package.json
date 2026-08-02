@@ -1,0 +1,31 @@
+{
+  "name": "zepto-shop",
+  "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=20.9.0"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "build": "vite build",
+    "dev:ui": "vite",
+    "test": "node --test",
+    "check:api": "node scripts/check-api.js",
+    "check:browser": "playwright test",
+    "check:db": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f scripts/check-db.sql",
+    "check:db:user": "sh scripts/check-user.sh"
+  },
+  "dependencies": {
+    "@clerk/backend": "^3.11.7",
+    "@clerk/clerk-js": "^6.25.10",
+    "lucide-react": "^0.468.0",
+    "pg": "^8.22.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.62.0",
+    "@vitejs/plugin-react": "^5.1.4",
+    "vite": "^8.1.5"
+  }
+}
