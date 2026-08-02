@@ -52,9 +52,16 @@ async function browserClerk() {
   }
   return clerkBrowserPromise;
 }
+async function ensureNoClerkSession(clerk) {
+  // A leftover Clerk session (for example after the account was deleted server
+  // side) makes Clerk reject a fresh sign-in with "You're already signed in".
+  // Clear it so the user can sign in or create an account again.
+  try { if (clerk?.session) await clerk.signOut(); } catch {}
+}
 async function startClerkEmailVerification(email, password) {
   if (window.__tokkoClerkEmail) return window.__tokkoClerkEmail.start({ email, password });
   const clerk = await browserClerk();
+  await ensureNoClerkSession(clerk);
   const normalizedEmail = email.trim().toLowerCase();
   const currentSignUp = clerk.client.signUp;
   if (currentSignUp?.id && currentSignUp.emailAddress?.trim().toLowerCase() === normalizedEmail && (currentSignUp.status === 'complete' || clerkEmailIsVerified(currentSignUp))) return { signUpId: currentSignUp.id, alreadyVerified: true };
@@ -81,6 +88,7 @@ async function verifyClerkEmail(signUpId, code) {
 }
 async function startGoogleOAuth() {
   const clerk = await browserClerk();
+  await ensureNoClerkSession(clerk);
   const origin = window.location.origin;
   try {
     await clerk.client.signIn.authenticateWithRedirect({ strategy: 'oauth_google', redirectUrl: `${origin}/sso-callback`, redirectUrlComplete: `${origin}/?clerk_oauth=complete` });
