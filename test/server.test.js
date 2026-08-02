@@ -144,6 +144,7 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
   assert.ok(
     server.matchRoute("POST", "/api/integrations/telegram/hermes")
   );
+  assert.ok(server.matchRoute("POST", "/api/webhooks/linq"));
   assert.ok(
     server.matchRoute(
       "POST",
@@ -258,6 +259,61 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
   assert.equal(
     server.hermesOtpFromMessages([
       { role: "user", content: "reconnect zepto" },
+    ]),
+    null
+  );
+});
+
+test("LINQ text replies expose numbered products and parse selections", () => {
+  const choices = server.linqPendingChoices({
+    productChoices: [{
+      choiceId: "11111111-1111-4111-8111-111111111111",
+      productName: "Vitamin C",
+      price: 499,
+      currency: "INR",
+      merchantName: "Himalaya Wellness",
+    }],
+  });
+  assert.equal(choices.type, "product");
+  assert.equal(
+    server.linqChoiceRequest("add 1", choices).item.choiceId,
+    "11111111-1111-4111-8111-111111111111"
+  );
+  const reply = server.linqReplyText({
+    message: "I found one option.",
+    productChoices: [{
+      productName: "Vitamin C",
+      price: 499,
+      currency: "INR",
+      merchantName: "Himalaya Wellness",
+    }],
+  });
+  assert.match(reply, /1\. Vitamin C — INR 499\.00 — Himalaya Wellness/);
+  assert.match(reply, /Reply ADD 1/);
+});
+
+test("LINQ duplicate phones prefer the account owner over dependents", () => {
+  const owner = { id: 40, is_account_owner: true };
+  const dependent = { id: 44, is_account_owner: false };
+  assert.equal(
+    server.selectLinqFamilyCandidate([dependent, owner]),
+    owner
+  );
+  assert.equal(
+    server.selectLinqFamilyCandidate([
+      owner,
+      { id: 45, is_account_owner: true },
+    ]),
+    null
+  );
+  assert.equal(
+    server.selectLinqFamilyCandidate([dependent]),
+    dependent
+  );
+  assert.equal(
+    server.selectLinqFamilyCandidate([
+      dependent,
+      { id: 46, is_account_owner: false },
     ]),
     null
   );

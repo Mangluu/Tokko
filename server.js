@@ -5051,6 +5051,220 @@ route(
   }
 );
 
+function linqChoiceRequest(text, pendingChoices) {
+  const choices = Array.isArray(pendingChoices?.items)
+    ? pendingChoices.items
+    : [];
+  if (!choices.length) return null;
+  const match = String(text || "").trim().match(
+    /^(?:(?:add|buy|choose|select|card)\s+)?(?:item\s+)?(\d{1,2})$/i
+  );
+  if (!match) return null;
+  const index = Number(match[1]) - 1;
+  return index >= 0 && index < choices.length
+    ? { type: pendingChoices.type, item: choices[index], index }
+    : null;
+}
+
+function linqReplyText(result = {}) {
+  const sections = [];
+  const message = String(result.message || "").trim();
+  if (message) sections.push(message);
+  const products = Array.isArray(result.productChoices)
+    ? result.productChoices.slice(0, 9)
+    : [];
+  if (products.length) {
+    sections.push(products.map((product, index) => {
+      const price = Number.isFinite(Number(product.price))
+        ? `${String(product.currency || "INR").toUpperCase()} ${Number(product.price).toFixed(2)}`
+        : String(product.currency || "INR").toUpperCase();
+      return `${index + 1}. ${product.productName || "Product"} — ${price} — ${product.merchantName || product.merchant || "Merchant"}`;
+    }).join("\n"));
+    sections.push("Reply ADD 1 (or another number) to add it to your cart.");
+  }
+  const cardChoices = Array.isArray(result.cardChoices)
+    ? result.cardChoices.slice(0, 9)
+    : [];
+  if (cardChoices.length) {
+    sections.push(cardChoices.map((choice, index) => {
+      const label = choice.label
+        || `${choice.brand || "Card"} ending ${choice.last4 || ""}`.trim();
+      return `${index + 1}. ${label}`;
+    }).join("\n"));
+    sections.push("Reply CARD 1 (or another number) to choose a payment option.");
+  }
+  const cart = result.cart || result.cartSummary;
+  const cartItems = Array.isArray(cart?.items) ? cart.items : [];
+  if (!products.length && cartItems.length) {
+    sections.push(`Cart: ${cartItems.map((item) =>
+      `${Number(item.quantity || 1)}× ${item.productName || "Product"}`
+    ).join(", ")}`);
+  }
+  if (result.pendingAction?.token) {
+    sections.push(
+      `${result.pendingAction.description || "This action needs approval."}\nReply YES to approve or NO to cancel.`
+    );
+  }
+  const nextUrl = result.nextAction?.url || result.merchantHandoffUrl;
+  if (/^https:\/\//.test(String(nextUrl || ""))) {
+    sections.push(`${result.nextAction?.label || "Continue securely"}: ${nextUrl}`);
+  }
+  return sections.filter(Boolean).join("\n\n").slice(0, 10_000)
+    || "Tokko received your message.";
+}
+
+function linqPendingChoices(result = {}) {
+  if (Array.isArray(result.productChoices) && result.productChoices.length) {
+    return {
+      type: "product",
+      items: result.productChoices.slice(0, 9).map((choice) => ({
+        choiceId: choice.choiceId,
+        productName: choice.productName || "Product",
+      })),
+    };
+  }
+  if (Array.isArray(result.cardChoices) && result.cardChoices.length) {
+    return {
+      type: "approval",
+      items: result.cardChoices.slice(0, 9).map((choice) => ({
+        token: choice.token,
+        label: choice.label || null,
+        brand: choice.brand || null,
+        last4: choice.last4 || null,
+      })),
+    };
+  }
+  return null;
+}
+
+function selectLinqFamilyCandidate(candidates) {
+  const matches = Array.isArray(candidates) ? candidates : [];
+  const ownerMatches = matches.filter(
+    (candidate) => candidate.is_account_owner === true
+  );
+  if (ownerMatches.length === 1) return ownerMatches[0];
+  if (ownerMatches.length > 1) return null;
+  return matches.length === 1 ? matches[0] : null;
+}
+
+async function linqFamilyUser(message) {
+  const existing = await db.getLinqHermesBinding(message.chatId);
+  if (existing) {
+    if (existing.from_phone !== message.from || existing.to_phone !== message.to) {
+      throw Object.assign(new Error("LINQ chat participants changed unexpectedly"), {
+        status: 409,
+      });
+    }
+    const existingUser = await db.getUserById(Number(existing.user_id));
+    if (existingUser) return existingUser;
+  }
+  let resolved = null;
+  const configuredNumber = String(process.env.LINQ_PHONE_NUMBER || "").trim();
+  if (configuredNumber && configuredNumber === message.to) {
+    const candidates = await db.getLinqFamilyCandidatesByPhone(message.from);
+    resolved = selectLinqFamilyCandidate(candidates);
+  }
+  if (!resolved) resolved = await db.resolveLinqUser(message.from, message.to);
+  if (!resolved) return null;
+  const user = await db.getUserById(Number(resolved.id));
+  if (!user) return null;
+  const profile = await db.getProfile(Number(user.id));
+  if (profile) {
+    await db.saveLinqAssignment(
+      Number(user.id),
+      {
+        id: profile.linq_phone_number_id
+          || process.env.LINQ_PHONE_NUMBER_ID
+          || "configured",
+        phone_number: message.to,
+      },
+      message.chatId
+    );
+  }
+  await db.saveLinqHermesBinding(
+    message.chatId,
+    Number(user.id),
+    message.from,
+    message.to
+  );
+  return user;
+}
+
+async function processLinqMessage(req, message, eventId) {
+  const user = await linqFamilyUser(message);
+  if (!user) {
+    const reply =
+      "This phone is not linked to a Tokko family yet. Complete Tokko family setup with this same phone number, then message this Linq number again.";
+    await linq.sendChatMessage({
+      chatId: message.chatId,
+      text: reply,
+      idempotencyKey: `tokko-linq-unlinked-${eventId}`,
+    });
+    return { processed: true, familyLinked: false, replied: true };
+  }
+  const userId = Number(user.id);
+  req.tokkoServiceUserId = userId;
+  let binding = await db.getLinqHermesBinding(message.chatId);
+  const choice = linqChoiceRequest(message.text, binding?.pending_choices);
+  const affirmative = /^(?:yes|y|approve|approved|confirm|confirmed|go ahead)$/i.test(
+    message.text.trim()
+  );
+  const negative = /^(?:no|n|cancel|decline|declined|stop)$/i.test(
+    message.text.trim()
+  );
+  let result;
+  let keepChoices = binding?.pending_choices || null;
+  if (negative && binding?.pending_action?.token) {
+    result = { message: "Okay, I cancelled that action." };
+    keepChoices = null;
+  } else if (choice?.type === "product" && choice.item?.choiceId) {
+    const cart = await addUcpCartChoice(userId, choice.item.choiceId, 1, false);
+    result = {
+      message: `Added ${choice.item.productName || "that product"} to your cart.`,
+      cart: publicUcpCart(cart),
+    };
+  } else {
+    const history = await db.getLinqHermesMessages(message.chatId, 23);
+    const messages = history.map((entry) => ({
+      role: entry.role,
+      content: entry.content,
+    }));
+    messages.push({ role: "user", content: message.text });
+    const approvalToken = choice?.type === "approval"
+      ? choice.item?.token || null
+      : affirmative
+        ? binding?.pending_action?.token || null
+        : null;
+    result = await runHermesBackend({
+      req,
+      userId,
+      clerkUserId: user.clerk_user_id || null,
+      messages,
+      language: binding?.response_language || "en-IN",
+      approvalToken,
+    });
+    keepChoices = linqPendingChoices(result);
+  }
+  const reply = linqReplyText(result);
+  await db.saveLinqHermesMessage(message.chatId, "user", message.text);
+  await db.saveLinqHermesMessage(message.chatId, "assistant", reply);
+  await db.saveLinqHermesState(message.chatId, {
+    pendingAction: result.pendingAction?.token ? result.pendingAction : null,
+    pendingChoices: keepChoices,
+  });
+  await linq.sendChatMessage({
+    chatId: message.chatId,
+    text: reply,
+    idempotencyKey: `tokko-linq-${eventId}`,
+  });
+  return {
+    processed: true,
+    familyLinked: true,
+    userId,
+    replied: true,
+  };
+}
+
 route("POST", "/api/webhooks/linq", async (req, res) => {
   const rawBody = await readRawBody(req);
   if (
@@ -5072,7 +5286,49 @@ route("POST", "/api/webhooks/linq", async (req, res) => {
   const eventType = event.type || event.event_type || null;
   if (!eventId) return sendJson(res, 400, { error: "Webhook event id is missing" });
   const isNew = await db.recordWebhookEvent("linq", eventId, eventType);
-  sendJson(res, 200, { received: true, duplicate: !isNew });
+  if (!isNew) {
+    return sendJson(res, 200, { received: true, duplicate: true });
+  }
+  const message = linq.incomingMessage(event);
+  if (!message) {
+    return sendJson(res, 200, {
+      received: true,
+      duplicate: false,
+      ignored: true,
+    });
+  }
+  try {
+    const result = await processLinqMessage(req, message, eventId);
+    return sendJson(res, 200, {
+      received: true,
+      duplicate: false,
+      ...result,
+    });
+  } catch (error) {
+    const status = Number(error.status || 500);
+    if (status >= 400 && status < 500 && error.provider !== "linq") {
+      const reply = `I couldn't complete that request: ${error.message}`.slice(0, 10_000);
+      const binding = await db.getLinqHermesBinding(message.chatId).catch(() => null);
+      if (binding) {
+        await db.saveLinqHermesMessage(message.chatId, "user", message.text);
+        await db.saveLinqHermesMessage(message.chatId, "assistant", reply);
+      }
+      await linq.sendChatMessage({
+        chatId: message.chatId,
+        text: reply,
+        idempotencyKey: `tokko-linq-error-${eventId}`,
+      });
+      return sendJson(res, 200, {
+        received: true,
+        duplicate: false,
+        processed: true,
+        replied: true,
+        error: error.message,
+      });
+    }
+    await db.forgetWebhookEvent("linq", eventId).catch(() => {});
+    throw error;
+  }
 });
 
 route("GET", "/api/zepto-status", async (req, res) => {
@@ -7021,6 +7277,10 @@ Object.assign(server, {
   handler,
   initializeApplication,
   listPravaMandatesForUser,
+  linqChoiceRequest,
+  linqPendingChoices,
+  linqReplyText,
+  selectLinqFamilyCandidate,
   matchRoute,
   parseBody,
   pravaReturnCallback,
