@@ -2246,7 +2246,7 @@ async def _send_hermes_result(
                 "Confirm this final price:",
                 reply_markup=InlineKeyboardMarkup([[
                     InlineKeyboardButton(
-                        "Proceed With Order",
+                        "Approve Checkout",
                         callback_data=f"ucporder:yes:{order_id}",
                     ),
                     InlineKeyboardButton(
@@ -2420,7 +2420,7 @@ def _ucp_cart_checkout_markup(cart: dict) -> InlineKeyboardMarkup | None:
         merchant = str(group.get("merchant") or "").strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,45}", merchant):
             continue
-        label = f"Checkout {group.get('merchantName') or merchant}"[:64]
+        label = "Proceed to Checkout"
         rows.append([InlineKeyboardButton(
             label,
             callback_data=f"cart:checkout:{merchant}",
@@ -2592,6 +2592,7 @@ async def checkout_ucp_merchant_cart(
 
 
 def _ucp_checkout_hermes_result(checkout: dict) -> dict:
+    approval_required = checkout.get("approvalRequired") is True
     payment_route = str(checkout.get("paymentRoute") or "")
     currency = str(checkout.get("currency") or "").upper()
     total = str(checkout.get("totalAmount") or "")
@@ -2599,7 +2600,12 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
     mandate_count = int(
         (checkout.get("mandateCheck") or {}).get("checkedMandateCount") or 0
     )
-    if payment_route == "card_selection_required":
+    if approval_required:
+        message = (
+            f"{merchant_name} returned a complete quote of {currency} {total}, "
+            "including shipping and the 3% forex charge. Review it before approving."
+        )
+    elif payment_route == "card_selection_required":
         message = (
             f"{merchant_name} returned a final quote of {currency} {total}. "
             "No active mandate covers it; choose a saved Prava card."
@@ -2618,10 +2624,17 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
     result = {
         **checkout,
         "message": message.strip(),
-        "checkoutSummary": checkout,
+        "checkoutSummary": {
+            **checkout,
+            "confirmationRequired": approval_required,
+        },
     }
     handoff_url = str(checkout.get("merchantHandoffUrl") or "")
-    if payment_route != "card_selection_required" and handoff_url.startswith("https://"):
+    if (
+        not approval_required
+        and payment_route != "card_selection_required"
+        and handoff_url.startswith("https://")
+    ):
         result["nextAction"] = {
             "type": "merchant_ucp_checkout",
             "label": f"Continue to {merchant_name} checkout",
@@ -2655,22 +2668,13 @@ async def decide_ucp_order(
                 "Order canceled. No payment was attempted and no merchant order was placed."
             )
             return
-        options = result.get("paymentOptions") or {}
-        mandate_count = int(options.get("eligibleMandateCount") or 0)
-        card_count = len(options.get("savedCards") or [])
-        rows = [
-            [InlineKeyboardButton(
-                f"Mandates ({mandate_count} covering)",
-                callback_data=f"ucppaycat:m:{order_id}",
-            )],
-            [InlineKeyboardButton(
-                f"Saved Cards ({card_count})",
-                callback_data=f"ucppaycat:c:{order_id}",
-            )],
-        ]
         await query.edit_message_text(
-            "Price confirmed. Choose a payment category:",
-            reply_markup=InlineKeyboardMarkup(rows),
+            "Checkout approved. Resolving your approved payment route..."
+        )
+        await _send_hermes_result(
+            update,
+            _ucp_checkout_hermes_result(result),
+            binding,
         )
     except Exception as exc:
         await query.message.reply_text(f"I couldn't save that order choice: {exc}")

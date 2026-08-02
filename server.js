@@ -2134,6 +2134,11 @@ function publicUcpCheckoutSummary(checkout) {
   return {
     currency: checkout.currency || "INR",
     totalAmount: checkout.totalAmount || null,
+    cartTotalAmount: checkout.cartTotalAmount || checkout.totalAmount || null,
+    merchantTotalAmount: checkout.merchantTotalAmount || null,
+    shippingAmount: checkout.shippingAmount || "0.00",
+    forexAmount: checkout.forexAmount || "0.00",
+    forex: checkout.forex || null,
     totals: Array.isArray(checkout.totals) ? checkout.totals : [],
     shippingOptions: Array.isArray(checkout.shippingOptions)
       ? checkout.shippingOptions
@@ -2141,6 +2146,7 @@ function publicUcpCheckoutSummary(checkout) {
     shippingQuoted: checkout.shippingQuoted === true,
     destinationSelected: checkout.destinationSelected === true,
     phoneAccepted: checkout.phoneAccepted === true,
+    autofill: checkout.autofill || null,
     reconciles: checkout.reconciles,
   };
 }
@@ -2246,7 +2252,79 @@ async function selectUcpSavedCard(userId, token) {
   };
 }
 
-async function createUcpCheckoutWithPayment(userId, input = {}) {
+const UCP_FOREX_RATE_PERCENT = 3;
+
+function withUcpCheckoutCharges(checkoutResult) {
+  const value = checkoutResult || {};
+  const amount = (candidate) => {
+    const number = Math.round(Number(candidate));
+    return Number.isFinite(number) ? number : 0;
+  };
+  const subtotalMinor = amount(value.subtotalMinor || value.itemsSubtotalMinor);
+  const shippingMinor = amount(value.shippingMinor);
+  const taxMinor = amount(value.taxMinor);
+  const feeMinor = amount(value.feeMinor);
+  const discountMinor = amount(value.discountMinor);
+  const discountAdjustment = discountMinor > 0 ? -discountMinor : discountMinor;
+  const componentTotalMinor = subtotalMinor
+    ? subtotalMinor + shippingMinor + taxMinor + feeMinor + discountAdjustment
+    : 0;
+  const merchantTotalMinor = Math.max(
+    amount(value.totalMinor),
+    componentTotalMinor
+  );
+  if (merchantTotalMinor <= 0) {
+    throw Object.assign(new Error("Merchant checkout total is unavailable"), {
+      status: 502,
+    });
+  }
+  const forexMinor = Math.round(
+    merchantTotalMinor * UCP_FOREX_RATE_PERCENT / 100
+  );
+  const cartTotalMinor = merchantTotalMinor + forexMinor;
+  const totals = (Array.isArray(value.totals) ? value.totals : [])
+    .filter((entry) => !["total", "forex"].includes(String(entry?.type || "")));
+  if (!totals.some((entry) => entry.type === "fulfillment")) {
+    totals.push({
+      type: "fulfillment",
+      label: "Total shipping",
+      amountMinor: shippingMinor,
+    });
+  }
+  totals.push({
+    type: "forex",
+    label: `Forex charge (${UCP_FOREX_RATE_PERCENT}%)`,
+    amountMinor: forexMinor,
+  });
+  totals.push({
+    type: "total",
+    label: "Cart total payable",
+    amountMinor: cartTotalMinor,
+  });
+  return {
+    ...value,
+    totals,
+    merchantTotalMinor,
+    merchantTotalAmount: (merchantTotalMinor / 100).toFixed(2),
+    shippingMinor,
+    shippingAmount: (shippingMinor / 100).toFixed(2),
+    forexMinor,
+    forexAmount: (forexMinor / 100).toFixed(2),
+    forex: {
+      appliedByTokko: true,
+      ratePercent: UCP_FOREX_RATE_PERCENT,
+      baseAmountMinor: merchantTotalMinor,
+      amountMinor: forexMinor,
+    },
+    totalMinor: cartTotalMinor,
+    totalAmount: (cartTotalMinor / 100).toFixed(2),
+    cartTotalMinor,
+    cartTotalAmount: (cartTotalMinor / 100).toFixed(2),
+    reconciles: true,
+  };
+}
+
+async function createUcpCheckoutQuote(userId, input = {}) {
   const [user, profile, addresses] = await Promise.all([
     db.getUserById(userId),
     db.getProfile(userId),
@@ -2260,12 +2338,13 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
         quantity: item?.quantity,
       }))
     : input.selectionToken;
-  const checkoutResult = await ucp.createCheckout(selectionInput, {
+  const merchantCheckout = await ucp.createCheckout(selectionInput, {
     quantity: input.quantity,
     baseUrl: BASE_URL,
     buyer: checkoutIdentity.buyer,
     destination: checkoutIdentity.destination,
   });
+  const checkoutResult = withUcpCheckoutCharges(merchantCheckout);
   const merchantHandoffUrl = checkoutResult.continueUrl;
   const baseResult = {
     ...checkoutResult,
@@ -2291,6 +2370,12 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
       status: "not_checked",
     },
   };
+  return baseResult;
+}
+
+async function resolveUcpCheckoutPayment(userId, baseResult) {
+  const checkoutResult = baseResult;
+  const merchantHandoffUrl = checkoutResult.merchantHandoffUrl;
   if (!payments.configuration().configured) {
     return {
       ...baseResult,
@@ -2407,6 +2492,13 @@ async function createUcpCheckoutWithPayment(userId, input = {}) {
       paymentHandoff,
     },
   };
+}
+
+async function createUcpCheckoutWithPayment(userId, input = {}) {
+  return resolveUcpCheckoutPayment(
+    userId,
+    await createUcpCheckoutQuote(userId, input)
+  );
 }
 
 const MANDATE_DISPLAY_LIMIT = 5;
@@ -4644,13 +4736,124 @@ route(
         { status: 409 }
       );
     }
-    const checkout = await createUcpCheckoutWithPayment(userId, {
+    const checkout = await createUcpCheckoutQuote(userId, {
       items: items.map((item) => ({
         selectionToken: item.selectionToken,
         quantity: item.quantity,
       })),
     });
-    sendJson(res, 201, checkout);
+    const orderId = nodeCrypto.randomUUID();
+    await db.saveCheckoutFlow({
+      id: orderId,
+      userId,
+      platform: "ucp",
+      status: "UCP_REVIEW",
+      addressId: checkout.autofill?.addressId || null,
+      allowCodFallback: false,
+      priceBreakdown: checkout,
+      cartSnapshot: items.map((item) => ({
+        selectionToken: item.selectionToken,
+        quantity: item.quantity,
+      })),
+    });
+    sendJson(res, 201, {
+      ...checkout,
+      orderId,
+      approvalRequired: true,
+      confirmationRequired: true,
+      merchantHandoffUrl: null,
+      checkoutUrl: null,
+      continueUrl: null,
+      nextAction: null,
+    });
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/decision",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const orderId = checkoutId(params.orderId);
+    const body = await parseBody(req);
+    if (typeof body.proceed !== "boolean") {
+      throw Object.assign(new Error("proceed must be true or false"), {
+        status: 400,
+      });
+    }
+    const flow = await db.getCheckoutFlow(userId, orderId);
+    if (!flow || flow.platform !== "ucp") {
+      throw Object.assign(new Error("Checkout quote not found"), { status: 404 });
+    }
+    if (Date.now() - new Date(flow.created_at).getTime() > 30 * 60 * 1_000) {
+      if (flow.status === "UCP_REVIEW") {
+        await db.transitionCheckoutFlow(
+          userId,
+          orderId,
+          "UCP_REVIEW",
+          "UCP_EXPIRED"
+        );
+      }
+      throw Object.assign(new Error("Checkout quote expired. Open the cart again."), {
+        status: 410,
+      });
+    }
+    if (body.proceed === false) {
+      if (flow.status === "UCP_CANCELED") {
+        return sendJson(res, 200, { canceled: true, orderId });
+      }
+      const canceled = await db.transitionCheckoutFlow(
+        userId,
+        orderId,
+        "UCP_REVIEW",
+        "UCP_CANCELED"
+      );
+      if (!canceled) {
+        throw Object.assign(new Error("This checkout can no longer be canceled"), {
+          status: 409,
+        });
+      }
+      return sendJson(res, 200, { canceled: true, orderId });
+    }
+    const claimed = await db.transitionCheckoutFlow(
+      userId,
+      orderId,
+      "UCP_REVIEW",
+      "UCP_APPROVING"
+    );
+    if (!claimed) {
+      throw Object.assign(new Error("This checkout was already decided"), {
+        status: 409,
+      });
+    }
+    try {
+      const result = await resolveUcpCheckoutPayment(
+        userId,
+        claimed.price_breakdown
+      );
+      await db.saveCheckoutFlow(
+        flowRecord(claimed, {
+          status: "UCP_APPROVED",
+          paymentRoute: result.paymentRoute,
+          failureMessage: null,
+        })
+      );
+      return sendJson(res, 200, {
+        ...result,
+        orderId,
+        approvalRequired: false,
+        confirmationRequired: false,
+      });
+    } catch (error) {
+      await db.saveCheckoutFlow(
+        flowRecord(claimed, {
+          status: "UCP_REVIEW",
+          failureMessage: error.message,
+        })
+      );
+      throw error;
+    }
   }
 );
 
@@ -6734,6 +6937,7 @@ Object.assign(server, {
   MERCHANT_CONSENT_TEXT,
   canonicalPravaCustomerId,
   careRulesInput,
+  createUcpCheckoutQuote,
   createUcpCheckoutWithPayment,
   decisionRequestInput,
   executeHermesTool,
@@ -6764,6 +6968,7 @@ Object.assign(server, {
   tokkoPaymentRoute,
   usablePravaMandatesForAmount,
   usablePravaMandatesForMerchant,
+  withUcpCheckoutCharges,
   zeptoAddressLocationContext,
   zeptoSavedAddressRows,
   zeptoOrderId,

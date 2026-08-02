@@ -133,9 +133,11 @@ class PhoneNormalizationTests(unittest.TestCase):
             "merchantGroups": [{"merchant": "himalayawellness", "merchantName": "Himalaya"}],
         })
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
+        labels = [button.text for row in markup.inline_keyboard for button in row]
         self.assertIn("cart:remove:42", callbacks)
         self.assertIn("cart:empty", callbacks)
         self.assertIn("cart:checkout:himalayawellness", callbacks)
+        self.assertIn("Proceed to Checkout", labels)
 
     def test_cart_checkout_uses_live_checkout_result_without_missing_order_routes(self):
         result = bot._ucp_checkout_hermes_result({
@@ -162,6 +164,22 @@ class PhoneNormalizationTests(unittest.TestCase):
         })
         self.assertIsNone(card_result["nextAction"])
         self.assertEqual(card_result["cardChoices"][0]["last4"], "4242")
+
+        approval_result = bot._ucp_checkout_hermes_result({
+            "orderId": "11111111-1111-4111-8111-111111111111",
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "563.41",
+            "shippingAmount": "49.00",
+            "forexAmount": "16.41",
+            "approvalRequired": True,
+            "merchantHandoffUrl": None,
+        })
+        self.assertIsNone(approval_result["nextAction"])
+        self.assertTrue(
+            approval_result["checkoutSummary"]["confirmationRequired"]
+        )
+        self.assertIn("3% forex charge", approval_result["message"])
 
     def test_shopping_message_requires_session_address_confirmation(self):
         update = SimpleNamespace(

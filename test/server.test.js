@@ -146,6 +146,12 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
   );
   assert.ok(
     server.matchRoute(
+      "POST",
+      "/api/v1/onboarding/42/merchants/ucp/orders/11111111-1111-4111-8111-111111111111/decision"
+    )
+  );
+  assert.ok(
+    server.matchRoute(
       "DELETE",
       "/api/v1/onboarding/42/merchants/ucp/cart/items/7"
     )
@@ -505,6 +511,34 @@ test("UCP mandate routing requires active balance and matching merchant scope", 
 });
 
 test(
+  "UCP payable total includes shipping before three percent forex",
+  () => {
+    const result = server.withUcpCheckoutCharges({
+      currency: "INR",
+      totals: [
+        { type: "fulfillment", label: "Shipping", amountMinor: 500 },
+        { type: "total", label: "Merchant total", amountMinor: 10000 },
+      ],
+      subtotalMinor: 0,
+      itemsSubtotalMinor: 10000,
+      shippingMinor: 500,
+      taxMinor: 0,
+      feeMinor: 0,
+      discountMinor: 0,
+      totalMinor: 10000,
+    });
+    assert.equal(result.merchantTotalAmount, "105.00");
+    assert.equal(result.shippingAmount, "5.00");
+    assert.equal(result.forexAmount, "3.15");
+    assert.equal(result.cartTotalAmount, "108.15");
+    assert.deepEqual(
+      result.totals.slice(-2).map((line) => [line.type, line.amountMinor]),
+      [["forex", 315], ["total", 10815]]
+    );
+  }
+);
+
+test(
   "UCP checkout checks mandates and returns the Charge API token with the checkout handoff",
   { concurrency: false },
   async () => {
@@ -598,12 +632,27 @@ test(
         is_selected: true,
       }];
 
+      const quote = await server.createUcpCheckoutQuote(42, {
+        selectionToken: "signed-selection",
+        quantity: 1,
+      });
+      assert.equal(chargeInput, undefined);
+      assert.equal(quote.cartTotalAmount, "267.80");
+      assert.equal(quote.autofill.addressId, "101");
+      assert.equal(checkoutOptions.buyer.first_name, "Family");
+      assert.equal(checkoutOptions.buyer.last_name, "Parent");
+      assert.equal(checkoutOptions.buyer.phone_number, "+919876543210");
+      assert.equal(
+        checkoutOptions.destination.phone_number,
+        "+919876543210"
+      );
+
       const result = await server.createUcpCheckoutWithPayment(42, {
         selectionToken: "signed-selection",
         quantity: 1,
       });
       assert.equal(chargeInput.mandateId, "mdt_himalaya");
-      assert.equal(chargeInput.amount, "260.00");
+      assert.equal(chargeInput.amount, "267.80");
       assert.equal(
         chargeInput.purchaseContext[0].merchant_details.name,
         "Himalaya Wellness"
@@ -612,6 +661,10 @@ test(
       assert.equal(result.paymentUrl, null);
       assert.equal(result.paymentUrlAvailable, false);
       assert.equal(result.paymentRoute, "mandate");
+      assert.equal(result.merchantTotalAmount, "260.00");
+      assert.equal(result.shippingAmount, "0.00");
+      assert.equal(result.forexAmount, "7.80");
+      assert.equal(result.cartTotalAmount, "267.80");
       assert.equal(result.mandateCheck.status, "credential_issued");
       assert.equal(result.paymentHandoff.credentials.token, "4111111111111111");
       assert.equal(result.nextAction.url, result.merchantHandoffUrl);
