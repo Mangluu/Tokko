@@ -151,6 +151,7 @@ function routeAuth(pattern) {
     pattern === "/api/auth/login" ||
     pattern === "/api/auth/logout" ||
     pattern === "/api/payments/return" ||
+    pattern === "/api/linq/onboarding/context" ||
     pattern === "/.well-known/ucp"
   ) {
     return "public";
@@ -4076,6 +4077,21 @@ route("GET", "/api/config", async (_req, res) => {
   });
 });
 
+route("GET", "/api/linq/onboarding/context", async (req, res) => {
+  const context = verifyLinqOnboardingToken(getQuery(req).token);
+  sendJson(res, 200, {
+    source: "linq",
+    phone: context.from,
+    linqNumber: context.to,
+    expiresAt: context.expiresAt,
+  });
+});
+
+route("POST", "/api/linq/onboarding/complete", async (req, res) => {
+  const body = await parseBody(req);
+  sendJson(res, 200, await completeLinqOnboarding(req, body.token));
+});
+
 route("GET", "/api/v1/system/apis", async (req, res) => {
   await auth.requireService(req);
   const apiRoutes = routes
@@ -4842,14 +4858,8 @@ route(
   }
 );
 
-route(
-  "POST",
-  "/api/v1/onboarding/:id/merchants/ucp/cart/checkout",
-  async (req, res, params) => {
-    await auth.requireService(req);
-    const userId = await resolveOnboardingUserId(params.id);
-    const body = await parseBody(req);
-    const cart = await db.getUcpCart(userId);
+async function createUcpCartCheckout(userId, input = {}) {
+    const cart = await db.getUcpCart(Number(userId));
     const items = Array.isArray(cart.items) ? cart.items : [];
     if (!items.length) {
       throw Object.assign(new Error("Your cart is empty"), { status: 409 });
@@ -4864,14 +4874,14 @@ route(
       );
     }
     const cartMerchant = [...merchants][0];
-    const requestedMerchant = String(body.merchant || "").trim().toLowerCase();
+    const requestedMerchant = String(input.merchant || "").trim().toLowerCase();
     if (requestedMerchant && requestedMerchant !== cartMerchant) {
       throw Object.assign(
         new Error("The checkout merchant does not match the current cart"),
         { status: 409 }
       );
     }
-    const checkout = await createUcpCheckoutQuote(userId, {
+    const checkout = await createUcpCheckoutQuote(Number(userId), {
       items: items.map((item) => ({
         selectionToken: item.selectionToken,
         quantity: item.quantity,
@@ -4880,7 +4890,7 @@ route(
     const orderId = nodeCrypto.randomUUID();
     await db.saveCheckoutFlow({
       id: orderId,
-      userId,
+      userId: Number(userId),
       platform: "ucp",
       status: "UCP_REVIEW",
       addressId: checkout.autofill?.addressId || null,
@@ -4891,7 +4901,7 @@ route(
         quantity: item.quantity,
       })),
     });
-    sendJson(res, 201, {
+    return {
       ...checkout,
       orderId,
       approvalRequired: true,
@@ -4900,31 +4910,25 @@ route(
       checkoutUrl: null,
       continueUrl: null,
       nextAction: null,
-    });
-  }
-);
+    };
+}
 
-route(
-  "POST",
-  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/decision",
-  async (req, res, params) => {
-    await auth.requireService(req);
-    const userId = await resolveOnboardingUserId(params.id);
-    const orderId = checkoutId(params.orderId);
-    const body = await parseBody(req);
-    if (typeof body.proceed !== "boolean") {
+async function decideUcpCartOrder(userId, orderIdValue, proceed) {
+    const normalizedUserId = Number(userId);
+    const orderId = checkoutId(orderIdValue);
+    if (typeof proceed !== "boolean") {
       throw Object.assign(new Error("proceed must be true or false"), {
         status: 400,
       });
     }
-    const flow = await db.getCheckoutFlow(userId, orderId);
+    const flow = await db.getCheckoutFlow(normalizedUserId, orderId);
     if (!flow || flow.platform !== "ucp") {
       throw Object.assign(new Error("Checkout quote not found"), { status: 404 });
     }
     if (Date.now() - new Date(flow.created_at).getTime() > 30 * 60 * 1_000) {
       if (flow.status === "UCP_REVIEW") {
         await db.transitionCheckoutFlow(
-          userId,
+          normalizedUserId,
           orderId,
           "UCP_REVIEW",
           "UCP_EXPIRED"
@@ -4934,12 +4938,12 @@ route(
         status: 410,
       });
     }
-    if (body.proceed === false) {
+    if (proceed === false) {
       if (flow.status === "UCP_CANCELED") {
-        return sendJson(res, 200, { canceled: true, orderId });
+        return { canceled: true, orderId };
       }
       const canceled = await db.transitionCheckoutFlow(
-        userId,
+        normalizedUserId,
         orderId,
         "UCP_REVIEW",
         "UCP_CANCELED"
@@ -4949,10 +4953,10 @@ route(
           status: 409,
         });
       }
-      return sendJson(res, 200, { canceled: true, orderId });
+      return { canceled: true, orderId };
     }
     const claimed = await db.transitionCheckoutFlow(
-      userId,
+      normalizedUserId,
       orderId,
       "UCP_REVIEW",
       "UCP_APPROVING"
@@ -4964,7 +4968,7 @@ route(
     }
     try {
       const result = await resolveUcpCheckoutPayment(
-        userId,
+        normalizedUserId,
         { ...claimed.price_breakdown, tokkoFlowId: orderId }
       );
       await db.saveCheckoutFlow(
@@ -4974,12 +4978,12 @@ route(
           failureMessage: null,
         })
       );
-      return sendJson(res, 200, {
+      return {
         ...result,
         orderId,
         approvalRequired: false,
         confirmationRequired: false,
-      });
+      };
     } catch (error) {
       await db.saveCheckoutFlow(
         flowRecord(claimed, {
@@ -4989,6 +4993,31 @@ route(
       );
       throw error;
     }
+}
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/cart/checkout",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const body = await parseBody(req);
+    sendJson(res, 201, await createUcpCartCheckout(userId, body));
+  }
+);
+
+route(
+  "POST",
+  "/api/v1/onboarding/:id/merchants/ucp/orders/:orderId/decision",
+  async (req, res, params) => {
+    await auth.requireService(req);
+    const userId = await resolveOnboardingUserId(params.id);
+    const body = await parseBody(req);
+    sendJson(
+      res,
+      200,
+      await decideUcpCartOrder(userId, params.orderId, body.proceed)
+    );
   }
 );
 
@@ -5111,19 +5140,275 @@ route(
   }
 );
 
+const LINQ_ONBOARDING_TTL_MS = 24 * 60 * 60 * 1_000;
+
+function linqOnboardingSecret() {
+  const secret = String(
+    process.env.LINQ_ONBOARDING_SECRET
+      || process.env.LINQ_WEBHOOK_SECRET
+      || process.env.HERMES_ACTION_SECRET
+      || ""
+  );
+  if (secret.length < 16) {
+    throw Object.assign(new Error("LINQ onboarding links are not configured"), {
+      status: 503,
+    });
+  }
+  return secret;
+}
+
+function linqOnboardingToken(message, options = {}) {
+  const now = Number(options.now ?? Date.now());
+  const ttlMs = Number(options.ttlMs ?? LINQ_ONBOARDING_TTL_MS);
+  const payload = {
+    v: 1,
+    chatId: String(message?.chatId || "").trim(),
+    from: String(message?.from || "").trim(),
+    to: String(message?.to || "").trim(),
+    iat: now,
+    exp: now + ttlMs,
+  };
+  if (!/^[0-9a-f-]{36}$/i.test(payload.chatId)) {
+    throw Object.assign(new Error("A valid LINQ chat id is required"), {
+      status: 400,
+    });
+  }
+  if (
+    !/^\+[1-9]\d{6,14}$/.test(payload.from)
+    || !/^\+[1-9]\d{6,14}$/.test(payload.to)
+  ) {
+    throw Object.assign(new Error("Valid LINQ phone numbers are required"), {
+      status: 400,
+    });
+  }
+  if (!Number.isFinite(now) || !Number.isFinite(ttlMs) || ttlMs <= 0) {
+    throw Object.assign(new Error("Invalid LINQ onboarding link lifetime"), {
+      status: 400,
+    });
+  }
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(encoded)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyLinqOnboardingToken(token, options = {}) {
+  const value = String(token || "").trim();
+  const [encoded, suppliedSignature, extra] = value.split(".");
+  if (
+    extra !== undefined
+    || !/^[A-Za-z0-9_-]+$/.test(encoded || "")
+    || !/^[A-Za-z0-9_-]+$/.test(suppliedSignature || "")
+  ) {
+    throw Object.assign(new Error("This LINQ onboarding link is invalid"), {
+      status: 400,
+    });
+  }
+  const expectedSignature = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(encoded)
+    .digest();
+  let supplied;
+  try {
+    supplied = Buffer.from(suppliedSignature, "base64url");
+  } catch {
+    supplied = Buffer.alloc(0);
+  }
+  if (
+    supplied.length !== expectedSignature.length
+    || !nodeCrypto.timingSafeEqual(supplied, expectedSignature)
+  ) {
+    throw Object.assign(new Error("This LINQ onboarding link is invalid"), {
+      status: 400,
+    });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("This LINQ onboarding link is invalid"), {
+      status: 400,
+    });
+  }
+  const now = Number(options.now ?? Date.now());
+  if (
+    payload?.v !== 1
+    || !/^[0-9a-f-]{36}$/i.test(String(payload.chatId || ""))
+    || !/^\+[1-9]\d{6,14}$/.test(String(payload.from || ""))
+    || !/^\+[1-9]\d{6,14}$/.test(String(payload.to || ""))
+    || !Number.isFinite(Number(payload.iat))
+    || !Number.isFinite(Number(payload.exp))
+    || Number(payload.iat) > now + 60_000
+  ) {
+    throw Object.assign(new Error("This LINQ onboarding link is invalid"), {
+      status: 400,
+    });
+  }
+  if (Number(payload.exp) <= now) {
+    throw Object.assign(new Error("This LINQ onboarding link has expired"), {
+      status: 410,
+    });
+  }
+  return {
+    chatId: String(payload.chatId),
+    from: String(payload.from),
+    to: String(payload.to),
+    issuedAt: new Date(Number(payload.iat)).toISOString(),
+    expiresAt: new Date(Number(payload.exp)).toISOString(),
+  };
+}
+
+function linqOnboardingUrl(message, options = {}) {
+  const baseUrl = String(
+    options.baseUrl
+      || process.env.TOKKO_APP_URL
+      || "https://tokko-drab.vercel.app"
+  );
+  let url;
+  try {
+    url = new URL(baseUrl);
+  } catch {
+    url = null;
+  }
+  if (!url || url.protocol !== "https:") {
+    throw Object.assign(new Error("TOKKO_APP_URL must be an HTTPS URL"), {
+      status: 503,
+    });
+  }
+  url.pathname = "/";
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("linqOnboarding", linqOnboardingToken(message, options));
+  return url.toString();
+}
+
+function linqChatReturnUrl(phone) {
+  const value = String(phone || "").trim();
+  if (!/^\+[1-9]\d{6,14}$/.test(value)) return null;
+  return `sms:${value}`;
+}
+
+async function completeLinqOnboarding(req, token) {
+  const user = await auth.requireUser(req);
+  const context = verifyLinqOnboardingToken(token);
+  const candidates = await db.getLinqFamilyCandidatesByPhone(context.from);
+  const selected = selectLinqFamilyCandidate(candidates);
+  if (!selected || Number(selected.id) !== Number(user.userId)) {
+    throw Object.assign(
+      new Error(
+        `Add ${context.from} as your Tokko account phone or a family member before returning to LINQ.`
+      ),
+      { status: 409 }
+    );
+  }
+  const profile = await db.getProfile(Number(user.userId));
+  if (!profile) {
+    throw Object.assign(new Error("Complete your Tokko family profile first"), {
+      status: 409,
+    });
+  }
+  await db.saveLinqAssignment(
+    Number(user.userId),
+    {
+      id: profile.linq_phone_number_id
+        || process.env.LINQ_PHONE_NUMBER_ID
+        || "configured",
+      phone_number: context.to,
+    },
+    context.chatId
+  );
+  await db.saveLinqHermesBinding(
+    context.chatId,
+    Number(user.userId),
+    context.from,
+    context.to
+  );
+  const reply =
+    "Your Tokko family is connected. You are back where you left off—send your request again and I’ll continue here.";
+  await linq.sendChatMessage({
+    chatId: context.chatId,
+    text: reply,
+    idempotencyKey: `tokko-linq-onboarding-${user.userId}-${context.chatId}`,
+  });
+  await db.saveLinqHermesMessage(context.chatId, "assistant", reply);
+  return {
+    completed: true,
+    chatConnected: true,
+    returnUrl: linqChatReturnUrl(context.to),
+    linqNumber: context.to,
+  };
+}
+
+function linqCartChoices(cart = {}) {
+  const items = Array.isArray(cart?.items) ? cart.items : [];
+  const choices = items.slice(0, 7).map((item) => ({
+    action: "remove",
+    itemId: String(item.id),
+    label: `Remove ${item.productName || "product"}`,
+  }));
+  if (!items.length) return choices;
+  choices.push({ action: "empty", label: "Empty Cart" });
+  const merchants = [
+    ...new Set(
+      items
+        .map((item) => String(item.merchant || "").trim().toLowerCase())
+        .filter(Boolean)
+    ),
+  ];
+  if (merchants.length === 1) {
+    choices.push({
+      action: "checkout",
+      merchant: merchants[0],
+      label: "Proceed to Checkout",
+    });
+  }
+  return choices;
+}
+
 function linqChoiceRequest(text, pendingChoices) {
   const choices = Array.isArray(pendingChoices?.items)
     ? pendingChoices.items
     : [];
   if (!choices.length) return null;
-  const match = String(text || "").trim().match(
-    /^(?:(?:add|buy|choose|select|card)\s+)?(?:item\s+)?(\d{1,2})$/i
+  const value = String(text || "").trim();
+  const directAction = pendingChoices?.type === "checkout"
+    ? /^(?:yes|y|approve|approved|confirm|confirmed|approve checkout|go ahead)$/i.test(value)
+      ? "approve"
+      : /^(?:no|n|cancel|decline|declined|do not place order|cancel checkout|stop)$/i.test(value)
+        ? "cancel"
+        : null
+    : pendingChoices?.type === "cart"
+      ? /^(?:checkout|proceed(?: to checkout)?|buy cart)$/i.test(value)
+        ? "checkout"
+        : /^(?:empty|empty cart|clear cart)$/i.test(value)
+          ? "empty"
+          : null
+      : null;
+  if (directAction) {
+    const index = choices.findIndex((item) => item.action === directAction);
+    if (index >= 0) {
+      return { type: pendingChoices.type, item: choices[index], index };
+    }
+  }
+  const match = value.match(
+    /^(?:(?:add|buy|choose|select|card|option)\s+)?(?:item\s+)?(\d{1,2})$/i
   );
   if (!match) return null;
   const index = Number(match[1]) - 1;
   return index >= 0 && index < choices.length
     ? { type: pendingChoices.type, item: choices[index], index }
     : null;
+}
+
+function linqApprovalRequest(userId, choice) {
+  const token = choice?.type === "approval"
+    ? String(choice.item?.token || "")
+    : "";
+  if (!token) return null;
+  const approved = hermes.verifyApproval(token, userId);
+  return { token, toolName: approved.toolName };
 }
 
 function linqReplyText(result = {}) {
@@ -5153,12 +5438,48 @@ function linqReplyText(result = {}) {
     }).join("\n"));
     sections.push("Reply CARD 1 (or another number) to choose a payment option.");
   }
+  const checkout = result.checkoutSummary;
+  const checkoutTotals = Array.isArray(checkout?.totals)
+    ? checkout.totals
+    : [];
+  if (checkout?.confirmationRequired && checkoutTotals.length) {
+    const currency = String(checkout.currency || "INR").toUpperCase();
+    const quote = ["Quote:"];
+    for (const total of checkoutTotals) {
+      const amount = Number(total.amountMinor || 0) / 100;
+      quote.push(`${total.label || total.type || "Amount"}: ${currency} ${amount.toFixed(2)}`);
+      for (const detail of Array.isArray(total.lines) ? total.lines : []) {
+        const detailAmount = Number(detail.amountMinor || 0) / 100;
+        quote.push(`  ${detail.label || "Detail"}: ${currency} ${detailAmount.toFixed(2)}`);
+      }
+    }
+    const delivery = checkout.deliveryWindow || {};
+    const deliveryPeriod = [
+      delivery.description,
+      delivery.earliest,
+      delivery.latest,
+    ].filter(Boolean).join(" to ");
+    if (deliveryPeriod) quote.push(`Delivery: ${deliveryPeriod}`);
+    sections.push(quote.join("\n"));
+    sections.push(
+      "1. Approve Checkout\n2. Do Not Place Order\nReply 1 or 2 (YES or NO also works)."
+    );
+  }
   const cart = result.cart || result.cartSummary;
   const cartItems = Array.isArray(cart?.items) ? cart.items : [];
   if (!products.length && cartItems.length) {
     sections.push(`Cart: ${cartItems.map((item) =>
       `${Number(item.quantity || 1)}× ${item.productName || "Product"}`
     ).join(", ")}`);
+    const actions = linqCartChoices(cart);
+    if (actions.length) {
+      sections.push(actions.map((action, index) =>
+        `${index + 1}. ${action.label}`
+      ).join("\n"));
+      sections.push("Reply with a number, or reply CHECKOUT to proceed.");
+    }
+  } else if (cart && !cartItems.length) {
+    sections.push("Your cart is empty. Tell me what you want to shop for.");
   }
   if (result.pendingAction?.token) {
     sections.push(
@@ -5167,10 +5488,55 @@ function linqReplyText(result = {}) {
   }
   const nextUrl = result.nextAction?.url || result.merchantHandoffUrl;
   if (/^https:\/\//.test(String(nextUrl || ""))) {
-    sections.push(`${result.nextAction?.label || "Continue securely"}: ${nextUrl}`);
+    sections.push(`${result.nextAction?.label || "Continue securely"}. A tappable secure link card follows.`);
   }
   return sections.filter(Boolean).join("\n\n").slice(0, 10_000)
     || "Tokko received your message.";
+}
+
+function linqReplyLink(result = {}) {
+  const url = String(result.nextAction?.url || result.merchantHandoffUrl || "");
+  return /^https:\/\//.test(url) ? url : null;
+}
+
+function linqUcpCheckoutResult(checkout = {}) {
+  if (checkout.canceled === true) {
+    return {
+      message: "Order canceled. No payment was attempted and no merchant order was placed.",
+    };
+  }
+  const approvalRequired = checkout.approvalRequired === true;
+  const currency = String(checkout.currency || "INR").toUpperCase();
+  const total = String(checkout.totalAmount || "");
+  const merchantName = checkout.merchantName || "The merchant";
+  let message;
+  if (approvalRequired) {
+    message = `${merchantName} returned a complete quote of ${currency} ${total}. Review it before approving.`;
+  } else if (checkout.paymentRoute === "card_selection_required") {
+    message = `${merchantName} returned a final quote of ${currency} ${total}. No active mandate covers it; choose a saved Prava card.`;
+  } else {
+    message = `Checkout approved for ${currency} ${total}. Review the final merchant checkout before continuing.`;
+  }
+  const handoffUrl = String(checkout.merchantHandoffUrl || "");
+  return {
+    ...checkout,
+    message,
+    checkoutSummary: {
+      ...checkout,
+      confirmationRequired: approvalRequired,
+    },
+    nextAction: !approvalRequired
+      && checkout.paymentRoute !== "card_selection_required"
+      && /^https:\/\//.test(handoffUrl)
+      ? {
+          type: "merchant_ucp_checkout",
+          label: `Continue to ${merchantName} checkout`,
+          url: handoffUrl,
+          paymentHandoff: checkout.paymentHandoff || null,
+          paymentSelection: checkout.paymentSelection || null,
+        }
+      : null,
+  };
 }
 
 function linqPendingChoices(result = {}) {
@@ -5188,11 +5554,31 @@ function linqPendingChoices(result = {}) {
       type: "approval",
       items: result.cardChoices.slice(0, 9).map((choice) => ({
         token: choice.token,
+        selectionType: choice.type || "ucp_saved_card",
         label: choice.label || null,
         brand: choice.brand || null,
         last4: choice.last4 || null,
       })),
     };
+  }
+  const checkout = result.checkoutSummary;
+  if (
+    checkout?.confirmationRequired === true
+    && /^[0-9a-f-]{36}$/i.test(String(checkout.orderId || ""))
+  ) {
+    return {
+      type: "checkout",
+      orderId: String(checkout.orderId),
+      items: [
+        { action: "approve", label: "Approve Checkout" },
+        { action: "cancel", label: "Do Not Place Order" },
+      ],
+    };
+  }
+  const cart = result.cart || result.cartSummary;
+  const cartChoices = linqCartChoices(cart);
+  if (cartChoices.length) {
+    return { type: "cart", items: cartChoices };
   }
   return null;
 }
@@ -5207,6 +5593,11 @@ function selectLinqFamilyCandidate(candidates) {
   return matches.length === 1 ? matches[0] : null;
 }
 
+function maskedLinqPhone(phone) {
+  const digits = String(phone || "").replace(/\D/g, "");
+  return digits ? `***${digits.slice(-4)}` : null;
+}
+
 async function linqFamilyUser(message) {
   const existing = await db.getLinqHermesBinding(message.chatId);
   if (existing) {
@@ -5218,13 +5609,24 @@ async function linqFamilyUser(message) {
     const existingUser = await db.getUserById(Number(existing.user_id));
     if (existingUser) return existingUser;
   }
-  let resolved = null;
-  const configuredNumber = String(process.env.LINQ_PHONE_NUMBER || "").trim();
-  if (configuredNumber && configuredNumber === message.to) {
-    const candidates = await db.getLinqFamilyCandidatesByPhone(message.from);
-    resolved = selectLinqFamilyCandidate(candidates);
+  const candidates = await db.getLinqFamilyCandidatesByPhone(message.from);
+  let resolved = selectLinqFamilyCandidate(candidates);
+  let resolutionSource = resolved ? "tokko_phone_owner_preference" : null;
+  if (!resolved) {
+    resolved = await db.resolveLinqUser(message.from, message.to);
+    if (resolved) resolutionSource = "existing_linq_assignment";
   }
-  if (!resolved) resolved = await db.resolveLinqUser(message.from, message.to);
+  console.info("[linq] family resolution", {
+    chatIdSuffix: String(message.chatId || "").slice(-8),
+    fromPhone: maskedLinqPhone(message.from),
+    toPhone: maskedLinqPhone(message.to),
+    candidateCount: candidates.length,
+    ownerCandidateCount: candidates.filter(
+      (candidate) => candidate.is_account_owner === true
+    ).length,
+    selectedUserId: resolved ? Number(resolved.id) : null,
+    resolutionSource,
+  });
   if (!resolved) return null;
   const user = await db.getUserById(Number(resolved.id));
   if (!user) return null;
@@ -5254,34 +5656,104 @@ async function processLinqMessage(req, message, eventId) {
   const user = await linqFamilyUser(message);
   if (!user) {
     const reply =
-      "This phone is not linked to a Tokko family yet. Complete Tokko family setup with this same phone number, then message this Linq number again.";
+      "This phone is not registered with a Tokko family yet. Open the secure Tokko setup link below and add this same number. When setup is saved, Tokko will reconnect you to this LINQ chat where you left off.";
+    const onboardingUrl = linqOnboardingUrl(message);
     await linq.sendChatMessage({
       chatId: message.chatId,
       text: reply,
       idempotencyKey: `tokko-linq-unlinked-${eventId}`,
     });
-    return { processed: true, familyLinked: false, replied: true };
+    await linq.sendChatLink({
+      chatId: message.chatId,
+      url: onboardingUrl,
+      idempotencyKey: `tokko-linq-unlinked-${eventId}-link`,
+    });
+    return {
+      processed: true,
+      familyLinked: false,
+      onboardingRequired: true,
+      replied: true,
+    };
   }
   const userId = Number(user.id);
   req.tokkoServiceUserId = userId;
   let binding = await db.getLinqHermesBinding(message.chatId);
   const choice = linqChoiceRequest(message.text, binding?.pending_choices);
+  const approvalRequest = linqApprovalRequest(userId, choice);
+  const messageText = String(message.text || "").trim();
   const affirmative = /^(?:yes|y|approve|approved|confirm|confirmed|go ahead)$/i.test(
-    message.text.trim()
+    messageText
   );
   const negative = /^(?:no|n|cancel|decline|declined|stop)$/i.test(
-    message.text.trim()
+    messageText
   );
+  const showCart = /^(?:cart|view cart|show cart)$/i.test(messageText);
+  const checkoutCart = /^(?:checkout|proceed(?: to checkout)?|buy cart)$/i.test(
+    messageText
+  );
+  const emptyCart = /^(?:empty|empty cart|clear cart)$/i.test(messageText);
   let result;
-  let keepChoices = binding?.pending_choices || null;
   if (negative && binding?.pending_action?.token) {
     result = { message: "Okay, I cancelled that action." };
-    keepChoices = null;
   } else if (choice?.type === "product" && choice.item?.choiceId) {
     const cart = await addUcpCartChoice(userId, choice.item.choiceId, 1, false);
     result = {
       message: `Added ${choice.item.productName || "that product"} to your cart.`,
       cart: publicUcpCart(cart),
+    };
+  } else if (showCart) {
+    result = {
+      message: "Here is your cart.",
+      cart: publicUcpCart(await db.getUcpCart(userId)),
+    };
+  } else if (choice?.type === "cart" && choice.item?.action === "remove") {
+    const cart = await db.getUcpCart(userId);
+    const items = Array.isArray(cart.items) ? cart.items : [];
+    const removedItem = items.find(
+      (item) => String(item.id) === String(choice.item.itemId)
+    );
+    if (!removedItem) {
+      throw Object.assign(new Error("Cart item not found"), { status: 404 });
+    }
+    const saved = await db.saveUcpCart(userId, {
+      items: items.filter((item) => String(item.id) !== String(choice.item.itemId)),
+    });
+    result = {
+      message: `Removed ${removedItem.productName || "that product"} from your cart.`,
+      cart: publicUcpCart(saved),
+    };
+  } else if (
+    emptyCart
+    || (choice?.type === "cart" && choice.item?.action === "empty")
+  ) {
+    result = {
+      message: "Your cart has been emptied.",
+      cart: publicUcpCart(await db.clearUcpCart(userId)),
+    };
+  } else if (
+    checkoutCart
+    || (choice?.type === "cart" && choice.item?.action === "checkout")
+  ) {
+    result = linqUcpCheckoutResult(
+      await createUcpCartCheckout(userId, {
+        merchant: choice?.item?.merchant || null,
+      })
+    );
+  } else if (choice?.type === "checkout" && choice.item?.action) {
+    result = linqUcpCheckoutResult(
+      await decideUcpCartOrder(
+        userId,
+        binding?.pending_choices?.orderId,
+        choice.item.action === "approve"
+      )
+    );
+  } else if (approvalRequest?.toolName === "select_ucp_saved_card") {
+    const selected = await selectUcpSavedCard(userId, approvalRequest.token);
+    const brand = selected.savedCard?.brand || "card";
+    const last4 = selected.savedCard?.last4 || "";
+    result = {
+      ...selected,
+      message: `Selected ${brand}${last4 ? ` ending ${last4}` : ""}. Open Prava's secure page to approve this saved card.`,
     };
   } else {
     const history = await db.getLinqHermesMessages(message.chatId, 23);
@@ -5290,8 +5762,8 @@ async function processLinqMessage(req, message, eventId) {
       content: entry.content,
     }));
     messages.push({ role: "user", content: message.text });
-    const approvalToken = choice?.type === "approval"
-      ? choice.item?.token || null
+    const approvalToken = approvalRequest
+      ? approvalRequest.token
       : affirmative
         ? binding?.pending_action?.token || null
         : null;
@@ -5303,9 +5775,10 @@ async function processLinqMessage(req, message, eventId) {
       language: binding?.response_language || "en-IN",
       approvalToken,
     });
-    keepChoices = linqPendingChoices(result);
   }
+  const keepChoices = linqPendingChoices(result);
   const reply = linqReplyText(result);
+  const replyLink = linqReplyLink(result);
   await db.saveLinqHermesMessage(message.chatId, "user", message.text);
   await db.saveLinqHermesMessage(message.chatId, "assistant", reply);
   await db.saveLinqHermesState(message.chatId, {
@@ -5317,6 +5790,13 @@ async function processLinqMessage(req, message, eventId) {
     text: reply,
     idempotencyKey: `tokko-linq-${eventId}`,
   });
+  if (replyLink) {
+    await linq.sendChatLink({
+      chatId: message.chatId,
+      url: replyLink,
+      idempotencyKey: `tokko-linq-${eventId}-link`,
+    });
+  }
   return {
     processed: true,
     familyLinked: true,
@@ -7351,8 +7831,11 @@ Object.assign(server, {
   MERCHANT_CONSENT_TEXT,
   canonicalPravaCustomerId,
   careRulesInput,
+  completeLinqOnboarding,
+  createUcpCartCheckout,
   createUcpCheckoutQuote,
   createUcpCheckoutWithPayment,
+  decideUcpCartOrder,
   decisionRequestInput,
   executeHermesTool,
   familyAddressInput,
@@ -7360,9 +7843,18 @@ Object.assign(server, {
   handler,
   initializeApplication,
   listPravaMandatesForUser,
+  linqApprovalRequest,
+  linqChatReturnUrl,
+  linqCartChoices,
   linqChoiceRequest,
+  linqOnboardingToken,
+  linqOnboardingUrl,
   linqPendingChoices,
+  linqReplyLink,
   linqReplyText,
+  linqUcpCheckoutResult,
+  linqFamilyUser,
+  verifyLinqOnboardingToken,
   selectLinqFamilyCandidate,
   matchRoute,
   parseBody,

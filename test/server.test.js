@@ -4,7 +4,9 @@ const http = require("node:http");
 process.env.HERMES_ACTION_SECRET ||= "test-hermes-action-secret";
 const server = require("../server.js");
 const db = require("../lib/db.js");
+const auth = require("../lib/auth.js");
 const hermes = require("../lib/hermes.js");
+const linq = require("../lib/linq.js");
 const payments = require("../lib/payments.js");
 const ucp = require("../lib/ucp.js");
 
@@ -292,6 +294,188 @@ test("LINQ text replies expose numbered products and parse selections", () => {
   assert.match(reply, /Reply ADD 1/);
 });
 
+test("LINQ cart and checkout replies preserve Telegram action states", () => {
+  const cart = {
+    items: [{
+      id: "cart-item-1",
+      merchant: "kapiva",
+      productName: "Amla Juice",
+      quantity: 2,
+    }],
+  };
+  const cartChoices = server.linqCartChoices(cart);
+  assert.deepEqual(
+    cartChoices.map((choice) => choice.action),
+    ["remove", "empty", "checkout"]
+  );
+  const cartState = server.linqPendingChoices({ cart });
+  assert.equal(
+    server.linqChoiceRequest("checkout", cartState).item.action,
+    "checkout"
+  );
+  assert.equal(
+    server.linqChoiceRequest("3", cartState).item.action,
+    "checkout"
+  );
+  const cartReply = server.linqReplyText({
+    message: "Added Amla Juice to your cart.",
+    cart,
+  });
+  assert.match(cartReply, /1\. Remove Amla Juice/);
+  assert.match(cartReply, /3\. Proceed to Checkout/);
+  assert.match(cartReply, /reply CHECKOUT/i);
+
+  const checkoutResult = server.linqUcpCheckoutResult({
+    orderId: "11111111-1111-4111-8111-111111111111",
+    approvalRequired: true,
+    merchantName: "Kapiva",
+    currency: "INR",
+    totalAmount: "412.00",
+    totals: [{ label: "Total", amountMinor: 41200 }],
+  });
+  const checkoutState = server.linqPendingChoices(checkoutResult);
+  assert.equal(checkoutState.type, "checkout");
+  assert.equal(
+    server.linqChoiceRequest("YES", checkoutState).item.action,
+    "approve"
+  );
+  assert.equal(
+    server.linqChoiceRequest("2", checkoutState).item.action,
+    "cancel"
+  );
+  const checkoutReply = server.linqReplyText(checkoutResult);
+  assert.match(checkoutReply, /Quote:/);
+  assert.match(checkoutReply, /1\. Approve Checkout/);
+  assert.match(checkoutReply, /2\. Do Not Place Order/);
+});
+
+test("LINQ sends a secure checkout URL as a separate link card", () => {
+  const result = server.linqUcpCheckoutResult({
+    approvalRequired: false,
+    merchantName: "Kapiva",
+    currency: "INR",
+    totalAmount: "412.00",
+    paymentRoute: "mandate",
+    merchantHandoffUrl: "https://merchant.example/checkout/abc",
+  });
+  assert.equal(
+    server.linqReplyLink(result),
+    "https://merchant.example/checkout/abc"
+  );
+  assert.doesNotMatch(server.linqReplyText(result), /https:\/\//);
+  assert.match(server.linqReplyText(result), /tappable secure link card follows/i);
+});
+
+test("LINQ routes a selected UCP saved card directly to Prava", () => {
+  const token = hermes.signApproval({
+    userId: 55,
+    toolName: "select_ucp_saved_card",
+    args: {
+      tokkoFlowId: "11111111-1111-4111-8111-111111111111",
+      paymentMethodId: "9",
+    },
+  });
+  const state = server.linqPendingChoices({
+    cardChoices: [{
+      token,
+      brand: "visa",
+      last4: "2259",
+    }],
+  });
+  const choice = server.linqChoiceRequest("CARD 1", state);
+  assert.equal(choice.item.selectionType, "ucp_saved_card");
+  assert.deepEqual(server.linqApprovalRequest(55, choice), {
+    token,
+    toolName: "select_ucp_saved_card",
+  });
+});
+
+test("LINQ onboarding links are signed, expiring Tokko redirects", () => {
+  const message = {
+    chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+    from: "+919876543210",
+    to: "+12025551234",
+  };
+  const now = Date.parse("2026-08-03T12:00:00.000Z");
+  const token = server.linqOnboardingToken(message, { now, ttlMs: 60_000 });
+  const context = server.verifyLinqOnboardingToken(token, { now: now + 1_000 });
+  assert.equal(context.chatId, message.chatId);
+  assert.equal(context.from, message.from);
+  assert.equal(context.to, message.to);
+  const url = new URL(server.linqOnboardingUrl(message, {
+    now,
+    ttlMs: 60_000,
+  }));
+  assert.equal(url.origin, "https://tokko-drab.vercel.app");
+  assert.equal(url.searchParams.get("linqOnboarding"), token);
+  assert.equal(server.linqChatReturnUrl(message.to), "sms:+12025551234");
+  assert.throws(
+    () => server.verifyLinqOnboardingToken(token, { now: now + 60_001 }),
+    /expired/
+  );
+  assert.throws(
+    () => server.verifyLinqOnboardingToken(`${token}x`, { now }),
+    /invalid/
+  );
+  assert.ok(server.matchRoute("GET", "/api/linq/onboarding/context?token=x"));
+  assert.ok(server.matchRoute("POST", "/api/linq/onboarding/complete"));
+});
+
+test("LINQ onboarding completion binds and resumes the original chat", { concurrency: false }, async () => {
+  const originals = {
+    requireUser: auth.requireUser,
+    getLinqFamilyCandidatesByPhone: db.getLinqFamilyCandidatesByPhone,
+    getProfile: db.getProfile,
+    saveLinqAssignment: db.saveLinqAssignment,
+    saveLinqHermesBinding: db.saveLinqHermesBinding,
+    saveLinqHermesMessage: db.saveLinqHermesMessage,
+    sendChatMessage: linq.sendChatMessage,
+  };
+  const calls = {};
+  try {
+    auth.requireUser = async () => ({ userId: 55 });
+    db.getLinqFamilyCandidatesByPhone = async (phone) => {
+      calls.lookupPhone = phone;
+      return [{ id: 55, is_account_owner: true }];
+    };
+    db.getProfile = async () => ({
+      user_id: 55,
+      linq_phone_number_id: null,
+    });
+    db.saveLinqAssignment = async (...args) => { calls.assignment = args; };
+    db.saveLinqHermesBinding = async (...args) => { calls.binding = args; };
+    db.saveLinqHermesMessage = async (...args) => { calls.message = args; };
+    linq.sendChatMessage = async (input) => { calls.sent = input; };
+    const token = server.linqOnboardingToken({
+      chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+      from: "+919876543210",
+      to: "+12025551234",
+    });
+    const result = await server.completeLinqOnboarding({}, token);
+    assert.equal(result.returnUrl, "sms:+12025551234");
+    assert.equal(calls.lookupPhone, "+919876543210");
+    assert.deepEqual(calls.binding, [
+      "8f392755-6865-4b18-880a-227f9d8b458f",
+      55,
+      "+919876543210",
+      "+12025551234",
+    ]);
+    assert.equal(calls.assignment[1].phone_number, "+12025551234");
+    assert.equal(calls.sent.chatId, "8f392755-6865-4b18-880a-227f9d8b458f");
+    assert.match(calls.sent.text, /back where you left off/i);
+  } finally {
+    Object.assign(auth, { requireUser: originals.requireUser });
+    Object.assign(db, {
+      getLinqFamilyCandidatesByPhone: originals.getLinqFamilyCandidatesByPhone,
+      getProfile: originals.getProfile,
+      saveLinqAssignment: originals.saveLinqAssignment,
+      saveLinqHermesBinding: originals.saveLinqHermesBinding,
+      saveLinqHermesMessage: originals.saveLinqHermesMessage,
+    });
+    Object.assign(linq, { sendChatMessage: originals.sendChatMessage });
+  }
+});
+
 test("LINQ duplicate phones prefer the account owner over dependents", () => {
   const owner = { id: 40, is_account_owner: true };
   const dependent = { id: 44, is_account_owner: false };
@@ -318,6 +502,53 @@ test("LINQ duplicate phones prefer the account owner over dependents", () => {
     null
   );
 });
+
+test(
+  "LINQ resolves a valid Tokko owner without requiring the configured destination",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      getLinqHermesBinding: db.getLinqHermesBinding,
+      getLinqFamilyCandidatesByPhone: db.getLinqFamilyCandidatesByPhone,
+      resolveLinqUser: db.resolveLinqUser,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      saveLinqHermesBinding: db.saveLinqHermesBinding,
+    };
+    let lookedUpPhone = null;
+    let savedBinding = null;
+    try {
+      db.getLinqHermesBinding = async () => null;
+      db.getLinqFamilyCandidatesByPhone = async (phone) => {
+        lookedUpPhone = phone;
+        return [{ id: 40, email: "owner@example.com", is_account_owner: true }];
+      };
+      db.resolveLinqUser = async () => null;
+      db.getUserById = async (id) => ({ id });
+      db.getProfile = async () => null;
+      db.saveLinqHermesBinding = async (...args) => {
+        savedBinding = args;
+      };
+
+      const user = await server.linqFamilyUser({
+        chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+        from: "+919876543210",
+        to: "+12025551234",
+      });
+
+      assert.equal(user.id, 40);
+      assert.equal(lookedUpPhone, "+919876543210");
+      assert.deepEqual(savedBinding, [
+        "8f392755-6865-4b18-880a-227f9d8b458f",
+        40,
+        "+919876543210",
+        "+12025551234",
+      ]);
+    } finally {
+      Object.assign(db, originals);
+    }
+  }
+);
 
 test("Telegram UCP cart groups safe product data without exposing selection tokens", () => {
   const cart = server.publicUcpCart({
