@@ -459,7 +459,7 @@ function Landing({ page, setPage, theme, onTheme }) {
 }
 
 function App() {
-  const [page, setPage] = useState('loading'); const [session, setSession] = useState('checking'); const [state, setState] = useState(null); const [authNotice, setAuthNotice] = useState(''); const [displayName, setDisplayName] = useState(''); const [theme, setTheme] = useState(() => localStorage.getItem('tokko-theme') || 'light');
+  const [page, setPage] = useState('loading'); const [session, setSession] = useState('checking'); const [state, setState] = useState(null); const [authNotice, setAuthNotice] = useState(''); const [displayName, setDisplayName] = useState(''); const [theme, setTheme] = useState(() => localStorage.getItem('tokko-theme') || 'light'); const syncedAtRef = useRef(0);
   const toggleTheme = () => setTheme((current) => current === 'light' ? 'dark' : 'light');
   useEffect(() => { document.documentElement.dataset.theme = theme; localStorage.setItem('tokko-theme', theme); }, [theme]);
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: 'auto' }); }, [page]);
@@ -477,6 +477,28 @@ function App() {
     boot().then((next) => { if (active) routeAuthenticated(next); }).catch((error) => { if (!active) return; const url = new URL(window.location.href); const callback = url.pathname === '/sso-callback' || url.searchParams.get('clerk_oauth') === 'complete'; if (callback) { setAuthNotice(error.message); window.history.replaceState({}, '', '/'); setPage('auth'); } else setPage('landing'); setSession('guest'); });
     return () => { active = false; };
   }, []);
+  useEffect(() => {
+    // A page restored from the browser back/forward cache is a full in-memory
+    // snapshot that never re-runs our data fetching, so it shows stale content.
+    // Reload it so the user always comes back to the current app and state.
+    const onPageShow = (event) => { if (event.persisted) window.location.reload(); };
+    window.addEventListener('pageshow', onPageShow);
+    return () => window.removeEventListener('pageshow', onPageShow);
+  }, []);
+  useEffect(() => {
+    if (session !== 'authenticated') return undefined;
+    // When the tab becomes visible again, re-sync server state (throttled) so a
+    // user returning after a while sees current data, and an expired session is
+    // detected and sent back to sign-in instead of showing a dead logged-in view.
+    const sync = async () => {
+      if (document.visibilityState !== 'visible' || Date.now() - syncedAtRef.current < 15000) return;
+      syncedAtRef.current = Date.now();
+      try { setState(await api('/api/me')); }
+      catch (error) { if (error?.status === 401) { setState(null); setSession('guest'); setPage('auth'); } }
+    };
+    document.addEventListener('visibilitychange', sync);
+    return () => document.removeEventListener('visibilitychange', sync);
+  }, [session]);
   const logout = async () => { try { await api('/api/auth/logout', { method: 'POST' }); } catch {} try { const clerk = await browserClerk(); if (clerk?.session) await clerk.signOut(); } catch {} setState(null); setSession('guest'); setPage('auth'); };
   if (page === 'loading') return <div className="tf-app-loading"><Brand /><LoaderCircle className="tokko-spinner" /><span>Waking your care circle…</span></div>;
   if (['landing', 'explainer'].includes(page)) return <Landing page={page} setPage={setPage} theme={theme} onTheme={toggleTheme} />;
