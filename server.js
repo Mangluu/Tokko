@@ -3680,6 +3680,7 @@ route("GET", "/api/config", async (_req, res) => {
     hermesRuntime: hermesConfiguration.runtime,
     hermesPolicyVersion: hermes.TRAKKO_POLICY_VERSION,
     hermesEndpointUrl: `${BASE_URL}/api/integrations/telegram/hermes`,
+    telegramBotUsername: process.env.TELEGRAM_BOT_USERNAME || null,
     consentPolicyVersion: CONSENT_POLICY_VERSION,
   });
 });
