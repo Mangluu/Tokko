@@ -240,6 +240,8 @@ function FamilyEditor({ state, displayName, submitLabel, onSaved }) {
     if (!members.length) return setStatus({ type: 'error', message: 'Add at least one family member.' });
     const phones = members.map((member) => toE164(member.countryCode, normalizeLocalPhone(member.countryCode, member.localPhone)));
     if (new Set(phones).size !== phones.length) return setStatus({ type: 'error', message: 'Each family member needs a different phone number.' });
+    const ownerLocal = normalizeLocalPhone(ownerPhone.countryCode, ownerPhone.localPhone);
+    if (ownerLocal && phones.includes(toE164(ownerPhone.countryCode, ownerLocal))) return setStatus({ type: 'error', message: 'Your phone and a family member cannot share a number.' });
     setBusy(true); setStatus({ message: 'Saving your family circle…' });
     try {
       const normalizedOwnerPhone = normalizeLocalPhone(ownerPhone.countryCode, ownerPhone.localPhone);
@@ -307,14 +309,16 @@ function SpendingManager({ state, onState, onboarding = false, onContinue }) {
   const cards = state.paymentMethods || [];
   const refreshPayments = async () => {
     setProviderStatus('Refreshing secure payment status…');
-    const [cardResult, mandateResult, nextState] = await Promise.all([api('/api/payments/payment-methods').catch((error) => ({ error: error.message, paymentMethods: state.paymentMethods || [] })), api('/api/payments/mandates').catch((error) => ({ error: error.message, mandates: [] })), api('/api/me')]);
-    onState({ ...nextState, paymentMethods: cardResult.paymentMethods || nextState.paymentMethods }); setMandates(mandateResult.mandates || []); setProviderStatus(cardResult.error || mandateResult.error || 'Payment status is up to date.');
+    try {
+      const [cardResult, mandateResult, nextState] = await Promise.all([api('/api/payments/payment-methods').catch((error) => ({ error: error.message, paymentMethods: state.paymentMethods || [] })), api('/api/payments/mandates').catch((error) => (error.status === 409 ? { mandates: [] } : { error: error.message, mandates: [] })), api('/api/me')]);
+      onState({ ...nextState, paymentMethods: cardResult.paymentMethods || nextState.paymentMethods }); setMandates(mandateResult.mandates || []); setProviderStatus(cardResult.error || mandateResult.error || 'Payment status is up to date.');
+    } catch (error) { setProviderStatus(error.message); }
   };
-  useEffect(() => { if (!onboarding) refreshPayments(); }, []);
+  useEffect(() => { if (!onboarding || new URL(window.location.href).searchParams.has('pravaCard') || new URL(window.location.href).searchParams.has('pravaMandate')) refreshPayments(); }, []);
   useEffect(() => {
     const onFocus = () => { if (new URL(window.location.href).searchParams.has('pravaCard') || new URL(window.location.href).searchParams.has('pravaMandate')) refreshPayments(); };
     window.addEventListener('focus', onFocus); return () => window.removeEventListener('focus', onFocus);
-  });
+  }, []);
   const toggleCategory = (value) => setCategories((current) => current.includes(value) ? current.filter((item) => item !== value) : [...current, value]);
   const save = async () => {
     setBusy(true); setStatus({ message: 'Saving your safety rules…' });
@@ -354,7 +358,7 @@ function HomeView({ state, decisions, setView }) {
 function Dashboard({ state, onState, theme, onTheme, onLogout }) {
   const returned = new URL(window.location.href).searchParams.has('pravaCard') || new URL(window.location.href).searchParams.has('pravaMandate');
   const [view, setView] = useState(returned ? 'spending' : 'home'); const [decisions, setDecisions] = useState([]); const [activity, setActivity] = useState([]); const [loading, setLoading] = useState(true); const [status, setStatus] = useState(null); const [busyDecision, setBusyDecision] = useState(null);
-  const refresh = async () => { setLoading(true); const [decisionResult, activityResult, nextState] = await Promise.all([api('/api/decisions?status=all').catch((error) => ({ decisions: [], error: error.message })), api('/api/activity').catch((error) => ({ activity: [], error: error.message })), api('/api/me')]); setDecisions(decisionResult.decisions || []); setActivity(activityResult.activity || []); onState(nextState); if (decisionResult.error || activityResult.error) setStatus({ type: 'error', message: decisionResult.error || activityResult.error }); setLoading(false); };
+  const refresh = async () => { setLoading(true); try { const [decisionResult, activityResult, nextState] = await Promise.all([api('/api/decisions?status=all').catch((error) => ({ decisions: [], error: error.message })), api('/api/activity').catch((error) => ({ activity: [], error: error.message })), api('/api/me')]); setDecisions(decisionResult.decisions || []); setActivity(activityResult.activity || []); onState(nextState); if (decisionResult.error || activityResult.error) setStatus({ type: 'error', message: decisionResult.error || activityResult.error }); } catch (error) { setStatus({ type: 'error', message: error.message }); } finally { setLoading(false); } };
   useEffect(() => { refresh(); }, []);
   useEffect(() => { window.scrollTo({ top: 0, left: 0, behavior: 'auto' }); }, [view]);
   const resolve = async (decision, resolution) => { setBusyDecision(decision.id); try { await api(`/api/decisions/${decision.id}/resolve`, { method: 'POST', body: { resolution } }); await refresh(); setStatus({ type: 'success', message: resolution === 'approve' ? 'Approved. Tokko can continue.' : 'Declined. Tokko will not place this order.' }); } catch (error) { setStatus({ type: 'error', message: error.message }); } finally { setBusyDecision(null); } };
