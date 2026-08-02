@@ -905,9 +905,8 @@ async function getUserState(userId, clerkUserId = null) {
   const paymentConfigured = payments.configuration().configured;
   const publicAddresses = familyAddressPayload(familyAddresses);
   const publicRules = publicCareRules(careRules);
-  const familyComplete = Boolean(
-    profile && Array.isArray(profile.dependents) && profile.dependents.length > 0
-  );
+  // Family members are optional — a saved profile (owner name + phone) is enough.
+  const familyComplete = Boolean(profile);
   const deliveryComplete = Boolean(publicAddresses.selectedAddress);
   const spendingComplete = Boolean(publicRules);
   const cardReady = paymentMethods.length > 0;
