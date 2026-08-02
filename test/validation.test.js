@@ -9,9 +9,11 @@ const {
   websiteOnboardingInput,
 } = require("../lib/validation.js");
 
-test("website onboarding needs family contacts but not an account phone", () => {
+test("website onboarding needs an account phone but not family contacts", () => {
   const profile = websiteOnboardingInput({
     primaryParentName: "Shivang",
+    primaryParentCountryCode: "+91",
+    primaryParentLocalPhone: "98111 22333",
     dependents: [{
       id: 12,
       name: "Asha",
@@ -20,10 +22,22 @@ test("website onboarding needs family contacts but not an account phone", () => 
       relationshipToUser: "Mother",
     }],
   });
-  assert.equal(profile.primaryParentPhone, null);
+  assert.equal(profile.primaryParentPhone, "+919811122333");
   assert.equal(profile.dependents[0].id, 12);
   assert.equal(profile.dependents[0].phone, "+919876543210");
   assert.equal(profile.merchantAuthPhone, null);
+
+  const withoutFamily = websiteOnboardingInput({
+    primaryParentName: "Shivang",
+    primaryParentPhone: "+919811122333",
+    dependents: [],
+  });
+  assert.equal(withoutFamily.dependents.length, 0);
+
+  assert.throws(
+    () => websiteOnboardingInput({ primaryParentName: "Shivang", dependents: [] }),
+    /primaryParentPhone/
+  );
 });
 
 test("website onboarding rejects duplicate family contacts and account reuse", () => {
