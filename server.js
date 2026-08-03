@@ -152,11 +152,13 @@ function routeAuth(pattern) {
     pattern === "/api/auth/logout" ||
     pattern === "/api/payments/return" ||
     pattern === "/api/payments/linq/options" ||
+    pattern === "/api/payments/linq/direct" ||
     pattern === "/api/payments/linq/options/continue" ||
     pattern === "/api/payments/linq/options/exit" ||
     pattern === "/api/payments/linq/mandate" ||
     pattern === "/api/payments/linq/mandate/continue" ||
     pattern === "/api/payments/telegram/options" ||
+    pattern === "/api/payments/telegram/direct" ||
     pattern === "/api/payments/telegram/options/continue" ||
     pattern === "/api/payments/telegram/options/exit" ||
     pattern === "/api/linq/onboarding/context" ||
@@ -2598,23 +2600,16 @@ async function prepareLinqUcpPaymentChoices(
   );
   const mandateChoices = eligibleMandates
     .map((mandate) => signedLinqMandateChoice(userId, checkout, mandate));
-  if (["linq", "telegram"].includes(returnContext?.channel)) {
+  if (returnContext?.channel === "telegram") {
     const checkoutId = String(
       checkout.tokkoFlowId || checkout.orderId || ""
     );
-    const paymentOptionsUrl = returnContext.channel === "telegram"
-      ? telegramPaymentOptionsUrl({
-          userId,
-          chatId: returnContext.chatId,
-          checkoutId,
-          botUsername: returnContext.botUsername,
-        })
-      : linqPaymentOptionsUrl({
-          userId,
-          chatId: returnContext.chatId,
-          checkoutId,
-          to: returnContext.to,
-        });
+    const directPaymentUrl = telegramDirectPaymentUrl({
+      userId,
+      chatId: returnContext.chatId,
+      checkoutId,
+      botUsername: returnContext.botUsername,
+    });
     return {
       ...checkout,
       merchantHandoffUrl: null,
@@ -2624,19 +2619,55 @@ async function prepareLinqUcpPaymentChoices(
       savedCards: [],
       cardChoices: mandateChoices,
       paymentSelection: {
-        policy: "active_one_time_mandate_or_prava_options",
+        policy: "active_one_time_mandate_or_direct_prava_payment",
         required: true,
         selected: false,
         route: "prava",
         merchantInstrumentSelected: false,
         reason: eligibleMandates.length
-          ? "choose_active_mandate_or_other_prava_payment_method"
-          : "use_other_prava_payment_method",
+          ? "choose_active_mandate_or_direct_prava_payment"
+          : "use_direct_prava_payment",
       },
       nextAction: {
-        type: "prava_payment_options",
-        label: "Use another payment method with Prava",
-        url: paymentOptionsUrl,
+        type: "prava_card_approval",
+        label: "Checkout with Prava",
+        url: directPaymentUrl,
+        checkoutId,
+      },
+    };
+  }
+  if (returnContext?.channel === "linq") {
+    const checkoutId = String(
+      checkout.tokkoFlowId || checkout.orderId || ""
+    );
+    const directPaymentUrl = linqDirectPaymentUrl({
+      userId,
+      chatId: returnContext.chatId,
+      checkoutId,
+      to: returnContext.to,
+    });
+    return {
+      ...checkout,
+      merchantHandoffUrl: null,
+      paymentRoute: "mandate_selection_required",
+      mandateCheck,
+      mandateChoices,
+      savedCards: [],
+      cardChoices: mandateChoices,
+      paymentSelection: {
+        policy: "active_one_time_mandate_or_direct_prava_payment",
+        required: true,
+        selected: false,
+        route: "prava",
+        merchantInstrumentSelected: false,
+        reason: eligibleMandates.length
+          ? "choose_active_mandate_or_direct_prava_payment"
+          : "use_direct_prava_payment",
+      },
+      nextAction: {
+        type: "prava_card_approval",
+        label: "Checkout with Prava",
+        url: directPaymentUrl,
         checkoutId,
       },
     };
@@ -5756,6 +5787,21 @@ route("GET", "/api/payments/linq/options", async (req, res) => {
   );
 });
 
+route("GET", "/api/payments/linq/direct", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyLinqPaymentOptionsToken(query.state);
+  const result = await startLinqPravaPaymentOption(context, {
+    action: "direct_card",
+  });
+  const url = linqPravaNextAction(result.nextAction)?.url;
+  if (!url) {
+    throw Object.assign(new Error("Prava did not return a secure session URL"), {
+      status: 502,
+    });
+  }
+  return sendRedirect(res, url);
+});
+
 route("GET", "/api/payments/linq/options/continue", async (req, res) => {
   const query = getQuery(req);
   const context = verifyLinqPaymentOptionsToken(query.state);
@@ -5851,6 +5897,21 @@ route("GET", "/api/payments/telegram/options", async (req, res) => {
     }),
     { scriptNonce }
   );
+});
+
+route("GET", "/api/payments/telegram/direct", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyTelegramPaymentOptionsToken(query.state);
+  const result = await startLinqPravaPaymentOption(context, {
+    action: "direct_card",
+  });
+  const url = linqPravaNextAction(result.nextAction)?.url;
+  if (!url) {
+    throw Object.assign(new Error("Prava did not return a secure session URL"), {
+      status: 502,
+    });
+  }
+  return sendRedirect(res, url);
 });
 
 route("GET", "/api/payments/telegram/options/continue", async (req, res) => {
@@ -7903,7 +7964,7 @@ async function prepareLinqPaymentRetry(context, error) {
       items: [],
     },
   });
-  const retryUrl = linqPaymentOptionsUrl(context);
+  const retryUrl = linqDirectPaymentUrl(context);
   const exitUrl = new URL(
     "/api/payments/linq/options/exit",
     LINQ_PAYMENT_OPTIONS_PUBLIC_ORIGIN
@@ -7942,7 +8003,7 @@ async function prepareTelegramPaymentRetry(context, error) {
       failureMessage: retryMessage,
     })
   );
-  const retryUrl = telegramPaymentOptionsUrl(context);
+  const retryUrl = telegramDirectPaymentUrl(context);
   const exitUrl = new URL(
     "/api/payments/telegram/options/exit",
     TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN
@@ -8014,7 +8075,10 @@ async function startLinqPravaPaymentOption(context, input = {}) {
   let flow = telegram
     ? await telegramPaymentOptionsCheckout(context)
     : await linqPaymentOptionsCheckout(context);
-  if (flow.status !== "UCP_APPROVED") {
+  const paymentChoiceAvailable = ["UCP_APPROVED", "UCP_REVIEW"].includes(
+    String(flow.status || "")
+  );
+  if (!paymentChoiceAvailable) {
     const pending = linqPendingPravaSession(flow);
     if (!pending) {
       throw Object.assign(
@@ -8818,7 +8882,13 @@ function linqUcpCheckoutResult(checkout = {}) {
     );
     const paymentOptionsAvailable =
       payableCheckout.nextAction?.type === "prava_payment_options";
-    message = paymentOptionsAvailable
+    const directPravaPaymentAvailable =
+      payableCheckout.nextAction?.type === "prava_card_approval";
+    message = directPravaPaymentAvailable
+      ? mandateCount
+        ? `${merchantName} returned a final quote of ${currency} ${total}. Choose one of the active one-time mandates below, or checkout with Prava by card.`
+        : `${merchantName} returned a final quote of ${currency} ${total}. No active one-time mandate can cover this total. Checkout with Prava by card.`
+      : paymentOptionsAvailable
       ? mandateCount
         ? `${merchantName} returned a final quote of ${currency} ${total}. Choose one of the active one-time mandates below, use another payment method with Prava, or type ADD SAVED CARD.`
         : `${merchantName} returned a final quote of ${currency} ${total}. No active one-time mandate can be used for this total. Use another payment method with Prava, or type ADD SAVED CARD.`
@@ -8901,7 +8971,9 @@ function linqPendingChoices(result = {}) {
     };
   }
   if (
-    result.nextAction?.type === "prava_payment_options"
+    ["prava_payment_options", "prava_card_approval"].includes(
+      result.nextAction?.type
+    )
     && /^[0-9a-f-]{36}$/i.test(String(result.nextAction.checkoutId || ""))
   ) {
     return {
@@ -11347,7 +11419,7 @@ async function resumeTelegramCheckoutFlowReturn(context, flow) {
         message:
           "Prava did not complete this card approval. Retry with another payment method or return to Telegram without placing an order.",
         nextAction: {
-          type: "prava_payment_options",
+          type: "prava_card_approval",
           label: "Retry with another payment method",
           url: retry.retryUrl,
         },
@@ -11660,6 +11732,15 @@ function linqPaymentOptionsUrl(context, options = {}) {
   return url.toString();
 }
 
+function linqDirectPaymentUrl(context, options = {}) {
+  const url = new URL(LINQ_PAYMENT_OPTIONS_PUBLIC_ORIGIN);
+  url.pathname = "/api/payments/linq/direct";
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("state", linqPaymentOptionsToken(context, options));
+  return url.toString();
+}
+
 const TELEGRAM_PAYMENT_OPTIONS_TTL_MS = 60 * 60 * 1_000;
 const TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN =
   "https://tokko-shopper.vercel.app";
@@ -11780,6 +11861,18 @@ function verifyTelegramPaymentOptionsToken(token, options = {}) {
 function telegramPaymentOptionsUrl(context, options = {}) {
   const url = new URL(TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN);
   url.pathname = "/api/payments/telegram/options";
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set(
+    "state",
+    telegramPaymentOptionsToken(context, options)
+  );
+  return url.toString();
+}
+
+function telegramDirectPaymentUrl(context, options = {}) {
+  const url = new URL(TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN);
+  url.pathname = "/api/payments/telegram/direct";
   url.search = "";
   url.hash = "";
   url.searchParams.set(
@@ -12311,6 +12404,8 @@ Object.assign(server, {
   linqOnboardingUrl,
   linqPaymentOptionsToken,
   linqPaymentOptionsUrl,
+  linqDirectPaymentUrl,
+  telegramDirectPaymentUrl,
   telegramPaymentOptionsToken,
   verifyTelegramPaymentOptionsToken,
   telegramPaymentOptionsUrl,

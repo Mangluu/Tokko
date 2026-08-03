@@ -2681,12 +2681,18 @@ async def _send_hermes_result(
     if card_choices:
         mandate_setup = result.get("mandateSetup") or result.get("mandate") or {}
         mandate_choice = bool(mandate_setup)
-        combined_payment_options = bool(
+        legacy_payment_options = bool(
             not mandate_choice
             and next_action.get("type") == "prava_payment_options"
             and payment_url.startswith("https://")
         )
-        if combined_payment_options:
+        direct_prava_payment = bool(
+            not mandate_choice
+            and next_action.get("type") == "prava_card_approval"
+            and payment_url.startswith("https://")
+        )
+        combined_payment_options = legacy_payment_options or direct_prava_payment
+        if legacy_payment_options:
             card_choices = [
                 *card_choices,
                 {
@@ -2733,6 +2739,14 @@ async def _send_hermes_result(
                 )]
                 for index, choice in enumerate(card_choices)
             ]
+            if direct_prava_payment:
+                choice_buttons.append([InlineKeyboardButton(
+                    str(
+                        next_action.get("label")
+                        or "Checkout with Prava"
+                    )[:64],
+                    url=payment_url,
+                )])
         await update.effective_message.reply_text(
             (
                 "Choose a saved Prava card for this mandate, or add a new saved card:"

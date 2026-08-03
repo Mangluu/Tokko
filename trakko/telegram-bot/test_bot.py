@@ -796,8 +796,8 @@ class BindingPersistenceTests(unittest.TestCase):
             "ucpcard:9",
         )
 
-    def test_renders_mandate_and_other_payment_as_one_choice_panel(self):
-        payment_url = "https://tokko-shopper.example/payments/options?s=signed"
+    def test_renders_mandate_and_direct_prava_payment_as_one_choice_panel(self):
+        direct_url = "https://tokko-shopper.example/api/payments/telegram/direct?state=signed"
         choices = [{
             "type": "ucp_mandate",
             "label": "Use one-time Prava mandate ending D123",
@@ -818,9 +818,9 @@ class BindingPersistenceTests(unittest.TestCase):
                 "message": "Choose a payment method.",
                 "cardChoices": choices,
                 "nextAction": {
-                    "type": "prava_payment_options",
-                    "label": "Use another payment method with Prava",
-                    "url": payment_url,
+                    "type": "prava_card_approval",
+                    "label": "Checkout with Prava",
+                    "url": direct_url,
                 },
             },
             {"userId": 42},
@@ -828,12 +828,12 @@ class BindingPersistenceTests(unittest.TestCase):
 
         self.assertEqual(message.reply_text.await_count, 1)
         sent = message.reply_text.await_args
-        self.assertIn("Choose one Prava payment option", sent.args[0])
+        self.assertIn("Choose a Prava payment method", sent.args[0])
         markup = sent.kwargs["reply_markup"]
         self.assertEqual(len(markup.inline_keyboard), 2)
         self.assertEqual(
-            [row[0].callback_data for row in markup.inline_keyboard],
-            ["ucpcard:0", "ucpcard:1"],
+            markup.inline_keyboard[0][0].callback_data,
+            "ucpcard:0",
         )
         self.assertEqual(
             markup.inline_keyboard[0][0].text,
@@ -841,12 +841,11 @@ class BindingPersistenceTests(unittest.TestCase):
         )
         self.assertEqual(
             markup.inline_keyboard[1][0].text,
-            "Use another payment method",
+            "Checkout with Prava",
         )
-        self.assertIsNone(markup.inline_keyboard[1][0].url)
-        saved_other = bot._get_pending_ucp_card_sync(1234, 1)
-        self.assertEqual(saved_other["type"], "prava_payment_options")
-        self.assertEqual(saved_other["url"], payment_url)
+        self.assertEqual(markup.inline_keyboard[1][0].url, direct_url)
+        self.assertIsNone(markup.inline_keyboard[1][0].callback_data)
+        self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 1))
 
     def test_other_payment_choice_removes_options_before_revealing_secure_link(self):
         payment_url = "https://tokko-shopper.example/payments/options?s=signed"

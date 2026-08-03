@@ -172,6 +172,7 @@ test("Telegram Hermes integration exposes the configured bot endpoint", () => {
     "/api/integrations/telegram/prava-return"
   ));
   assert.ok(server.matchRoute("GET", "/api/payments/telegram/options?state=x"));
+  assert.ok(server.matchRoute("GET", "/api/payments/telegram/direct?state=x"));
   assert.ok(server.matchRoute(
     "GET",
     "/api/payments/telegram/options/continue?state=x&action=direct_card"
@@ -1319,7 +1320,8 @@ test(
         [...new Set(choices.cardChoices.map((choice) => choice.type))],
         ["ucp_mandate"]
       );
-      assert.equal(choices.nextAction.type, "prava_payment_options");
+      assert.equal(choices.nextAction.type, "prava_card_approval");
+      assert.equal(choices.nextAction.label, "Checkout with Prava");
       const pendingPaymentChoices = server.linqPendingChoices(choices);
       assert.equal(pendingPaymentChoices.checkoutId, flowId);
       assert.equal(
@@ -1330,7 +1332,7 @@ test(
       );
       const optionsUrl = new URL(choices.nextAction.url);
       assert.equal(optionsUrl.origin, "https://tokko-shopper.vercel.app");
-      assert.equal(optionsUrl.pathname, "/api/payments/linq/options");
+      assert.equal(optionsUrl.pathname, "/api/payments/linq/direct");
       const paymentContext = server.verifyLinqPaymentOptionsToken(
         optionsUrl.searchParams.get("state")
       );
@@ -1358,6 +1360,11 @@ test(
         action: "direct_card",
       });
       assert.equal(direct.nextAction.type, "prava_card_approval");
+      assert.equal(
+        direct.nextAction.url,
+        "https://checkout.sandbox.prava.space/s/sess_payment_1"
+      );
+      assert.doesNotMatch(direct.nextAction.url, /tokko-shopper|zepto-shop/i);
       assert.equal(paymentSessionArgs.cardId, null);
       const directCallback = new URL(paymentSessionArgs.callbackUrl);
       assert.equal(
@@ -1632,7 +1639,7 @@ test("LINQ Prava failures offer retry or cart-clearing return to chat", { concur
     assert.equal(savedFlows[0].status, "UCP_APPROVED");
     assert.equal(savedFlows[0].paymentRoute, "payment_selection_required");
     assert.equal(savedStates[0].pendingChoices.type, "payment_options");
-    assert.equal(new URL(retry.retryUrl).pathname, "/api/payments/linq/options");
+    assert.equal(new URL(retry.retryUrl).pathname, "/api/payments/linq/direct");
     assert.equal(
       new URL(retry.returnUrl).pathname,
       "/api/payments/linq/options/exit"
@@ -1996,6 +2003,7 @@ test("LINQ Prava payment-option links are signed, expiring, and public", () => {
     /invalid/
   );
   assert.ok(server.matchRoute("GET", "/api/payments/linq/options?state=x"));
+  assert.ok(server.matchRoute("GET", "/api/payments/linq/direct?state=x"));
   assert.ok(server.matchRoute(
     "GET",
     "/api/payments/linq/options/continue?state=x&action=direct_card"
@@ -2353,6 +2361,18 @@ test("Telegram Prava payment-option links are signed, expiring, and render Teleg
   }));
   assert.equal(url.origin, "https://tokko-shopper.vercel.app");
   assert.equal(url.pathname, "/api/payments/telegram/options");
+  const directUrl = new URL(server.telegramDirectPaymentUrl(paymentContext, {
+    now,
+    ttlMs: 60_000,
+  }));
+  assert.equal(directUrl.pathname, "/api/payments/telegram/direct");
+  assert.equal(
+    server.verifyTelegramPaymentOptionsToken(
+      directUrl.searchParams.get("state"),
+      { now: now + 1_000 }
+    ).checkoutId,
+    paymentContext.checkoutId
+  );
   const page = server.renderLinqPaymentOptionsPage({
     state: token,
     channel: "telegram",
@@ -2670,10 +2690,10 @@ test(
 
       assert.equal(result.credentialIssued, false);
       assert.equal(result.retryPayment, true);
-      assert.equal(result.nextAction.type, "prava_payment_options");
+      assert.equal(result.nextAction.type, "prava_card_approval");
       assert.equal(
         new URL(result.nextAction.url).pathname,
-        "/api/payments/telegram/options"
+        "/api/payments/telegram/direct"
       );
       assert.equal(
         new URL(result.returnUrl).pathname,
@@ -3209,9 +3229,18 @@ test(
         telegramResult.mandateChoices.map((choice) => choice.mandateId),
         ["mdt_any_1", "mdt_any_2", "mdt_any_3", "mdt_any_4"]
       );
+      assert.equal(telegramResult.nextAction.type, "prava_card_approval");
+      assert.equal(
+        telegramResult.nextAction.label,
+        "Checkout with Prava"
+      );
       assert.equal(
         new URL(telegramResult.nextAction.url).pathname,
-        "/api/payments/telegram/options"
+        "/api/payments/telegram/direct"
+      );
+      assert.deepEqual(
+        telegramResult.cardChoices.map((choice) => choice.type),
+        ["ucp_mandate", "ucp_mandate", "ucp_mandate", "ucp_mandate"]
       );
     } finally {
       Object.assign(ucp, { createCheckout: originals.createCheckout });
@@ -3394,7 +3423,7 @@ test(
 );
 
 test(
-  "Telegram UCP checkout with no mandate exposes the shared Prava payment options",
+  "Telegram UCP checkout with no mandate exposes a direct Prava payment choice",
   { concurrency: false },
   async () => {
     const originals = {
@@ -3408,6 +3437,7 @@ test(
       getPaymentCustomer: db.getPaymentCustomer,
       getPaymentMethods: db.getPaymentMethods,
       getFamilyAddresses: db.getFamilyAddresses,
+      getTelegramHermesBinding: db.getTelegramHermesBinding,
       getCheckoutFlow: db.getCheckoutFlow,
       saveCheckoutFlow: db.saveCheckoutFlow,
     };
@@ -3457,6 +3487,9 @@ test(
         contact_phone: "+919900112244",
         is_selected: true,
       }];
+      db.getTelegramHermesBinding = async () => ({
+        user_id: 44,
+      });
       let savedFlow = null;
       db.saveCheckoutFlow = async (flow) => {
         savedFlow = {
@@ -3504,18 +3537,38 @@ test(
         }
       );
       assert.equal(result.paymentRoute, "mandate_selection_required");
-      assert.equal(result.nextAction.type, "prava_payment_options");
-      const optionsUrl = new URL(result.nextAction.url);
-      assert.equal(optionsUrl.pathname, "/api/payments/telegram/options");
-      const optionsContext = server.verifyTelegramPaymentOptionsToken(
-        optionsUrl.searchParams.get("state")
+      assert.equal(result.nextAction.type, "prava_card_approval");
+      assert.equal(
+        result.nextAction.label,
+        "Checkout with Prava"
       );
-      assert.equal(optionsContext.userId, 44);
-      assert.equal(optionsContext.chatId, "7783253227");
-      assert.equal(optionsContext.botUsername, "TokkoBot");
+      const directUrl = new URL(result.nextAction.url);
+      assert.equal(directUrl.pathname, "/api/payments/telegram/direct");
       assert.equal(result.merchantHandoffUrl, null);
       assert.deepEqual(result.cardChoices, []);
+      const launchContext = server.verifyTelegramPaymentOptionsToken(
+        directUrl.searchParams.get("state")
+      );
       assert.equal(sessionArgs, null);
+
+      const directSession = await server.startLinqPravaPaymentOption(
+        launchContext,
+        { action: "direct_card" }
+      );
+      assert.equal(directSession.nextAction.type, "prava_card_approval");
+      assert.equal(
+        directSession.nextAction.url,
+        "https://sandbox.prava.space/approve/sess_nocard"
+      );
+      assert.doesNotMatch(directSession.nextAction.url, /tokko-shopper/i);
+      assert.equal(sessionArgs.cardId, null);
+      const callback = new URL(sessionArgs.callbackUrl);
+      const callbackContext = server.verifyTelegramPravaReturnToken(
+        callback.searchParams.get("state")
+      );
+      assert.equal(callbackContext.channel, "telegram");
+      assert.equal(callbackContext.chatId, "7783253227");
+      assert.equal(callbackContext.botUsername, "TokkoBot");
     } finally {
       Object.assign(ucp, { createCheckout: originals.createCheckout });
       Object.assign(payments, {
@@ -3530,6 +3583,7 @@ test(
         getPaymentCustomer: originals.getPaymentCustomer,
         getPaymentMethods: originals.getPaymentMethods,
         getFamilyAddresses: originals.getFamilyAddresses,
+        getTelegramHermesBinding: originals.getTelegramHermesBinding,
         getCheckoutFlow: originals.getCheckoutFlow,
         saveCheckoutFlow: originals.saveCheckoutFlow,
       });
