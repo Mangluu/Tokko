@@ -796,6 +796,144 @@ class BindingPersistenceTests(unittest.TestCase):
             "ucpcard:9",
         )
 
+    def test_renders_mandate_and_other_payment_as_one_choice_panel(self):
+        payment_url = "https://tokko-shopper.example/payments/options?s=signed"
+        choices = [{
+            "type": "ucp_mandate",
+            "label": "Use one-time Prava mandate ending D123",
+            "token": "signed-mandate-choice",
+            "remaining": "400.00",
+            "currency": "INR",
+        }]
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+
+        asyncio.run(bot._send_hermes_result(
+            update,
+            {
+                "message": "Choose a payment method.",
+                "cardChoices": choices,
+                "nextAction": {
+                    "type": "prava_payment_options",
+                    "label": "Use another payment method with Prava",
+                    "url": payment_url,
+                },
+            },
+            {"userId": 42},
+        ))
+
+        self.assertEqual(message.reply_text.await_count, 1)
+        sent = message.reply_text.await_args
+        self.assertIn("Choose one Prava payment option", sent.args[0])
+        markup = sent.kwargs["reply_markup"]
+        self.assertEqual(len(markup.inline_keyboard), 2)
+        self.assertEqual(
+            [row[0].callback_data for row in markup.inline_keyboard],
+            ["ucpcard:0", "ucpcard:1"],
+        )
+        self.assertEqual(
+            markup.inline_keyboard[0][0].text,
+            "Use one-time Prava mandate · INR 400.00 left",
+        )
+        self.assertEqual(
+            markup.inline_keyboard[1][0].text,
+            "Use another payment method",
+        )
+        self.assertIsNone(markup.inline_keyboard[1][0].url)
+        saved_other = bot._get_pending_ucp_card_sync(1234, 1)
+        self.assertEqual(saved_other["type"], "prava_payment_options")
+        self.assertEqual(saved_other["url"], payment_url)
+
+    def test_other_payment_choice_removes_options_before_revealing_secure_link(self):
+        payment_url = "https://tokko-shopper.example/payments/options?s=signed"
+        bot._set_pending_ucp_cards_sync(1234, [{
+            "type": "prava_payment_options",
+            "label": "Use another payment method",
+            "url": payment_url,
+        }])
+        query = SimpleNamespace(
+            data="ucpcard:0",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=query.message,
+        )
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_select_ucp_card", AsyncMock()) as select_card,
+        ):
+            asyncio.run(bot.select_ucp_saved_card(
+                update,
+                SimpleNamespace(bot=SimpleNamespace()),
+            ))
+
+        query.edit_message_text.assert_awaited_once()
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        self.assertIn(
+            "Payment option selected: Use another payment method",
+            query.edit_message_text.await_args.args[0],
+        )
+        select_card.assert_not_awaited()
+        secure_call = query.message.reply_text.await_args
+        self.assertEqual(secure_call.args[0], "Continue securely with Prava:")
+        secure_button = secure_call.kwargs["reply_markup"].inline_keyboard[0][0]
+        self.assertEqual(secure_button.url, payment_url)
+        self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 0))
+
+    def test_mandate_choice_is_consumed_and_removes_all_payment_buttons(self):
+        choice = {
+            "type": "ucp_mandate",
+            "token": "signed-mandate-choice",
+            "remaining": "400.00",
+            "currency": "INR",
+        }
+        bot._set_pending_ucp_cards_sync(1234, [choice])
+        query = SimpleNamespace(
+            data="ucpcard:0",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            edit_message_reply_markup=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=query.message,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        selected_result = {"message": "Mandate selected."}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_telegram_return_context", AsyncMock(return_value={
+                "returnContext": {"botUsername": "TokkoShopperBot"},
+            })),
+            patch.object(bot, "_select_ucp_card", AsyncMock(return_value=selected_result)) as select_card,
+            patch.object(bot, "_send_hermes_result", AsyncMock()) as send_result,
+        ):
+            asyncio.run(bot.select_ucp_saved_card(update, context))
+
+        query.edit_message_text.assert_awaited_once()
+        query.edit_message_reply_markup.assert_awaited_once_with(reply_markup=None)
+        select_card.assert_awaited_once_with(
+            1234,
+            binding,
+            choice["token"],
+            "TokkoShopperBot",
+        )
+        send_result.assert_awaited_once_with(update, selected_result, binding)
+        self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 0))
+
 
 if __name__ == "__main__":
     unittest.main()

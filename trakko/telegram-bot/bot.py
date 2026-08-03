@@ -595,15 +595,27 @@ def _set_pending_ucp_cards_sync(chat_id: int, choices: list) -> None:
                 {"merchantScope": str(choice.get("merchantScope"))}
                 if choice.get("merchantScope") else {}
             ),
+            **(
+                {"url": str(choice.get("url"))}
+                if choice.get("url") else {}
+            ),
         }
         for choice in choices
-        if (choice.get("token") or choice.get("paymentMethodId"))
+        if (
+            choice.get("token")
+            or choice.get("paymentMethodId")
+            or (
+                choice.get("type") == "prava_payment_options"
+                and str(choice.get("url") or "").startswith("https://")
+            )
+        )
         and (
             str(choice.get("type") or "saved_card") in {
                 "add_card",
                 "different_card",
                 "ucp_mandate",
                 "create_ucp_one_time_mandate",
+                "prava_payment_options",
             }
             or re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
         )
@@ -731,6 +743,35 @@ def _clear_pending_ucp_cards_sync(chat_id: int) -> None:
         conn.close()
 
 
+def _take_pending_ucp_card_sync(chat_id: int, index: int) -> dict | None:
+    """Atomically consume one payment choice so it cannot be submitted twice."""
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute(
+            "DELETE FROM pending_ucp_card_choices "
+            "WHERE expires_at <= CAST(strftime('%s', 'now') AS INTEGER)"
+        )
+        row = conn.execute(
+            "SELECT choices_json FROM pending_ucp_card_choices WHERE chat_id = ?",
+            (chat_id,),
+        ).fetchone()
+        if not row:
+            conn.commit()
+            return None
+        choices = json.loads(row[0])
+        choice = choices[index] if 0 <= index < len(choices) else None
+        if choice is not None:
+            conn.execute(
+                "DELETE FROM pending_ucp_card_choices WHERE chat_id = ?",
+                (chat_id,),
+            )
+        conn.commit()
+        return choice
+    finally:
+        conn.close()
+
+
 def _clear_pending_shopping_context_sync(chat_id: int) -> None:
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -758,6 +799,18 @@ def _card_choice_label(choice: dict, selected: bool = False) -> str:
         f"{prefix}{default}{str(choice.get('brand') or 'Card').title()} "
         f"•••• {choice.get('last4')}"
     )
+
+
+def _prava_payment_choice_label(choice: dict) -> str:
+    choice_type = str(choice.get("type") or "")
+    if choice_type == "ucp_mandate":
+        remaining = str(choice.get("remaining") or "").strip()
+        currency = str(choice.get("currency") or "INR").upper()
+        suffix = f" · {currency} {remaining} left" if remaining else ""
+        return f"Use one-time Prava mandate{suffix}"[:64]
+    if choice_type == "prava_payment_options":
+        return "Use another payment method"
+    return _card_choice_label(choice)
 
 
 def _mandate_frequency_inline_keyboard(amount: str) -> InlineKeyboardMarkup:
@@ -2610,6 +2663,9 @@ async def _send_hermes_result(
                 ),
             ]]),
         )
+    next_action = result.get("nextAction") or {}
+    payment_url = str(next_action.get("url") or result.get("paymentLink") or "")
+    combined_payment_options = False
     card_choices = [
         choice for choice in (result.get("cardChoices") or [])
         if choice.get("token") and (
@@ -2625,6 +2681,20 @@ async def _send_hermes_result(
     if card_choices:
         mandate_setup = result.get("mandateSetup") or result.get("mandate") or {}
         mandate_choice = bool(mandate_setup)
+        combined_payment_options = bool(
+            not mandate_choice
+            and next_action.get("type") == "prava_payment_options"
+            and payment_url.startswith("https://")
+        )
+        if combined_payment_options:
+            card_choices = [
+                *card_choices,
+                {
+                    "type": "prava_payment_options",
+                    "label": "Use another payment method",
+                    "url": payment_url,
+                },
+            ]
         choice_buttons = None
         if mandate_choice:
             amount = _valid_mandate_amount(str(mandate_setup.get("amount") or ""))
@@ -2654,7 +2724,11 @@ async def _send_hermes_result(
             await asyncio.to_thread(_set_pending_ucp_cards_sync, chat_id, card_choices)
             choice_buttons = [
                 [InlineKeyboardButton(
-                    _card_choice_label(choice),
+                    (
+                        _prava_payment_choice_label(choice)
+                        if combined_payment_options
+                        else _card_choice_label(choice)
+                    ),
                     callback_data=f"ucpcard:{index}",
                 )]
                 for index, choice in enumerate(card_choices)
@@ -2663,13 +2737,16 @@ async def _send_hermes_result(
             (
                 "Choose a saved Prava card for this mandate, or add a new saved card:"
                 if mandate_choice
-                else "Choose a Prava payment method:"
+                else (
+                    "Choose one Prava payment option below to continue.\n\n"
+                    "The payment choices will be removed after you select one."
+                    if combined_payment_options
+                    else "Choose a Prava payment method:"
+                )
             ),
             reply_markup=InlineKeyboardMarkup(choice_buttons),
         )
-    next_action = result.get("nextAction") or {}
-    payment_url = str(next_action.get("url") or result.get("paymentLink") or "")
-    if payment_url.startswith("https://"):
+    if payment_url.startswith("https://") and not combined_payment_options:
         handoff = next_action.get("paymentHandoff") or result.get("paymentHandoff") or {}
         await update.effective_message.reply_text(
             "Prava secure approval:",
@@ -3312,7 +3389,7 @@ async def select_ucp_saved_card(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
     query = update.callback_query
-    await query.answer("Applying card choice...")
+    await query.answer("Selecting payment option...")
     chat_id = update.effective_chat.id
     binding = await get_family_binding(chat_id)
     if binding is None:
@@ -3322,28 +3399,48 @@ async def select_ucp_saved_card(
         )
         return
     index = int(query.data.rsplit(":", 1)[-1])
-    choice = await asyncio.to_thread(_get_pending_ucp_card_sync, chat_id, index)
+    choice = await asyncio.to_thread(_take_pending_ucp_card_sync, chat_id, index)
     if not choice:
         await query.message.reply_text(
             "That card choice expired. Ask Tokko to prepare the payment again."
         )
         return
     try:
+        selected_label = _prava_payment_choice_label(choice)
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except Exception:
+            log.exception("Could not remove the selected Prava payment options")
+        try:
+            await query.edit_message_text(
+                f"Payment option selected: {selected_label}\n\n"
+                "Preparing your secure Prava payment...",
+                reply_markup=None,
+            )
+        except Exception:
+            log.exception("Could not replace the selected Prava payment options")
+
+        if choice.get("type") == "prava_payment_options":
+            payment_options_url = str(choice.get("url") or "")
+            if not payment_options_url.startswith("https://"):
+                raise RuntimeError("The secure Prava payment link is no longer valid")
+            await query.message.reply_text(
+                "Continue securely with Prava:",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Open Prava payment options",
+                        url=payment_options_url,
+                    )
+                ]]),
+            )
+            return
+
         return_context = await _telegram_return_context(context)
         result = await _select_ucp_card(
             chat_id,
             binding,
             choice["token"],
             return_context["returnContext"]["botUsername"],
-        )
-        await asyncio.to_thread(_clear_pending_ucp_cards_sync, chat_id)
-        await query.edit_message_reply_markup(
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton(
-                    _card_choice_label(choice, selected=True),
-                    callback_data="selection:done",
-                )
-            ]])
         )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
