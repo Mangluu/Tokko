@@ -1,4 +1,5 @@
 import React, { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { createRoot } from 'react-dom/client';
 import {
   Activity, ArrowLeft, ArrowRight, Bell, Check, CheckCircle2, ChevronRight,
@@ -263,7 +264,7 @@ function Modal({ open, onClose, titleId, children, className = '' }) {
     return () => { document.removeEventListener('keydown', onKeyDown); previous?.focus?.(); };
   }, [open, onClose]);
   if (!open) return null;
-  return <div className="tf-modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} className={`tf-modal ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>{children}</section></div>;
+  return createPortal(<div className="tf-modal-layer" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) onClose(); }}><section ref={dialogRef} className={`tf-modal ${className}`} role="dialog" aria-modal="true" aria-labelledby={titleId}>{children}</section></div>, document.body);
 }
 
 function ConfirmDialog({ open, title, copy, confirmLabel, destructive = false, onConfirm, onClose }) {
