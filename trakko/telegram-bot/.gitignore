@@ -7,3 +7,4 @@ __pycache__/
 .vercel/
 .venv/
 .pytest_cache/
+tmp*/

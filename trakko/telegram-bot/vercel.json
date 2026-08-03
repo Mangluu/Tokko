@@ -4,6 +4,10 @@
     "api/webhook.py": {
       "maxDuration": 300,
       "excludeFiles": "{.env,.env.*,venv/**,__pycache__/**,**/__pycache__/**,*.db}"
+    },
+    "api/prava_return.py": {
+      "maxDuration": 60,
+      "excludeFiles": "{.env,.env.*,venv/**,__pycache__/**,**/__pycache__/**,*.db}"
     }
   },
   "rewrites": [

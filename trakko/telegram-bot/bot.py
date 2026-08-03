@@ -1360,10 +1360,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
         return_payload in {
         "payments_card_return",
         "payments_mandate_return",
+        "payments_checkout_exit",
         }
         or mandate_callback_match is not None
         or card_callback_match is not None
     ):
+        followup_message = None
         try:
             if card_callback_match is not None:
                 compact = card_callback_match.group(1).lower()
@@ -1381,17 +1383,16 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 token = str(credential.get("token") or "").strip()
                 if result.get("tokenIssued") and token:
                     message = (
-                        "You're back from Prava. The saved-card payment-result API "
-                        "returned this single-use sandbox token:\n\n"
-                        f"{token}\n"
-                        f"Transaction: {credential.get('transactionId') or 'pending'}\n"
-                        "This temporary virtual PAN is displayed for testing and is not stored by Tokko."
+                        "Prava checkout was successful, but the order still awaits "
+                        "merchant approval. This cart was cleared."
                     )
+                    followup_message = "Order creation failed at the merchant end."
                 elif result.get("tokenIssued"):
                     message = (
-                        "You're back from Prava. The saved-card payment was approved "
-                        "and Tokko stored only the one-time credential fingerprint."
+                        "Prava checkout was successful, but the order still awaits "
+                        "merchant approval. This cart was cleared."
                     )
+                    followup_message = "Order creation failed at the merchant end."
                 else:
                     message = (
                         "You're back from Prava, but the saved-card payment result is "
@@ -1436,14 +1437,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                 credential = result.get("sandboxPaymentCredential") or {}
                 token = str(credential.get("token") or "").strip()
                 message = (
-                    "You're back from Prava. The mandate is active, and Tokko "
-                    f"called the mandate Charge API for {result.get('currency')} "
-                    f"{result.get('chargeAmount')}.\n\n"
-                    "Prava sandbox token:\n"
-                    f"{token}\n"
-                    f"Transaction: {credential.get('transactionId') or 'pending'}\n"
-                    "This single-use virtual PAN is shown for testing. Tokko stored only its fingerprint."
+                    "Prava checkout was successful, but the order still awaits "
+                    "merchant approval. This cart was cleared."
                 )
+                followup_message = "Order creation failed at the merchant end."
             elif return_payload == "payments_mandate_return":
                 try:
                     checkout_result = await _call_hermes(
@@ -1472,6 +1469,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         has_more=bool(result.get("hasMore")),
                     )
                 )
+            elif return_payload == "payments_checkout_exit":
+                message = (
+                    "Payment was not completed. No merchant order was placed, "
+                    "and the checkout cart was cleared."
+                )
             else:
                 result = await _family_api(binding, "GET", "payment/mandates")
                 message = (
@@ -1492,6 +1494,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             f"{message}\n\nYou are back in the same shopping conversation. Tell me what you need next.",
             reply_markup=MAIN_KEYBOARD,
         )
+        if followup_message:
+            await update.message.reply_text(followup_message)
         return ConversationHandler.END
     if binding is not None:
         try:
@@ -2535,7 +2539,7 @@ async def _send_hermes_result(
     )
     # The saved-card payment step renders its own concise prompt below; its
     # narration ("…returned a final quote… no mandate…") just duplicates it.
-    card_step = bool(result.get("cardChoices")) and not (
+    card_step = bool(result.get("cardChoices")) and not result.get("credentialIssued") and not (
         result.get("mandateSetup") or result.get("mandate")
     )
     # The checkout review / card step each render one consolidated message below,
@@ -2549,6 +2553,9 @@ async def _send_hermes_result(
                 chunk,
                 reply_markup=markup if index == len(chunks) - 1 else None,
             )
+    followup_message = str(result.get("followupMessage") or "").strip()
+    if followup_message:
+        await update.effective_message.reply_text(followup_message[:4000])
     if "cartSummary" in result:
         cart_summary = result.get("cartSummary") or {}
         await update.effective_message.reply_text(
@@ -2730,6 +2737,7 @@ def _ucp_cart_text(cart: dict) -> str:
         lines.append("\nThis legacy cart mixes merchants and must be repaired before checkout.")
     elif groups:
         lines.append("\nThis cart is locked to this merchant. Final charges come from its live UCP quote.")
+        lines.append("To remove an item, type: remove <product name>.")
     if prescription_items:
         lines.append("\nPrescription review, checkout blocked until licensed verification:")
         for item in prescription_items:
@@ -2740,16 +2748,6 @@ def _ucp_cart_text(cart: dict) -> str:
 def _ucp_cart_checkout_markup(cart: dict) -> InlineKeyboardMarkup | None:
     rows = []
     groups = cart.get("merchantGroups") or []
-    for item in cart.get("items") or []:
-        item_id = str(item.get("id") or "")
-        if not re.fullmatch(r"[1-9]\d*", item_id):
-            continue
-        name = str(item.get("productName") or "Product")
-        short = name if len(name) <= 38 else f"{name[:37]}…"
-        rows.append([InlineKeyboardButton(
-            f"🗑 Remove {short}",
-            callback_data=f"cart:remove:{item_id}",
-        )])
     if cart.get("items"):
         rows.append([InlineKeyboardButton("Empty Cart", callback_data="cart:empty")])
     if len(groups) != 1:
@@ -2950,12 +2948,31 @@ async def checkout_ucp_merchant_cart(
         return
     merchant = query.data.rsplit(":", 1)[-1]
     try:
+        return_context = await _telegram_return_context(context)
+        return_context["returnContext"]["chatId"] = str(
+            update.effective_chat.id
+        )
         checkout = await _family_api(
             binding,
             "POST",
             "merchants/ucp/cart/checkout",
             {"merchant": merchant},
         )
+        order_id = str(checkout.get("orderId") or "")
+        if (
+            checkout.get("approvalRequired") is True
+            and re.fullmatch(r"[0-9a-fA-F-]{36}", order_id)
+        ):
+            checkout = await _family_api(
+                binding,
+                "POST",
+                f"merchants/ucp/orders/{order_id}/decision",
+                {
+                    "proceed": True,
+                    "paymentFlow": "prava_direct_card",
+                    **return_context,
+                },
+            )
         await _send_hermes_result(
             update,
             _ucp_checkout_hermes_result(checkout),
@@ -2988,7 +3005,13 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
     mandate_count = int(
         (checkout.get("mandateCheck") or {}).get("checkedMandateCount") or 0
     )
-    if approval_required:
+    payment_action = checkout.get("nextAction") or {}
+    if payment_action.get("type") == "prava_card_approval":
+        message = (
+            f"{merchant_name} returned a final quote of {currency} {total}. "
+            "Open the secure Prava payment link below to continue."
+        )
+    elif approval_required:
         message = (
             f"{merchant_name} returned a complete quote of {currency} {total}, "
             "including shipping and the 3% forex charge. Review it before approving."
@@ -3022,7 +3045,12 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
         },
     }
     handoff_url = str(checkout.get("merchantHandoffUrl") or "")
-    if (
+    if payment_action.get("type") in {
+        "prava_card_approval",
+        "prava_payment_options",
+    }:
+        result["nextAction"] = payment_action
+    elif (
         not approval_required
         and payment_route != "card_selection_required"
         and handoff_url.startswith("https://")
@@ -3042,18 +3070,28 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
 async def decide_ucp_order(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
-    del context
     query = update.callback_query
     _, answer, order_id = query.data.split(":", 2)
     proceed = answer == "yes"
     await query.answer("Confirming price..." if proceed else "Canceling order")
     binding = await get_family_binding(update.effective_chat.id)
     try:
+        decision_payload = {"proceed": proceed}
+        if proceed:
+            return_context = await _telegram_return_context(context)
+            return_context["returnContext"]["chatId"] = str(
+                update.effective_chat.id
+            )
+            decision_payload.update({
+                "paymentFlow": "prava_mandate_selection",
+                "cardChoiceMode": "saved_or_different",
+                **return_context,
+            })
         result = await _family_api(
             binding,
             "POST",
             f"merchants/ucp/orders/{order_id}/decision",
-            {"proceed": proceed},
+            decision_payload,
         )
         if not proceed:
             await asyncio.to_thread(
@@ -3162,23 +3200,10 @@ async def show_ucp_payment_category(
 
 async def _present_ucp_payment_start(query, result: dict, method: str, order_id: str) -> None:
     if result.get("tokenIssued"):
-        selected = result.get("selectedMandate") or {}
-        credential = result.get("sandboxPaymentCredential") or {}
-        suffix = (
-            f" Tokko selected the smallest covering mandate, {selected.get('currency')} {selected.get('remaining')}."
-            if selected.get("id") else ""
-        )
-        token_text = (
-            "\n\nPrava sandbox mandate Charge API token:\n"
-            f"{credential.get('token')}\n"
-            f"Transaction: {credential.get('transactionId') or 'pending'}\n"
-            "This temporary credential is displayed for testing and is not stored by Tokko."
-            if credential.get("token") else ""
-        )
         await query.edit_message_text(
-            "Prava issued a one-time credential. Tokko linked only its fingerprint to this order."
-            f"{suffix}{token_text}"
+            "Prava checkout was successful, but the order still awaits merchant approval."
         )
+        await query.message.reply_text("Order creation failed at the merchant end.")
         return
     url = str(result.get("pravaCheckoutUrl") or "")
     if not url.startswith("https://"):
@@ -3267,24 +3292,18 @@ async def continue_ucp_order_payment(
             f"merchants/ucp/orders/{order_id}/payment/continue",
             {},
         )
-        credential = result.get("sandboxPaymentCredential") or {}
-        token_source = (
-            "saved-card payment-result API"
-            if credential.get("sessionId")
-            else "mandate Charge API"
-        )
-        await query.message.reply_text(
-            (
-                f"Prava returned the sandbox {token_source} token:\n"
-                f"{credential.get('token')}\n"
-                f"Transaction: {credential.get('transactionId') or 'pending'}\n"
-                "This temporary credential is displayed for testing and is not stored by Tokko."
+        if result.get("tokenIssued"):
+            await query.message.reply_text(
+                "Prava checkout was successful, but the order still awaits merchant approval."
             )
-            if result.get("tokenIssued") and credential.get("token")
-            else "Prava returned the one-time credential. Tokko saved only its fingerprint against this order."
-            if result.get("tokenIssued")
-            else f"Prava is still {result.get('pravaStatus') or 'pending'}. Finish approval and retry."
-        )
+            await query.message.reply_text(
+                "Order creation failed at the merchant end."
+            )
+        else:
+            await query.message.reply_text(
+                f"Prava is still {result.get('pravaStatus') or 'pending'}. "
+                "Finish approval and retry."
+            )
     except Exception as exc:
         await query.message.reply_text(f"I couldn't read the Prava payment result: {exc}")
 

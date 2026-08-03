@@ -4,9 +4,11 @@ import asyncio
 import json
 import os
 from http.server import BaseHTTPRequestHandler
+from urllib.parse import urlparse
 
 from telegram import Update
 
+from api.prava_return import handler as PravaReturnHandler
 from bot import _init_db, build_application
 
 
@@ -31,6 +33,9 @@ class handler(BaseHTTPRequestHandler):
         self.wfile.write(encoded)
 
     def do_GET(self) -> None:
+        if urlparse(self.path).path.rstrip("/") == "/api/prava_return":
+            PravaReturnHandler.do_GET(self)
+            return
         self._json_response(
             200,
             {

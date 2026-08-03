@@ -67,12 +67,11 @@ Mandate amounts are per-charge caps, not prepaid wallet balances. Creating a
 mandate does not deduct money. The cardholder opens the returned Prava URL and
 uses OTP/passkey approval there; raw card details never enter this bot.
 
-Card and mandate sessions created from Telegram carry a Telegram return
-context. Prava returns to Tokko's safe callback first, which immediately opens
-the originating bot with a `/start payments_card_return` or
-`/start payments_mandate_return` deep link. The bot then refreshes the family's
-saved cards or mandates. Sessions created on the website continue returning to
-the website.
+UCP checkout card and mandate sessions carry a signed Telegram return context.
+Prava returns to Tokko's safe callback first; the Telegram bridge completes the
+checkout return, posts the result directly into the existing chat, and opens
+that chat without generating a `/start` message. Sessions created on the
+website continue returning to the website.
 
 Hermes confirmations use Telegram inline checkbox-style buttons. A typed
 answer such as `yes`, `approve`, `go ahead`, `no`, or `leave it` works too. The

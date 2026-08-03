@@ -114,13 +114,14 @@ const HERMES_UCP_CHECKOUT_TOOL = {
 const HERMES_MANDATE_TOOL = {
   name: "prepare_payment_mandate",
   description:
-    "Prepare Prava mandate setup and return masked saved-card choices plus an add-new-card choice. Use this when the user asks to create, set up, or approve a payment mandate. Never choose a card on the user's behalf.",
+    "Prepare Prava mandate setup. In LINQ this returns one secure hosted setup link where the user confirms the amount and chooses or adds a saved card. In other channels it may return masked saved-card choices. Use this when the user asks to create, set up, or approve a payment mandate. Never choose a card on the user's behalf.",
   inputSchema: {
     type: "object",
     properties: {
       amount: {
         type: "string",
-        description: "Per-charge mandate cap as a positive decimal amount.",
+        description:
+          "Optional per-charge mandate cap as a positive decimal amount. If omitted, the LINQ hosted setup page asks for it.",
       },
       frequency: {
         type: "string",
@@ -134,7 +135,6 @@ const HERMES_MANDATE_TOOL = {
           "Defaults to any for one_time and listed for recurring mandates.",
       },
     },
-    required: ["amount"],
   },
 };
 
@@ -153,6 +153,12 @@ function routeAuth(pattern) {
     pattern === "/api/payments/return" ||
     pattern === "/api/payments/linq/options" ||
     pattern === "/api/payments/linq/options/continue" ||
+    pattern === "/api/payments/linq/options/exit" ||
+    pattern === "/api/payments/linq/mandate" ||
+    pattern === "/api/payments/linq/mandate/continue" ||
+    pattern === "/api/payments/telegram/options" ||
+    pattern === "/api/payments/telegram/options/continue" ||
+    pattern === "/api/payments/telegram/options/exit" ||
     pattern === "/api/linq/onboarding/context" ||
     pattern === "/.well-known/ucp"
   ) {
@@ -280,14 +286,20 @@ function sendRedirect(res, location, status = 303) {
   res.end();
 }
 
-function sendHtml(res, status, body) {
+function sendHtml(res, status, body, options = {}) {
   const html = String(body || "");
+  const scriptNonce = /^[A-Za-z0-9_-]{16,128}$/.test(
+    String(options.scriptNonce || "")
+  )
+    ? String(options.scriptNonce)
+    : null;
   res.writeHead(status, {
     "Cache-Control": "no-store",
     "Content-Type": "text/html; charset=utf-8",
     "Content-Length": Buffer.byteLength(html),
     "Content-Security-Policy":
       "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; "
+      + (scriptNonce ? `script-src 'nonce-${scriptNonce}'; ` : "")
       + "form-action 'self'; frame-ancestors 'none'",
     "Referrer-Policy": "no-referrer",
     "X-Content-Type-Options": "nosniff",
@@ -1130,13 +1142,30 @@ function pravaReturnCallback(flow, returnContext = {}) {
   if (returnContext?.channel === "telegram") {
     const callbackUrl = new URL("/api/payments/return", callbackBase);
     callbackUrl.searchParams.set("channel", "telegram");
-    callbackUrl.searchParams.set(
-      "bot",
-      telegramBotUsername(returnContext.botUsername, {
-        source: "returnContext.botUsername",
-      })
-    );
-    callbackUrl.searchParams.set("flow", type);
+    if (
+      returnContext.userId
+      && returnContext.chatId
+      && returnContext.checkoutId
+      && returnContext.stage
+    ) {
+      callbackUrl.searchParams.set(
+        "state",
+        telegramPravaReturnToken({
+          ...returnContext,
+          flow: type,
+        })
+      );
+    } else {
+      // Preserve standalone Telegram mandate-management callbacks. UCP
+      // checkout callbacks always use the signed state branch above.
+      callbackUrl.searchParams.set(
+        "bot",
+        telegramBotUsername(returnContext.botUsername, {
+          source: "returnContext.botUsername",
+        })
+      );
+      callbackUrl.searchParams.set("flow", type);
+    }
     return callbackUrl.toString();
   }
 
@@ -1306,6 +1335,50 @@ function telegramMandateIntent(input = {}) {
     amount: value.toFixed(2),
     frequency,
     merchantScope,
+  };
+}
+
+function linqMandateDraft(input = {}) {
+  const rawAmount = String(input.amount ?? "").trim();
+  const normalized = telegramMandateIntent({
+    ...input,
+    amount: rawAmount || "1",
+  });
+  return {
+    ...normalized,
+    amount: rawAmount ? normalized.amount : null,
+  };
+}
+
+function prepareLinqMandateSetupLink(userId, input = {}, returnContext = {}) {
+  if (
+    returnContext?.channel !== "linq"
+    || !/^[0-9a-f-]{36}$/i.test(String(returnContext.chatId || ""))
+    || !/^\+[1-9]\d{6,14}$/.test(String(returnContext.to || ""))
+  ) {
+    throw Object.assign(new Error("A valid LINQ return context is required"), {
+      status: 400,
+    });
+  }
+  const mandate = linqMandateDraft(input);
+  const setupId = nodeCrypto.randomUUID();
+  const url = linqMandateSetupUrl({
+    userId,
+    chatId: returnContext.chatId,
+    setupId,
+    to: returnContext.to,
+    suggestedAmount: mandate.amount,
+    frequency: mandate.frequency,
+    merchantScope: mandate.merchantScope,
+  });
+  return {
+    stage: "hosted_mandate_setup",
+    mandate,
+    nextAction: {
+      type: "prava_mandate_options",
+      label: "Choose mandate amount and card securely",
+      url,
+    },
   };
 }
 
@@ -2525,12 +2598,26 @@ async function prepareLinqUcpPaymentChoices(
   );
   const mandateChoices = eligibleMandates
     .map((mandate) => signedLinqMandateChoice(userId, checkout, mandate));
-  if (returnContext?.channel === "linq") {
+  if (["linq", "telegram"].includes(returnContext?.channel)) {
     const checkoutId = String(
       checkout.tokkoFlowId || checkout.orderId || ""
     );
+    const paymentOptionsUrl = returnContext.channel === "telegram"
+      ? telegramPaymentOptionsUrl({
+          userId,
+          chatId: returnContext.chatId,
+          checkoutId,
+          botUsername: returnContext.botUsername,
+        })
+      : linqPaymentOptionsUrl({
+          userId,
+          chatId: returnContext.chatId,
+          checkoutId,
+          to: returnContext.to,
+        });
     return {
       ...checkout,
+      merchantHandoffUrl: null,
       paymentRoute: "mandate_selection_required",
       mandateCheck,
       mandateChoices,
@@ -2549,12 +2636,7 @@ async function prepareLinqUcpPaymentChoices(
       nextAction: {
         type: "prava_payment_options",
         label: "Use another payment method with Prava",
-        url: linqPaymentOptionsUrl({
-          userId,
-          chatId: returnContext.chatId,
-          checkoutId,
-          to: returnContext.to,
-        }),
+        url: paymentOptionsUrl,
         checkoutId,
       },
     };
@@ -2785,28 +2867,11 @@ async function resolveUcpCheckoutPayment(userId, baseResult, returnContext) {
     };
   }
   if (returnContext?.channel === "telegram") {
-    const choices = await prepareLinqUcpPaymentChoices(userId, checkoutResult);
-    if (!choices.mandateChoices?.length && checkoutResult.tokkoFlowId) {
-      const flow = await db.getCheckoutFlow(userId, checkoutResult.tokkoFlowId);
-      if (flow) {
-        const session = await startHermesPravaCardSession({
-          userId,
-          flow,
-          card: null,
-          amount: Number(checkoutResult.totalAmount),
-          returnContext,
-        });
-        return {
-          ...choices,
-          ...session,
-          mandateCheck: choices.mandateCheck,
-          mandateChoices: choices.mandateChoices,
-          cardChoices: choices.cardChoices,
-          merchantHandoffUrl: null,
-        };
-      }
-    }
-    return choices;
+    return prepareLinqUcpPaymentChoices(
+      userId,
+      checkoutResult,
+      returnContext
+    );
   }
   const savedCards = await syncPravaPaymentMethodsForUser(userId);
   let identity;
@@ -3252,7 +3317,9 @@ async function startUcpPravaCardSession({
     db.getProfile(userId),
   ]);
   const market = String(checkoutResult.market || "IN").trim().toUpperCase();
-  const callbackUrl = pravaReturnCallback("card", returnContext?.channel === "linq"
+  const callbackUrl = pravaReturnCallback("card", ["linq", "telegram"].includes(
+    returnContext?.channel
+  )
     ? {
         ...returnContext,
         userId,
@@ -3273,6 +3340,21 @@ async function startUcpPravaCardSession({
     description: `Authorize ${checkoutResult.merchantName || "merchant"} checkout with Prava.`,
     purchaseContext: ucpPurchaseContext(checkoutResult),
   });
+  const priceBreakdown = {
+    ...checkoutResult,
+    channelPaymentSetup: {
+      channel: String(returnContext?.channel || "").toLowerCase() || null,
+      ...(returnContext?.chatId
+        ? { chatId: String(returnContext.chatId) }
+        : {}),
+      ...(returnContext?.botUsername
+        ? { botUsername: String(returnContext.botUsername) }
+        : {}),
+      purpose: "direct_payment",
+      sessionId: session.sessionId,
+      expiresAt: session.expiresAt || null,
+    },
+  };
   const saved = await db.saveCheckoutFlow(
     flowRecord(flow, {
       status: "UCP_PRAVA_APPROVAL_REQUIRED",
@@ -3287,7 +3369,7 @@ async function startUcpPravaCardSession({
       pravaChargeReportedAt: null,
       pravaSessionId: session.sessionId,
       pravaSessionApprovalUrl: session.approvalUrl,
-      priceBreakdown: checkoutResult,
+      priceBreakdown,
       failureMessage: null,
     })
   );
@@ -3355,12 +3437,14 @@ async function startLinqUcpOneTimeMandate(
       status: 400,
     });
   }
+  const sessionAttemptId = nodeCrypto.randomUUID();
   const callbackUrl = pravaReturnCallback("mandate", {
     ...returnContext,
     channel,
     userId,
     checkoutId: flow.id,
     stage: "ucp_mandate_setup",
+    attemptId: sessionAttemptId,
   });
   const session = await payments.createMandateSession({
     customerId: identity.customerId,
@@ -3373,7 +3457,11 @@ async function startLinqUcpOneTimeMandate(
     phone: profile?.primary_parent_phone || null,
     countryCode: /^[A-Z]{2}$/.test(market) ? market : "IN",
     callbackUrl,
-    externalOrderRef: `tokko_ucp_mandate_${String(flow.id).replace(/-/g, "")}`,
+    externalOrderRef: `tokko_ucp_mdt_${nodeCrypto
+      .createHash("sha256")
+      .update(`${flow.id}:${sessionAttemptId}`)
+      .digest("hex")
+      .slice(0, 40)}`,
     description: `Authorize one payment to ${checkout.merchantName || "merchant"} for this Tokko cart.`,
     purchaseContext: ucpPurchaseContext(checkout),
   });
@@ -3384,6 +3472,9 @@ async function startLinqUcpOneTimeMandate(
       merchantScope: "any",
       mandateIdsBefore: mandatesBefore.map((mandate) => String(mandate.id)),
       sessionId: session.sessionId,
+      attemptId: sessionAttemptId,
+      expiresAt: session.expiresAt || null,
+      paymentMethodId: selectedCard ? String(selectedCard.id) : null,
       requestedAt: new Date().toISOString(),
       channel,
       ...(returnContext.chatId
@@ -3409,17 +3500,24 @@ async function startLinqUcpOneTimeMandate(
       failureMessage: null,
     })
   );
+  const savedCard = selectedCard ? publicUcpCard(selectedCard) : null;
+  const mandateSummary = linqMandateSessionSummary({
+    amount: checkout.totalAmount,
+    currency: checkout.currency || "INR",
+    savedCard,
+  });
   return {
     ...checkout,
     paymentRoute: "mandate_setup",
     status: "MANDATE_APPROVAL_REQUIRED",
     frequency: "one_time",
     merchantScope: "any",
-    savedCard: selectedCard ? publicUcpCard(selectedCard) : null,
+    savedCard,
+    mandateSummary,
     checkoutFlow: checkoutFlow(saved),
     nextAction: {
       type: "prava_mandate_approval",
-      label: "Approve one-time mandate securely with Prava",
+      label: linqMandateApprovalLabel(mandateSummary),
       url: session.approvalUrl,
       checkoutId: flow.id,
     },
@@ -3502,6 +3600,16 @@ async function resumeLinqUcpOneTimeMandate(context) {
   }
   const checkout = canonicalUcpCheckoutAmount(flow.price_breakdown || {});
   const setup = checkout.channelMandateSetup || checkout.linqMandateSetup || {};
+  if (
+    ["linq", "telegram"].includes(setup.channel)
+    && setup.attemptId
+    && String(context.attemptId || "") !== String(setup.attemptId)
+  ) {
+    throw Object.assign(
+      new Error("This Prava return belongs to an older payment attempt"),
+      { status: 409, code: "STALE_PRAVA_ATTEMPT" }
+    );
+  }
   if (
     setup.frequency !== "one_time"
     || !["any", "listed"].includes(setup.merchantScope)
@@ -3598,14 +3706,19 @@ async function startUcpCardChoice(userId, token, returnContext = {}) {
       status: 404,
     });
   }
+  const continueToMandate =
+    returnContext?.stage === "ucp_mandate_card_setup";
+  const callbackStage = continueToMandate
+    ? "ucp_mandate_card_setup"
+    : "ucp_card_setup";
   const methods = await syncPravaPaymentMethodsForUser(userId);
   const session = await createTokenizationSessionForUser(userId, {
-    returnContext: returnContext?.channel === "linq"
+    returnContext: ["linq", "telegram"].includes(returnContext?.channel)
       ? {
           ...returnContext,
           userId,
           checkoutId: flow.id,
-          stage: "ucp_card_setup",
+          stage: callbackStage,
         }
       : returnContext,
   });
@@ -3617,6 +3730,14 @@ async function startUcpCardChoice(userId, token, returnContext = {}) {
         .filter(Boolean),
       tokenizationSessionId: session.sessionId,
       expiresAt: session.expiresAt,
+      purpose: continueToMandate ? "mandate" : "direct_payment",
+      channel: String(returnContext?.channel || "").toLowerCase() || null,
+      ...(returnContext?.chatId
+        ? { chatId: String(returnContext.chatId) }
+        : {}),
+      ...(returnContext?.botUsername
+        ? { botUsername: String(returnContext.botUsername) }
+        : {}),
     },
   };
   const saved = await db.saveCheckoutFlow(
@@ -3638,9 +3759,286 @@ async function startUcpCardChoice(userId, token, returnContext = {}) {
     checkoutFlow: checkoutFlow(saved),
     nextAction: {
       type: "prava_card_enrollment",
-      label: "Add card securely with Prava",
+      label: continueToMandate
+        ? "Add card securely, then create the mandate"
+        : "Add card securely with Prava",
       url: session.approvalUrl,
       checkoutId: flow.id,
+    },
+  };
+}
+
+async function newUcpCardAfterSetup(userId, flow) {
+  const setup = flow.price_breakdown?.pravaCardSetup || {};
+  const before = new Set(
+    (Array.isArray(setup.providerPaymentMethodIdsBefore)
+      ? setup.providerPaymentMethodIdsBefore
+      : []).map(String)
+  );
+  let selected = null;
+  for (let attempt = 0; attempt < 4 && !selected; attempt += 1) {
+    const methods = await syncPravaPaymentMethodsForUser(userId);
+    selected = methods.find((method) =>
+      method.provider_payment_method_id
+      && !before.has(String(method.provider_payment_method_id))
+    ) || null;
+    if (!selected && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  if (!selected) {
+    throw Object.assign(
+      new Error("The new card is not available yet. Finish Prava card setup and try again."),
+      { status: 409 }
+    );
+  }
+  return selected;
+}
+
+async function startLinqSavedCardEnrollment(userId, returnContext = {}) {
+  if (
+    returnContext?.channel !== "linq"
+    || !/^[0-9a-f-]{36}$/i.test(String(returnContext.chatId || ""))
+    || !/^\+[1-9]\d{6,14}$/.test(String(returnContext.to || ""))
+  ) {
+    throw Object.assign(new Error("A valid LINQ return context is required"), {
+      status: 400,
+    });
+  }
+  const methods = await syncPravaPaymentMethodsForUser(userId);
+  const enrollmentId = nodeCrypto.randomUUID();
+  const session = await createTokenizationSessionForUser(userId, {
+    returnContext: {
+      ...returnContext,
+      userId,
+      checkoutId: enrollmentId,
+      stage: "card_enrollment",
+    },
+  });
+  const cardEnrollment = {
+    type: "card_enrollment",
+    checkoutId: enrollmentId,
+    providerPaymentMethodIdsBefore: methods
+      .map((method) => method.provider_payment_method_id)
+      .filter(Boolean),
+    tokenizationSessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+  };
+  return {
+    paymentRoute: "prava_card",
+    status: "CARD_SETUP_REQUIRED",
+    cardEnrollment,
+    nextAction: {
+      type: "prava_card_enrollment",
+      label: "Add card securely with Prava",
+      url: session.approvalUrl,
+    },
+  };
+}
+
+async function completeLinqSavedCardEnrollment(userId, pendingChoices = {}) {
+  const expiry = new Date(pendingChoices.expiresAt || "").getTime();
+  if (Number.isFinite(expiry) && expiry < Date.now()) {
+    throw Object.assign(new Error("The pending card setup expired. Add the card again."), {
+      status: 410,
+    });
+  }
+  const before = new Set(
+    (Array.isArray(pendingChoices.providerPaymentMethodIdsBefore)
+      ? pendingChoices.providerPaymentMethodIdsBefore
+      : []).map(String)
+  );
+  let selected = null;
+  for (let attempt = 0; attempt < 4 && !selected; attempt += 1) {
+    const methods = await syncPravaPaymentMethodsForUser(userId);
+    selected = methods.find((method) =>
+      method.provider_payment_method_id
+      && !before.has(String(method.provider_payment_method_id))
+    ) || null;
+    if (!selected && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  if (!selected) {
+    throw Object.assign(
+      new Error("The new card is not available yet. Finish Prava card setup and return to LINQ again."),
+      { status: 409 }
+    );
+  }
+  return {
+    paymentRoute: "prava_card",
+    status: "CARD_SAVED",
+    savedCard: publicUcpCard(selected),
+    nextAction: null,
+  };
+}
+
+async function linqStandaloneMandateContext(context) {
+  const binding = await db.getLinqHermesBinding(context.chatId);
+  if (
+    !binding
+    || Number(binding.user_id) !== Number(context.userId)
+    || String(binding.to_phone || "") !== String(context.to)
+  ) {
+    throw Object.assign(
+      new Error("This LINQ mandate link is not linked to the family"),
+      { status: 403 }
+    );
+  }
+  return binding;
+}
+
+function linqMandateIntentFromSelection(context, input = {}) {
+  const customAmount = String(input.customAmount ?? input.custom_amount ?? "").trim();
+  const selectedAmount = String(input.amount || "").trim();
+  const amount = customAmount || (selectedAmount === "custom" ? "" : selectedAmount);
+  if (!amount) {
+    throw Object.assign(new Error("Choose or enter a mandate amount"), {
+      status: 400,
+    });
+  }
+  return telegramMandateIntent({
+    amount,
+    frequency: context.frequency,
+    merchantScope: context.merchantScope,
+  });
+}
+
+async function startLinqStandaloneMandateCardEnrollment(context, mandate) {
+  await linqStandaloneMandateContext(context);
+  const methods = await syncPravaPaymentMethodsForUser(context.userId);
+  const session = await createTokenizationSessionForUser(context.userId, {
+    returnContext: {
+      channel: "linq",
+      userId: context.userId,
+      chatId: context.chatId,
+      checkoutId: context.setupId,
+      to: context.to,
+      stage: "linq_mandate_card_enrollment",
+    },
+  });
+  await db.saveLinqHermesState(context.chatId, {
+    pendingAction: null,
+    pendingChoices: {
+      type: "standalone_mandate_card_enrollment",
+      setupId: context.setupId,
+      mandate,
+      providerPaymentMethodIdsBefore: methods
+        .map((method) => method.provider_payment_method_id)
+        .filter(Boolean),
+      tokenizationSessionId: session.sessionId,
+      expiresAt: session.expiresAt,
+      items: [],
+    },
+  });
+  return {
+    status: "CARD_SETUP_REQUIRED",
+    nextAction: {
+      type: "prava_card_enrollment",
+      label: "Add a new saved card securely with Prava",
+      url: session.approvalUrl,
+    },
+  };
+}
+
+async function startLinqStandaloneMandate(context, mandate, paymentMethodId) {
+  await linqStandaloneMandateContext(context);
+  const methods = await activePravaPaymentMethodsForUser(context.userId);
+  const selected = methods.find(
+    (method) => String(method.id) === String(paymentMethodId || "")
+  );
+  if (!selected?.provider_payment_method_id) {
+    throw Object.assign(new Error("Choose an active saved Prava card"), {
+      status: 409,
+    });
+  }
+  const identity = await pravaMandateIdentity(context.userId);
+  const mandatesBefore = await listPravaMandatesForUser(
+    context.userId,
+    identity.customerId
+  );
+  const session = await createPravaMandateForUser(context.userId, {
+    ...mandate,
+    paymentMethodId: selected.id,
+    returnContext: {
+      channel: "linq",
+      userId: context.userId,
+      chatId: context.chatId,
+      checkoutId: context.setupId,
+      to: context.to,
+      stage: "linq_mandate_setup",
+    },
+  });
+  await db.saveLinqHermesState(context.chatId, {
+    pendingAction: null,
+    pendingChoices: {
+      type: "standalone_mandate_setup",
+      setupId: context.setupId,
+      mandate,
+      paymentMethodId: String(selected.id),
+      mandateIdsBefore: mandatesBefore.map((item) => String(item.id)),
+      sessionId: session.sessionId,
+      expiresAt: session.expiresAt,
+      items: [],
+    },
+  });
+  return {
+    status: "MANDATE_APPROVAL_REQUIRED",
+    nextAction: {
+      type: "prava_mandate_approval",
+      label: "Continue securely with Prava",
+      url: session.approvalUrl,
+    },
+  };
+}
+
+async function resumeLinqStandaloneMandate(context, pendingChoices = {}) {
+  const expiry = new Date(pendingChoices.expiresAt || "").getTime();
+  if (Number.isFinite(expiry) && expiry < Date.now()) {
+    throw Object.assign(new Error("The mandate setup session expired"), {
+      status: 410,
+    });
+  }
+  const before = new Set(
+    (Array.isArray(pendingChoices.mandateIdsBefore)
+      ? pendingChoices.mandateIdsBefore
+      : []).map(String)
+  );
+  const identity = await pravaMandateIdentity(context.userId);
+  let created = null;
+  for (let attempt = 0; attempt < 4 && !created; attempt += 1) {
+    const mandates = await listPravaMandatesForUser(
+      context.userId,
+      identity.customerId
+    );
+    created = mandates
+      .filter((mandate) => !before.has(String(mandate.id)))
+      .filter((mandate) =>
+        !/failed|declined|cancelled|canceled|expired|revoked/i.test(
+          `${mandate.status || ""} ${mandate.state || ""}`
+        )
+      )
+      .sort(
+        (left, right) =>
+          Number(mandateActivityTime(right) || 0)
+          - Number(mandateActivityTime(left) || 0)
+      )[0] || null;
+    if (!created && attempt < 3) {
+      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+    }
+  }
+  if (!created) {
+    throw Object.assign(
+      new Error("Prava did not return the newly created mandate"),
+      { status: 409 }
+    );
+  }
+  return {
+    status: "MANDATE_CREATED",
+    mandate: {
+      amount: pendingChoices.mandate?.amount || null,
+      currency: String(created.currency || "INR").toUpperCase(),
+      frequency: pendingChoices.mandate?.frequency || null,
     },
   };
 }
@@ -3652,29 +4050,7 @@ async function resumeUcpAfterCardSetup(context) {
       status: 404,
     });
   }
-  const setup = flow.price_breakdown?.pravaCardSetup || {};
-  const before = new Set(
-    (Array.isArray(setup.providerPaymentMethodIdsBefore)
-      ? setup.providerPaymentMethodIdsBefore
-      : []).map(String)
-  );
-  let selected = null;
-  for (let attempt = 0; attempt < 4 && !selected; attempt += 1) {
-    const methods = await syncPravaPaymentMethodsForUser(context.userId);
-    selected = methods.find((method) =>
-      method.provider_payment_method_id
-      && !before.has(String(method.provider_payment_method_id))
-    ) || null;
-    if (!selected && attempt < 3) {
-      await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
-    }
-  }
-  if (!selected) {
-    throw Object.assign(
-      new Error("The new card is not available yet. Finish Prava card setup and try the link again."),
-      { status: 409 }
-    );
-  }
+  const selected = await newUcpCardAfterSetup(context.userId, flow);
   return startUcpPravaCardSession({
     userId: context.userId,
     flow,
@@ -3685,6 +4061,38 @@ async function resumeUcpAfterCardSetup(context) {
       to: context.to,
     },
   });
+}
+
+async function resumeLinqUcpMandateAfterCardSetup(context) {
+  const flow = await db.getCheckoutFlow(context.userId, context.checkoutId);
+  if (!flow || flow.platform !== "ucp") {
+    throw Object.assign(new Error("This UCP checkout flow is no longer available"), {
+      status: 404,
+    });
+  }
+  if (flow.price_breakdown?.pravaCardSetup?.purpose !== "mandate") {
+    throw Object.assign(new Error("No mandate card setup is waiting"), {
+      status: 409,
+    });
+  }
+  const selected = await newUcpCardAfterSetup(context.userId, flow);
+  const token = hermes.signApproval({
+    userId: context.userId,
+    toolName: "create_ucp_one_time_mandate",
+    args: {
+      tokkoFlowId: flow.id,
+      paymentMethodId: String(selected.id),
+    },
+  });
+  return startLinqUcpOneTimeMandate(
+    context.userId,
+    token,
+    {
+      channel: "linq",
+      chatId: context.chatId,
+      to: context.to,
+    }
+  );
 }
 
 async function consumeUcpPravaPaymentResult(userId, checkoutIdValue) {
@@ -5205,8 +5613,39 @@ route("GET", "/api/payments/return", async (req, res) => {
     const context = verifyLinqPravaReturnToken(query.state);
     const returnUrl = linqChatReturnUrl(context.to);
     try {
-      await handleLinqPravaReturn(context);
+      const result = await handleLinqPravaReturn(context);
+      if (/^https:\/\//.test(String(result.browserRedirectUrl || ""))) {
+        return sendRedirect(res, result.browserRedirectUrl);
+      }
+      if (result.retryPayment === true) {
+        const retry = await prepareLinqPaymentRetry(
+          context,
+          new Error(result.message || "Prava did not complete this payment.")
+        );
+        if (retry) {
+          return sendHtml(res, 200, renderLinqPaymentFailurePage(retry));
+        }
+      }
     } catch (error) {
+      if (error.code === "STALE_PRAVA_ATTEMPT") {
+        const currentFlow = await db.getCheckoutFlow(
+          context.userId,
+          context.checkoutId
+        ).catch(() => null);
+        const pending = linqPendingPravaSession(currentFlow);
+        if (pending) {
+          return sendHtml(res, 200, renderLinqPravaLaunchPage({
+            url: pending.url,
+            label: pending.label,
+            resumed: true,
+            mandateSummary: pending.mandateSummary || null,
+          }));
+        }
+      }
+      const retry = await prepareLinqPaymentRetry(context, error).catch(() => null);
+      if (retry) {
+        return sendHtml(res, 200, renderLinqPaymentFailurePage(retry));
+      }
       const message = `Tokko could not continue the Prava checkout: ${error.message}`
         .slice(0, 10_000);
       await linq.sendChatMessage({
@@ -5224,6 +5663,9 @@ route("GET", "/api/payments/return", async (req, res) => {
     return sendRedirect(res, returnUrl);
   }
   if (query.channel === "telegram") {
+    if (query.state) {
+      return sendRedirect(res, telegramPravaBridgeUrl(query.state));
+    }
     const bot = telegramBotUsername(query.bot, {
       source: "query.bot",
       route: "GET /api/payments/return",
@@ -5240,6 +5682,54 @@ route("GET", "/api/payments/return", async (req, res) => {
   return sendRedirect(res, `${BASE_URL}/`);
 });
 
+route("GET", "/api/payments/linq/mandate", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyLinqMandateSetupToken(query.state);
+  await linqStandaloneMandateContext(context);
+  let cards = [];
+  let cardsUnavailable = false;
+  try {
+    cards = await activePravaPaymentMethodsForUser(context.userId);
+  } catch {
+    cardsUnavailable = true;
+  }
+  return sendHtml(
+    res,
+    200,
+    renderLinqMandateSetupPage({
+      state: query.state,
+      context,
+      cards: cards.map(publicUcpCard),
+      cardsUnavailable,
+    })
+  );
+});
+
+route("GET", "/api/payments/linq/mandate/continue", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyLinqMandateSetupToken(query.state);
+  const mandate = linqMandateIntentFromSelection(context, query);
+  const selectedCard = String(query.card || "").trim();
+  if (!selectedCard) {
+    throw Object.assign(new Error("Choose a saved card or add a new one"), {
+      status: 400,
+    });
+  }
+  const result = selectedCard === "new"
+    ? await startLinqStandaloneMandateCardEnrollment(context, mandate)
+    : await startLinqStandaloneMandate(context, mandate, selectedCard);
+  const url = linqPravaNextAction(result.nextAction)?.url;
+  if (!url) {
+    throw Object.assign(new Error("Prava did not return a secure session URL"), {
+      status: 502,
+    });
+  }
+  return sendHtml(res, 200, renderLinqPravaLaunchPage({
+    url,
+    label: result.nextAction?.label,
+  }));
+});
+
 route("GET", "/api/payments/linq/options", async (req, res) => {
   const query = getQuery(req);
   const context = verifyLinqPaymentOptionsToken(query.state);
@@ -5251,6 +5741,7 @@ route("GET", "/api/payments/linq/options", async (req, res) => {
   } catch {
     cardsUnavailable = true;
   }
+  const scriptNonce = nodeCrypto.randomBytes(18).toString("base64url");
   return sendHtml(
     res,
     200,
@@ -5259,24 +5750,147 @@ route("GET", "/api/payments/linq/options", async (req, res) => {
       flow,
       cards: cards.map(publicUcpCard),
       cardsUnavailable,
-    })
+      scriptNonce,
+    }),
+    { scriptNonce }
   );
 });
 
 route("GET", "/api/payments/linq/options/continue", async (req, res) => {
   const query = getQuery(req);
   const context = verifyLinqPaymentOptionsToken(query.state);
-  const result = await startLinqPravaPaymentOption(context, {
-    action: query.action,
-    paymentMethodId: query.card,
-  });
-  const url = linqPravaNextAction(result.nextAction)?.url;
-  if (!url) {
-    throw Object.assign(new Error("Prava did not return a secure session URL"), {
-      status: 502,
+  try {
+    const result = await startLinqPravaPaymentOption(context, {
+      action: query.action,
+      paymentMethodId: query.card,
     });
+    const url = linqPravaNextAction(result.nextAction)?.url;
+    if (!url) {
+      throw Object.assign(new Error("Prava did not return a secure session URL"), {
+        status: 502,
+      });
+    }
+    if (result.nextAction?.type === "prava_mandate_approval") {
+      const mandateSummary = linqMandateSessionSummary(
+        result.mandateSummary || result
+      );
+      const message = linqMandateSessionMessage(mandateSummary);
+      const attemptKey = nodeCrypto
+        .createHash("sha256")
+        .update(url)
+        .digest("hex")
+        .slice(0, 16);
+      await db.saveLinqHermesMessage(
+        context.chatId,
+        "assistant",
+        message
+      ).catch(() => null);
+      await linq.sendChatMessage({
+        chatId: context.chatId,
+        text: message,
+        idempotencyKey:
+          `tokko-linq-prava-${context.checkoutId}-${attemptKey}-mandate`,
+      }).catch(() => null);
+      const linkDelivered = await linq.sendChatLink({
+        chatId: context.chatId,
+        url,
+        idempotencyKey:
+          `tokko-linq-prava-${context.checkoutId}-${attemptKey}-mandate-link`,
+      }).then(() => true).catch(() => false);
+      if (linkDelivered) {
+        return sendRedirect(res, linqChatReturnUrl(context.to));
+      }
+      return sendHtml(res, 200, renderLinqPravaLaunchPage({
+        url,
+        label: result.nextAction.label,
+        resumed: result.resumed === true,
+        mandateSummary,
+      }));
+    }
+    return sendHtml(res, 200, renderLinqPravaLaunchPage({
+      url,
+      resumed: result.resumed === true,
+      label: result.nextAction?.label,
+    }));
+  } catch (error) {
+    const retry = await prepareLinqPaymentRetry(context, error).catch(() => null);
+    if (!retry) throw error;
+    return sendHtml(res, 200, renderLinqPaymentFailurePage(retry));
   }
-  return sendRedirect(res, url);
+});
+
+route("GET", "/api/payments/linq/options/exit", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyLinqPaymentOptionsToken(query.state);
+  const result = await leaveLinqPaymentCheckout(context);
+  return sendRedirect(res, result.returnUrl);
+});
+
+route("GET", "/api/payments/telegram/options", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyTelegramPaymentOptionsToken(query.state);
+  const flow = await telegramPaymentOptionsCheckout(context);
+  let cards = [];
+  let cardsUnavailable = false;
+  try {
+    cards = await activePravaPaymentMethodsForUser(context.userId);
+  } catch {
+    cardsUnavailable = true;
+  }
+  const scriptNonce = nodeCrypto.randomBytes(18).toString("base64url");
+  return sendHtml(
+    res,
+    200,
+    renderLinqPaymentOptionsPage({
+      state: query.state,
+      flow,
+      cards: cards.map(publicUcpCard),
+      cardsUnavailable,
+      scriptNonce,
+      channel: "telegram",
+    }),
+    { scriptNonce }
+  );
+});
+
+route("GET", "/api/payments/telegram/options/continue", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyTelegramPaymentOptionsToken(query.state);
+  try {
+    const result = await startLinqPravaPaymentOption(context, {
+      action: query.action,
+      paymentMethodId: query.card,
+    });
+    const url = linqPravaNextAction(result.nextAction)?.url;
+    if (!url) {
+      throw Object.assign(new Error("Prava did not return a secure session URL"), {
+        status: 502,
+      });
+    }
+    return sendHtml(res, 200, renderLinqPravaLaunchPage({
+      url,
+      resumed: result.resumed === true,
+      label: result.nextAction?.label,
+      mandateSummary: result.nextAction?.type === "prava_mandate_approval"
+        ? (result.mandateSummary || result)
+        : null,
+    }));
+  } catch (error) {
+    const retry = await prepareTelegramPaymentRetry(context, error)
+      .catch(() => null);
+    if (!retry) throw error;
+    return sendHtml(res, 200, renderLinqPaymentFailurePage({
+      ...retry,
+      channel: "telegram",
+    }));
+  }
+});
+
+route("GET", "/api/payments/telegram/options/exit", async (req, res) => {
+  const query = getQuery(req);
+  const context = verifyTelegramPaymentOptionsToken(query.state);
+  const result = await leaveTelegramPaymentCheckout(context);
+  return sendRedirect(res, result.returnUrl);
 });
 
 route("POST", "/api/payments/tokenization-session", async (req, res) => {
@@ -5772,7 +6386,7 @@ route(
   async (req, res, params) => {
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
-    sendJson(res, 200, publicUcpCart(await db.getUcpCart(userId)));
+    sendJson(res, 200, publicUcpCart(await getActiveUcpCart(userId)));
   }
 );
 
@@ -5800,6 +6414,34 @@ route(
     }
   }
 );
+
+const UCP_CART_IDLE_TTL_MS = 10 * 60 * 1_000;
+
+async function activeUcpCartState(userId, options = {}) {
+  const now = Number(options.now ?? Date.now());
+  const idleMs = Number(options.idleMs ?? UCP_CART_IDLE_TTL_MS);
+  const cart = await db.getUcpCart(Number(userId));
+  const items = Array.isArray(cart?.items) ? cart.items : [];
+  const updatedAt = new Date(cart?.updatedAt || 0).getTime();
+  const abandoned = (
+    items.length > 0
+    && Number.isFinite(now)
+    && Number.isFinite(idleMs)
+    && idleMs > 0
+    && Number.isFinite(updatedAt)
+    && updatedAt > 0
+    && now - updatedAt > idleMs
+  );
+  if (!abandoned) return { cart, abandoned: false };
+  return {
+    cart: await db.clearUcpCart(Number(userId)),
+    abandoned: true,
+  };
+}
+
+async function getActiveUcpCart(userId, options = {}) {
+  return (await activeUcpCartState(userId, options)).cart;
+}
 
 function ucpCartCheckoutFingerprint(items) {
   return (Array.isArray(items) ? items : [])
@@ -5829,7 +6471,7 @@ async function clearUcpCartForCheckoutFlow(userId, flow) {
 
 async function createUcpCartCheckout(userId, input = {}) {
     const normalizedUserId = Number(userId);
-    const cart = await db.getUcpCart(normalizedUserId);
+    const cart = await getActiveUcpCart(normalizedUserId);
     const items = Array.isArray(cart.items) ? cart.items : [];
     if (!items.length) {
       throw Object.assign(new Error("Your cart is empty"), { status: 409 });
@@ -5957,6 +6599,7 @@ async function decideUcpCartOrder(userId, orderIdValue, proceed, options = {}) {
         tokkoFlowId: orderId,
       };
       let result;
+      let paymentSessionPersisted = false;
       if (options.paymentFlow === "prava_mandate_selection") {
         if (!payments.configuration().configured) {
           throw Object.assign(
@@ -5993,19 +6636,38 @@ async function decideUcpCartOrder(userId, orderIdValue, proceed, options = {}) {
               options.cardChoiceMode === "saved_or_different",
           }
         );
+      } else if (options.paymentFlow === "prava_direct_card") {
+        if (!payments.configuration().configured) {
+          throw Object.assign(
+            new Error("Prava card checkout is disabled for this deployment"),
+            { status: 503 }
+          );
+        }
+        result = {
+          ...checkoutResult,
+          ...await startUcpPravaCardSession({
+            userId: normalizedUserId,
+            flow: claimed,
+            card: null,
+            returnContext: options.returnContext || {},
+          }),
+        };
+        paymentSessionPersisted = true;
       } else {
         result = await resolveUcpCheckoutPayment(
           normalizedUserId,
           checkoutResult
         );
       }
-      await db.saveCheckoutFlow(
-        flowRecord(claimed, {
-          status: "UCP_APPROVED",
-          paymentRoute: result.paymentRoute,
-          failureMessage: null,
-        })
-      );
+      if (!paymentSessionPersisted) {
+        await db.saveCheckoutFlow(
+          flowRecord(claimed, {
+            status: "UCP_APPROVED",
+            paymentRoute: result.paymentRoute,
+            failureMessage: null,
+          })
+        );
+      }
       return {
         ...result,
         orderId,
@@ -6048,7 +6710,11 @@ route(
     sendJson(
       res,
       200,
-      await decideUcpCartOrder(userId, params.orderId, body.proceed)
+      await decideUcpCartOrder(userId, params.orderId, body.proceed, {
+        paymentFlow: body.paymentFlow,
+        cardChoiceMode: body.cardChoiceMode,
+        returnContext: body.returnContext,
+      })
     );
   }
 );
@@ -6070,7 +6736,7 @@ route(
   async (req, res, params) => {
     await auth.requireService(req);
     const userId = await resolveOnboardingUserId(params.id);
-    const cart = await db.getUcpCart(userId);
+    const cart = await getActiveUcpCart(userId);
     const items = Array.isArray(cart.items) ? cart.items : [];
     const removedItem = items.find(
       (item) => String(item.id) === String(params.itemId)
@@ -6202,20 +6868,33 @@ function linqPravaReturnToken(context, options = {}) {
     to: String(context?.to || "").trim(),
     stage: String(context?.stage || "").trim(),
     flow: String(context?.flow || "card").trim(),
+    attemptId: context?.attemptId
+      ? String(context.attemptId).trim()
+      : null,
     iat: now,
     exp: now + ttlMs,
   };
   const validFlow =
     (payload.flow === "card"
-      && ["ucp_card_setup", "ucp_payment"].includes(payload.stage))
+      && [
+        "card_enrollment",
+        "linq_mandate_card_enrollment",
+        "ucp_card_setup",
+        "ucp_mandate_card_setup",
+        "ucp_payment",
+      ].includes(
+        payload.stage
+      ))
     || (payload.flow === "mandate"
-      && payload.stage === "ucp_mandate_setup");
+      && ["linq_mandate_setup", "ucp_mandate_setup"].includes(payload.stage));
   if (
     !Number.isSafeInteger(payload.userId)
     || payload.userId <= 0
     || !/^[0-9a-f-]{36}$/i.test(payload.chatId)
     || !/^[0-9a-f-]{36}$/i.test(payload.checkoutId)
     || !/^\+[1-9]\d{6,14}$/.test(payload.to)
+    || (payload.attemptId !== null
+      && !/^[0-9a-f-]{36}$/i.test(payload.attemptId))
     || !validFlow
     || !Number.isFinite(now)
     || !Number.isFinite(ttlMs)
@@ -6274,9 +6953,17 @@ function verifyLinqPravaReturnToken(token, options = {}) {
   const now = Number(options.now ?? Date.now());
   const validFlow =
     (payload?.flow === "card"
-      && ["ucp_card_setup", "ucp_payment"].includes(payload?.stage))
+      && [
+        "card_enrollment",
+        "linq_mandate_card_enrollment",
+        "ucp_card_setup",
+        "ucp_mandate_card_setup",
+        "ucp_payment",
+      ].includes(
+        payload?.stage
+      ))
     || (payload?.flow === "mandate"
-      && payload?.stage === "ucp_mandate_setup");
+      && ["linq_mandate_setup", "ucp_mandate_setup"].includes(payload?.stage));
   if (
     payload?.v !== 1
     || !Number.isSafeInteger(Number(payload.userId))
@@ -6284,6 +6971,9 @@ function verifyLinqPravaReturnToken(token, options = {}) {
     || !/^[0-9a-f-]{36}$/i.test(String(payload.chatId || ""))
     || !/^[0-9a-f-]{36}$/i.test(String(payload.checkoutId || ""))
     || !/^\+[1-9]\d{6,14}$/.test(String(payload.to || ""))
+    || (payload.attemptId !== null
+      && payload.attemptId !== undefined
+      && !/^[0-9a-f-]{36}$/i.test(String(payload.attemptId)))
     || !validFlow
     || !Number.isFinite(Number(payload.iat))
     || !Number.isFinite(Number(payload.exp))
@@ -6305,6 +6995,148 @@ function verifyLinqPravaReturnToken(token, options = {}) {
     to: String(payload.to),
     stage: String(payload.stage),
     flow: String(payload.flow),
+    ...(payload.attemptId
+      ? { attemptId: String(payload.attemptId) }
+      : {}),
+    issuedAt: new Date(Number(payload.iat)).toISOString(),
+    expiresAt: new Date(Number(payload.exp)).toISOString(),
+  };
+}
+
+const TELEGRAM_PRAVA_RETURN_TTL_MS = 60 * 60 * 1_000;
+
+function validTelegramPravaReturnFlow(flow, stage) {
+  return (
+    flow === "card"
+    && ["ucp_mandate_card_setup", "ucp_payment"].includes(stage)
+  ) || (
+    flow === "mandate"
+    && stage === "ucp_mandate_setup"
+  );
+}
+
+function telegramPravaReturnToken(context, options = {}) {
+  const now = Number(options.now ?? Date.now());
+  const ttlMs = Number(options.ttlMs ?? TELEGRAM_PRAVA_RETURN_TTL_MS);
+  const payload = {
+    v: 1,
+    userId: Number(context?.userId),
+    chatId: String(context?.chatId || "").trim(),
+    checkoutId: String(context?.checkoutId || "").trim(),
+    botUsername: String(context?.botUsername || "").trim().replace(/^@/, ""),
+    stage: String(context?.stage || "").trim(),
+    flow: String(context?.flow || "card").trim(),
+    attemptId: context?.attemptId
+      ? String(context.attemptId).trim()
+      : null,
+    iat: now,
+    exp: now + ttlMs,
+  };
+  if (
+    !Number.isSafeInteger(payload.userId)
+    || payload.userId <= 0
+    || !/^-?\d{1,20}$/.test(payload.chatId)
+    || !/^[0-9a-f-]{36}$/i.test(payload.checkoutId)
+    || !telegramBotUsernameDiagnostic(
+      payload.botUsername,
+      "telegramPravaReturnToken.botUsername"
+    ).valid
+    || !validTelegramPravaReturnFlow(payload.flow, payload.stage)
+    || (payload.attemptId !== null
+      && !/^[0-9a-f-]{36}$/i.test(payload.attemptId))
+    || !Number.isFinite(now)
+    || !Number.isFinite(ttlMs)
+    || ttlMs <= 0
+  ) {
+    throw Object.assign(new Error("Invalid Telegram Prava return context"), {
+      status: 400,
+    });
+  }
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`telegram-prava:${encoded}`)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyTelegramPravaReturnToken(token, options = {}) {
+  const value = String(token || "").trim();
+  const [encoded, suppliedSignature, extra] = value.split(".");
+  if (
+    extra !== undefined
+    || !/^[A-Za-z0-9_-]+$/.test(encoded || "")
+    || !/^[A-Za-z0-9_-]+$/.test(suppliedSignature || "")
+  ) {
+    throw Object.assign(new Error("This Telegram Prava return link is invalid"), {
+      status: 400,
+    });
+  }
+  const expected = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`telegram-prava:${encoded}`)
+    .digest();
+  let supplied;
+  try {
+    supplied = Buffer.from(suppliedSignature, "base64url");
+  } catch {
+    supplied = Buffer.alloc(0);
+  }
+  if (
+    supplied.length !== expected.length
+    || !nodeCrypto.timingSafeEqual(supplied, expected)
+  ) {
+    throw Object.assign(new Error("This Telegram Prava return link is invalid"), {
+      status: 400,
+    });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("This Telegram Prava return link is invalid"), {
+      status: 400,
+    });
+  }
+  const now = Number(options.now ?? Date.now());
+  if (
+    payload?.v !== 1
+    || !Number.isSafeInteger(Number(payload.userId))
+    || Number(payload.userId) <= 0
+    || !/^-?\d{1,20}$/.test(String(payload.chatId || ""))
+    || !/^[0-9a-f-]{36}$/i.test(String(payload.checkoutId || ""))
+    || !telegramBotUsernameDiagnostic(
+      payload.botUsername,
+      "verifyTelegramPravaReturnToken.botUsername"
+    ).valid
+    || !validTelegramPravaReturnFlow(payload.flow, payload.stage)
+    || (payload.attemptId !== null
+      && payload.attemptId !== undefined
+      && !/^[0-9a-f-]{36}$/i.test(String(payload.attemptId)))
+    || !Number.isFinite(Number(payload.iat))
+    || !Number.isFinite(Number(payload.exp))
+    || Number(payload.iat) > now + 60_000
+  ) {
+    throw Object.assign(new Error("This Telegram Prava return link is invalid"), {
+      status: 400,
+    });
+  }
+  if (Number(payload.exp) <= now) {
+    throw Object.assign(new Error("This Telegram Prava return link has expired"), {
+      status: 410,
+    });
+  }
+  return {
+    channel: "telegram",
+    userId: Number(payload.userId),
+    chatId: String(payload.chatId),
+    checkoutId: String(payload.checkoutId),
+    botUsername: String(payload.botUsername),
+    stage: String(payload.stage),
+    flow: String(payload.flow),
+    ...(payload.attemptId
+      ? { attemptId: String(payload.attemptId) }
+      : {}),
     issuedAt: new Date(Number(payload.iat)).toISOString(),
     expiresAt: new Date(Number(payload.exp)).toISOString(),
   };
@@ -6523,6 +7355,152 @@ async function linqPaymentOptionsCheckout(
   return flow;
 }
 
+async function telegramPaymentOptionsCheckout(
+  context,
+  { requireAvailable = false } = {}
+) {
+  const binding = await db.getTelegramHermesBinding(context.chatId);
+  if (
+    !binding
+    || Number(binding.user_id) !== Number(context.userId)
+  ) {
+    throw Object.assign(
+      new Error("This Telegram payment link is not linked to the family"),
+      { status: 403 }
+    );
+  }
+  const flow = await db.getCheckoutFlow(context.userId, context.checkoutId);
+  if (!flow || flow.platform !== "ucp") {
+    throw Object.assign(new Error("This checkout is no longer available"), {
+      status: 404,
+    });
+  }
+  if (requireAvailable && flow.status !== "UCP_APPROVED") {
+    throw Object.assign(
+      new Error("A Prava payment method has already been opened for this checkout"),
+      { status: 409 }
+    );
+  }
+  return flow;
+}
+
+const LINQ_PRAVA_SESSION_FALLBACK_TTL_MS = 15 * 60 * 1_000;
+
+function linqPendingPravaSession(flow, options = {}) {
+  const status = String(flow?.status || "");
+  const priceBreakdown = flow?.price_breakdown || {};
+  const mandateSetup = priceBreakdown.channelMandateSetup || {};
+  const cardSetup = priceBreakdown.pravaCardSetup || {};
+  let action = null;
+  let type = null;
+  let label = null;
+  let expiresAt = null;
+  let paymentMethodId = null;
+  let mandateSummary = null;
+  if (status === "UCP_MANDATE_APPROVAL_REQUIRED") {
+    action = "create_mandate";
+    type = "prava_mandate_approval";
+    mandateSummary = linqMandateSessionSummary({
+      amount: flow?.prava_charge_amount || priceBreakdown.totalAmount,
+      currency: priceBreakdown.currency || "INR",
+      savedCard: flow?.card_last4
+        ? { brand: flow.card_brand || "Card", last4: flow.card_last4 }
+        : null,
+    });
+    label = linqMandateApprovalLabel(mandateSummary, "Continue creating");
+    expiresAt = mandateSetup.expiresAt || null;
+    paymentMethodId = mandateSetup.paymentMethodId || null;
+  } else if (status === "UCP_CARD_SETUP_REQUIRED") {
+    action = "add_card";
+    type = "prava_card_enrollment";
+    label = cardSetup.purpose === "mandate"
+      ? "Continue adding a card for this mandate"
+      : "Continue adding a card with Prava";
+    expiresAt = cardSetup.expiresAt || null;
+  } else if (status === "UCP_PRAVA_APPROVAL_REQUIRED") {
+    action = "direct_card";
+    type = "prava_card_approval";
+    label = "Continue payment approval with Prava";
+  }
+  const url = String(flow?.prava_session_approval_url || "");
+  const sessionId = String(flow?.prava_session_id || "");
+  if (
+    !action
+    || !sessionId
+    || !/^https:\/\/[^\s]{1,2039}$/i.test(url)
+  ) return null;
+  const now = Number(options.now ?? Date.now());
+  const explicitExpiry = new Date(expiresAt || "").getTime();
+  const updatedAt = new Date(
+    flow?.updated_at || flow?.created_at || 0
+  ).getTime();
+  const expiry = Number.isFinite(explicitExpiry)
+    ? explicitExpiry
+    : Number.isFinite(updatedAt) && updatedAt > 0
+      ? updatedAt + LINQ_PRAVA_SESSION_FALLBACK_TTL_MS
+      : now + LINQ_PRAVA_SESSION_FALLBACK_TTL_MS;
+  return {
+    action,
+    type,
+    label,
+    url,
+    sessionId,
+    paymentMethodId: paymentMethodId ? String(paymentMethodId) : null,
+    ...(mandateSummary ? { mandateSummary } : {}),
+    expired: Number.isFinite(now) && expiry <= now,
+  };
+}
+
+async function linqPravaSessionCanResume(session) {
+  if (!session || session.expired) return false;
+  try {
+    const result = await payments.getPaymentResult(session.sessionId);
+    const providerStatus = [
+      result?.status,
+      result?.session_status,
+      result?.sessionStatus,
+    ].filter(Boolean).join(" ");
+    return !/failed|declined|cancelled|canceled|expired|revoked/i.test(
+      providerStatus
+    );
+  } catch {
+    // A hosted mandate setup session may not expose payment-result state until
+    // it completes. Its signed URL is still the safest resumable destination.
+    return true;
+  }
+}
+
+async function supersedeLinqPravaSession(flow, reason) {
+  if (flow?.prava_session_id) {
+    await payments.revokeSession(flow.prava_session_id).catch((error) => {
+      console.warn("[payments] Could not revoke superseded LINQ Prava session", {
+        checkoutId: flow.id,
+        message: error.message,
+      });
+    });
+  }
+  const priceBreakdown = { ...(flow?.price_breakdown || {}) };
+  delete priceBreakdown.channelMandateSetup;
+  delete priceBreakdown.linqMandateSetup;
+  delete priceBreakdown.pravaCardSetup;
+  return db.saveCheckoutFlow(
+    flowRecord(flow, {
+      status: "UCP_APPROVED",
+      paymentRoute: "payment_selection_required",
+      pravaMandateId: "",
+      pravaTransactionId: "",
+      pravaChargeReference: "",
+      pravaChargeStatus: "PAYMENT_RETRY_STARTED",
+      pravaChargeReportedAt: null,
+      pravaSessionId: "",
+      pravaSessionApprovalUrl: "",
+      priceBreakdown,
+      failureMessage: String(reason || "The previous Prava session was superseded.")
+        .slice(0, 500),
+    })
+  );
+}
+
 async function activePravaPaymentMethodsForUser(userId) {
   const customer = await db.getPaymentCustomer(userId);
   if (!customer || customer.provider !== "prava") return [];
@@ -6563,12 +7541,143 @@ function escapeHtml(value) {
   })[character]);
 }
 
-function linqPaymentOptionsContinueUrl(state, action, cardId = null) {
+function linqMandateSessionSummary(value = {}) {
+  const priceBreakdown = value.checkoutFlow?.priceBreakdown || {};
+  const sourceCard = value.savedCard || value.checkoutFlow?.card || null;
+  const amount = String(
+    value.amount
+      || value.checkoutFlow?.pravaCharge?.amount
+      || priceBreakdown.totalAmount
+      || ""
+  ).trim();
+  const rawCurrency = String(
+    value.currency || priceBreakdown.currency || "INR"
+  ).trim().toUpperCase();
+  const currency = /^[A-Z]{3}$/.test(rawCurrency) ? rawCurrency : "INR";
+  const last4 = String(sourceCard?.last4 || "").replace(/\D/g, "").slice(-4);
+  const savedCard = last4
+    ? {
+        brand: String(sourceCard?.brand || "Card").trim().slice(0, 40),
+        last4,
+      }
+    : null;
+  return { amount, currency, savedCard };
+}
+
+function linqMandateApprovalLabel(value = {}, verb = "Create") {
+  const summary = linqMandateSessionSummary(value);
+  const amount = summary.amount
+    ? `${summary.currency} ${summary.amount}`
+    : "a";
+  const card = summary.savedCard
+    ? ` with ${summary.savedCard.brand} ending ${summary.savedCard.last4}`
+    : "";
+  return `${verb} ${amount} one-time mandate${card} in Prava`.slice(0, 200);
+}
+
+function linqMandateSessionMessage(value = {}) {
+  const summary = linqMandateSessionSummary(value);
+  const amount = summary.amount
+    ? `${summary.currency} ${summary.amount}`
+    : "shown in Prava";
+  const card = summary.savedCard
+    ? `${summary.savedCard.brand} ending ${summary.savedCard.last4}`
+    : "the card selected in Prava";
+  return `Mandate amount to create: ${amount}. Saved card to use: ${card}. `
+    + "Tap the Prava secure-session link below to approve it.";
+}
+
+function linqPaymentOptionsContinueUrl(
+  state,
+  action,
+  cardId = null,
+  channel = "linq"
+) {
   const query = new URLSearchParams({ state, action });
   if (cardId !== null && cardId !== undefined) {
     query.set("card", String(cardId));
   }
-  return `/api/payments/linq/options/continue?${query.toString()}`;
+  const routeChannel = channel === "telegram" ? "telegram" : "linq";
+  return `/api/payments/${routeChannel}/options/continue?${query.toString()}`;
+}
+
+function renderLinqMandateSetupPage({
+  state,
+  context,
+  cards = [],
+  cardsUnavailable = false,
+}) {
+  const suggestedAmount = String(context?.suggestedAmount || "").trim();
+  const selectedCardId = String(context?.selectedCardId || "");
+  const frequencyLabels = {
+    one_time: "One-time mandate",
+    weekly: "Weekly mandate",
+    monthly: "Monthly mandate",
+    yearly: "Yearly mandate",
+  };
+  const frequency = frequencyLabels[context?.frequency] || "Mandate";
+  const amountChoices = suggestedAmount
+    ? `<label class="amount-choice">
+        <input type="radio" name="amount" value="${escapeHtml(suggestedAmount)}" checked>
+        <span><strong>INR ${escapeHtml(suggestedAmount)}</strong><small>Amount requested in LINQ</small></span>
+      </label>
+      <label class="amount-choice custom">
+        <input type="radio" name="amount" value="custom">
+        <span><strong>Custom amount</strong><small>Enter a different per-charge amount</small>
+          <input class="amount-input" type="number" name="custom_amount" min="0.01" step="0.01" inputmode="decimal" placeholder="Enter amount in INR" autocomplete="off">
+        </span>
+      </label>`
+    : `<input type="hidden" name="amount" value="custom">
+      <label class="amount-field" for="custom-amount">Mandate amount in INR</label>
+      <input id="custom-amount" class="amount-input" type="number" name="custom_amount" min="0.01" step="0.01" inputmode="decimal" placeholder="Enter amount in INR" autocomplete="off" required>`;
+  const cardOptions = cards.map((card) => {
+    const label = `${card.brand || "Card"} ending ${card.last4 || ""}${
+      card.isDefault ? " (default)" : ""
+    }`.trim();
+    const selected = String(card.id) === selectedCardId ? " selected" : "";
+    return `<option value="${escapeHtml(card.id)}"${selected}>${escapeHtml(label)}</option>`;
+  }).join("");
+  const unavailable = cardsUnavailable
+    ? "<p class=\"warning\">Saved cards could not be loaded. You can still add a new saved card securely with Prava.</p>"
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Create a Prava mandate</title>
+  <style>
+    :root{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f6f8;color:#14161a}
+    *{box-sizing:border-box}body{margin:0;padding:32px 16px}.panel{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:28px;box-shadow:0 16px 44px rgba(17,24,39,.08)}
+    h1{font-size:25px;margin:0 0 8px}.summary{margin:0 0 24px;color:#4b5563;line-height:1.5}.section{border-top:1px solid #e5e7eb;padding-top:20px;margin-top:20px}.section h2{font-size:17px;margin:0 0 6px}.section>p{margin:0 0 14px;color:#4b5563;line-height:1.5}.amount-choice{display:flex;gap:12px;align-items:flex-start;border:1px solid #cfd4dc;border-radius:12px;padding:14px;margin-top:10px;cursor:pointer}.amount-choice input[type=radio]{margin-top:4px}.amount-choice span{display:block;flex:1}.amount-choice strong,.amount-choice small{display:block}.amount-choice small{margin-top:3px;color:#6b7280}.amount-field{display:block;font-size:14px;font-weight:700;margin:10px 0 7px}.amount-input,select{display:block;width:100%;min-height:48px;border:1px solid #cfd4dc;border-radius:12px;background:#fff;color:#111827;padding:10px 12px;font:inherit}.custom .amount-input{margin-top:10px}.choice{display:block;width:100%;font:inherit;text-align:center;border-radius:12px;padding:14px 16px;margin-top:20px;font-weight:700;background:#111827;color:#fff;border:0;cursor:pointer}.warning{color:#92400e!important;background:#fffbeb;border-radius:10px;padding:10px 12px}.note{margin-top:20px;font-size:13px;color:#6b7280;line-height:1.5}
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>Create a Prava mandate</h1>
+    <p class="summary">${escapeHtml(frequency)}. Confirm the amount and the saved card to use. Nothing is created until you continue and approve it securely with Prava.</p>
+    <form action="/api/payments/linq/mandate/continue" method="get">
+      <input type="hidden" name="state" value="${escapeHtml(state)}">
+      <section class="section">
+        <h2>1. Confirm mandate amount</h2>
+        <p>Choose the requested amount or enter a custom per-charge amount.</p>
+        ${amountChoices}
+      </section>
+      <section class="section">
+        <h2>2. Choose a card</h2>
+        <p>Select a saved card, or add a new saved card through Prava.</p>
+        ${unavailable}
+        <select name="card" aria-label="Card for mandate" required>
+          ${cardOptions}
+          <option value="new">Add a new saved card</option>
+        </select>
+      </section>
+      <button class="choice" type="submit">Continue securely</button>
+    </form>
+    <p class="note">If you add a card, Prava will return here automatically with that card selected. After mandate approval, you will return to the same LINQ chat.</p>
+  </main>
+</body>
+</html>`;
 }
 
 function renderLinqPaymentOptionsPage({
@@ -6576,28 +7685,44 @@ function renderLinqPaymentOptionsPage({
   flow,
   cards = [],
   cardsUnavailable = false,
+  scriptNonce = null,
+  channel = "linq",
 }) {
+  const chatName = channel === "telegram" ? "Telegram" : "LINQ";
   const checkout = canonicalUcpCheckoutAmount(flow.price_breakdown || {});
   const merchantName = escapeHtml(checkout.merchantName || "the merchant");
   const currency = escapeHtml(String(checkout.currency || "INR").toUpperCase());
   const amount = escapeHtml(checkout.totalAmount || "");
   const directUrl = escapeHtml(
-    linqPaymentOptionsContinueUrl(state, "direct_card")
+    linqPaymentOptionsContinueUrl(state, "direct_card", null, channel)
   );
-  const cardLinks = cards.map((card) => {
-    const label = `${card.brand || "Card"} ending ${card.last4 || ""}`.trim();
-    const href = linqPaymentOptionsContinueUrl(
-      state,
-      "create_mandate",
-      card.id
-    );
-    return `<a class="choice secondary" href="${escapeHtml(href)}">${escapeHtml(label)}</a>`;
+  const addCardUrl = escapeHtml(
+    linqPaymentOptionsContinueUrl(state, "add_card", null, channel)
+  );
+  const continuePath = channel === "telegram"
+    ? "/api/payments/telegram/options/continue"
+    : "/api/payments/linq/options/continue";
+  const cardOptions = cards.map((card) => {
+    const label = `${card.brand || "Card"} ending ${card.last4 || ""}${
+      card.isDefault ? " (default)" : ""
+    }`.trim();
+    return `<option value="${escapeHtml(card.id)}">${escapeHtml(label)}</option>`;
   }).join("");
-  const mandateChoices = cardLinks || (cardsUnavailable
-    ? "<p class=\"muted\">Saved cards could not be loaded. Return to LINQ and retry.</p>"
-    : `<a class="choice secondary" href="${escapeHtml(
-        linqPaymentOptionsContinueUrl(state, "create_mandate")
-      )}">Choose or enter a card securely in Prava</a>`);
+  const mandateChoices = cardOptions
+    ? `<form class="mandate-form" action="${continuePath}" method="get">
+        <input type="hidden" name="state" value="${escapeHtml(state)}">
+        <input type="hidden" name="action" value="create_mandate">
+        <label for="mandate-card">Card for this mandate</label>
+        <select id="mandate-card" name="card" required>
+          <option value="" selected disabled>Select a saved card</option>
+          ${cardOptions}
+        </select>
+        <button id="create-mandate-button" class="choice secondary" type="submit">Create mandate with selected card</button>
+        <p id="mandate-progress" class="progress" role="status" aria-live="polite" hidden>Creating your secure Prava mandate session. This can take a few seconds&hellip;</p>
+      </form>`
+    : (cardsUnavailable
+    ? `<p class="muted">Saved cards could not be loaded. Return to ${chatName} and retry.</p>`
+    : "<p class=\"muted\">No saved card is available for a mandate. Add a new card below first.</p>");
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -6607,7 +7732,7 @@ function renderLinqPaymentOptionsPage({
   <style>
     :root{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f6f8;color:#14161a}
     *{box-sizing:border-box}body{margin:0;padding:32px 16px}.panel{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:28px;box-shadow:0 16px 44px rgba(17,24,39,.08)}
-    h1{font-size:25px;margin:0 0 8px}.summary{margin:0 0 24px;color:#4b5563}.section{border-top:1px solid #e5e7eb;padding-top:20px;margin-top:20px}.section h2{font-size:17px;margin:0 0 6px}.section p{margin:0 0 14px;line-height:1.5}.choice{display:block;text-decoration:none;text-align:center;border-radius:12px;padding:14px 16px;margin-top:10px;font-weight:700;background:#111827;color:#fff}.choice.secondary{background:#fff;color:#111827;border:1px solid #cfd4dc}.muted{color:#6b7280;font-size:14px}.note{margin-top:20px;font-size:13px;color:#6b7280;line-height:1.5}
+    h1{font-size:25px;margin:0 0 8px}.summary{margin:0 0 24px;color:#4b5563}.section{border-top:1px solid #e5e7eb;padding-top:20px;margin-top:20px}.section h2{font-size:17px;margin:0 0 6px}.section p{margin:0 0 14px;line-height:1.5}.choice{display:block;width:100%;font:inherit;text-decoration:none;text-align:center;border-radius:12px;padding:14px 16px;margin-top:10px;font-weight:700;background:#111827;color:#fff;border:0;cursor:pointer}.choice.secondary{background:#fff;color:#111827;border:1px solid #cfd4dc}.choice:disabled{cursor:wait;opacity:.7}.mandate-form label{display:block;font-size:14px;font-weight:700;margin:12px 0 7px}.mandate-form select{display:block;width:100%;min-height:48px;border:1px solid #cfd4dc;border-radius:12px;background:#fff;color:#111827;padding:10px 12px;font:inherit}.progress{margin:10px 0 0;color:#374151;font-size:14px;line-height:1.45}.muted{color:#6b7280;font-size:14px}.note{margin-top:20px;font-size:13px;color:#6b7280;line-height:1.5}
   </style>
 </head>
 <body>
@@ -6621,31 +7746,347 @@ function renderLinqPaymentOptionsPage({
     </section>
     <section class="section">
       <h2>Create a one-time mandate</h2>
-      <p>Choose the card to authorize. After approval, Tokko will charge the new mandate automatically.</p>
+      <p>Choose any active saved card. It can be used whether or not this browser already has an active passkey; Prava will reuse or set up device binding during approval. After approval, Tokko will charge the new mandate automatically.</p>
       ${mandateChoices}
+      <a class="choice secondary" href="${addCardUrl}">Add a new card and create mandate</a>
     </section>
-    <p class="note">Prava uses separate secure sessions for direct payment and mandate setup. You will return to the existing LINQ chat after either flow.</p>
+    <p class="note">Prava uses separate secure sessions for direct payment and mandate setup. You will return to the existing ${chatName} chat after either flow.</p>
+  </main>
+  ${scriptNonce ? `<script nonce="${escapeHtml(scriptNonce)}">
+    (() => {
+      const form = document.querySelector('.mandate-form');
+      const button = document.getElementById('create-mandate-button');
+      const progress = document.getElementById('mandate-progress');
+      if (!form || !button || !progress) return;
+      form.addEventListener('submit', () => {
+        button.disabled = true;
+        button.textContent = 'Creating Prava session\u2026';
+        progress.hidden = false;
+        form.setAttribute('aria-busy', 'true');
+      });
+    })();
+  </script>` : ""}
+</body>
+</html>`;
+}
+
+function renderLinqPaymentFailurePage({
+  message,
+  retryUrl,
+  returnUrl,
+  channel = "linq",
+}) {
+  const chatName = channel === "telegram" ? "Telegram" : "LINQ";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Prava payment was not completed</title>
+  <style>
+    :root{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f6f8;color:#14161a}
+    *{box-sizing:border-box}body{margin:0;padding:32px 16px}.panel{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:28px;box-shadow:0 16px 44px rgba(17,24,39,.08)}
+    h1{font-size:25px;margin:0 0 10px}.summary{margin:0;color:#4b5563;line-height:1.55}.choice{display:block;width:100%;text-decoration:none;text-align:center;border-radius:12px;padding:14px 16px;margin-top:14px;font-weight:700;background:#111827;color:#fff;border:1px solid #111827}.choice.secondary{background:#fff;color:#111827;border-color:#cfd4dc}.note{margin-top:20px;font-size:13px;color:#6b7280;line-height:1.5}
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>Payment was not completed</h1>
+    <p class="summary">${escapeHtml(message || "Prava did not complete this payment.")} No merchant order was placed.</p>
+    <a class="choice" href="${escapeHtml(retryUrl)}">Retry with another payment method</a>
+    <a class="choice secondary" href="${escapeHtml(returnUrl)}">Return to ${chatName} without placing order</a>
+    <p class="note">Retrying keeps this checkout available. Returning to ${chatName} clears this cart.</p>
   </main>
 </body>
 </html>`;
 }
 
-async function startLinqPravaPaymentOption(context, input = {}) {
-  const flow = await linqPaymentOptionsCheckout(context, {
-    requireAvailable: true,
+function renderLinqPravaLaunchPage({
+  url,
+  label,
+  resumed = false,
+  mandateSummary = null,
+}) {
+  const destination = String(url || "");
+  if (!/^https:\/\/[^\s]{1,2039}$/i.test(destination)) {
+    throw Object.assign(new Error("Prava did not return a secure session URL"), {
+      status: 502,
+    });
+  }
+  const safeUrl = escapeHtml(destination);
+  const mandate = mandateSummary
+    ? linqMandateSessionSummary(mandateSummary)
+    : null;
+  const action = escapeHtml(
+    label || (mandate
+      ? linqMandateApprovalLabel(
+          mandate,
+          resumed ? "Continue creating" : "Create"
+        )
+      : "Continue securely with Prava")
+  );
+  const mandateCard = mandate?.savedCard
+    ? `${escapeHtml(mandate.savedCard.brand)} ending ${escapeHtml(mandate.savedCard.last4)}`
+    : "Select a saved card in Prava";
+  const mandateDetails = mandate
+    ? `<dl class="details">
+        <div><dt>Mandate amount</dt><dd>${escapeHtml(mandate.currency)} ${escapeHtml(mandate.amount)}</dd></div>
+        <div><dt>Saved card</dt><dd>${mandateCard}</dd></div>
+      </dl>`
+    : "";
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  ${mandate ? "" : `<meta http-equiv="refresh" content="1;url=${safeUrl}">`}
+  <title>${mandate ? "Prava mandate session ready" : "Opening Prava"}</title>
+  <style>
+    :root{color-scheme:light;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:#f5f6f8;color:#14161a}
+    *{box-sizing:border-box}body{margin:0;padding:32px 16px}.panel{max-width:560px;margin:0 auto;background:#fff;border:1px solid #e5e7eb;border-radius:20px;padding:28px;box-shadow:0 16px 44px rgba(17,24,39,.08)}
+    h1{font-size:25px;margin:0 0 10px}.summary{margin:0;color:#4b5563;line-height:1.55}.details{margin:18px 0 0;border:1px solid #e5e7eb;border-radius:12px;overflow:hidden}.details div{display:flex;justify-content:space-between;gap:20px;padding:12px 14px}.details div+div{border-top:1px solid #e5e7eb}.details dt{color:#6b7280}.details dd{margin:0;text-align:right;font-weight:700}.choice{display:block;width:100%;text-decoration:none;text-align:center;border-radius:12px;padding:14px 16px;margin-top:18px;font-weight:700;background:#111827;color:#fff;border:1px solid #111827}.note{margin-top:16px;font-size:13px;color:#6b7280;line-height:1.5}
+  </style>
+</head>
+<body>
+  <main class="panel">
+    <h1>${mandate
+      ? (resumed
+        ? "Your Prava mandate session is ready again"
+        : "Prava mandate session ready")
+      : (resumed ? "Reopening your Prava session" : "Prava session created")}</h1>
+    <p class="summary">${mandate
+      ? "Review the mandate amount and saved card, then open the secure Prava session."
+      : resumed
+        ? "Your existing payment attempt is still available. Tokko is reopening it now."
+        : "Your selection went through. Tokko is opening Prava for secure approval now."}</p>
+    ${mandateDetails}
+    <a class="choice" href="${safeUrl}">${action}</a>
+    <p class="note">${mandate
+      ? "The mandate is created only after you approve it in Prava."
+      : "If Prava does not open automatically, tap the button above."}</p>
+  </main>
+</body>
+</html>`;
+}
+
+async function prepareLinqPaymentRetry(context, error) {
+  const flow = await db.getCheckoutFlow(context.userId, context.checkoutId);
+  if (!flow || flow.platform !== "ucp") return null;
+  if ([
+    "UCP_MANDATE_CREDENTIAL_ISSUED",
+    "UCP_PRAVA_CREDENTIAL_ISSUED",
+  ].includes(String(flow.status || ""))) {
+    return null;
+  }
+  const retryMessage = String(
+    error?.message || "Prava did not complete this payment."
+  ).slice(0, 500);
+  await db.saveCheckoutFlow(
+    flowRecord(flow, {
+      status: "UCP_APPROVED",
+      paymentRoute: "payment_selection_required",
+      pravaMandateId: "",
+      pravaTransactionId: "",
+      pravaChargeReference: "",
+      pravaChargeStatus: "PAYMENT_RETRY_REQUIRED",
+      pravaChargeReportedAt: null,
+      pravaSessionId: "",
+      pravaSessionApprovalUrl: "",
+      failureMessage: retryMessage,
+    })
+  );
+  await db.saveLinqHermesState(context.chatId, {
+    pendingAction: null,
+    pendingChoices: {
+      type: "payment_options",
+      checkoutId: String(context.checkoutId),
+      items: [],
+    },
   });
-  const action = String(input.action || "");
-  const returnContext = {
-    channel: "linq",
-    chatId: context.chatId,
-    to: context.to,
+  const retryUrl = linqPaymentOptionsUrl(context);
+  const exitUrl = new URL(
+    "/api/payments/linq/options/exit",
+    LINQ_PAYMENT_OPTIONS_PUBLIC_ORIGIN
+  );
+  exitUrl.searchParams.set("state", linqPaymentOptionsToken(context));
+  return {
+    message: retryMessage,
+    retryUrl,
+    returnUrl: exitUrl.toString(),
   };
+}
+
+async function prepareTelegramPaymentRetry(context, error) {
+  const flow = await db.getCheckoutFlow(context.userId, context.checkoutId);
+  if (!flow || flow.platform !== "ucp") return null;
+  if ([
+    "UCP_MANDATE_CREDENTIAL_ISSUED",
+    "UCP_PRAVA_CREDENTIAL_ISSUED",
+  ].includes(String(flow.status || ""))) {
+    return null;
+  }
+  const retryMessage = String(
+    error?.message || "Prava did not complete this payment."
+  ).slice(0, 500);
+  await db.saveCheckoutFlow(
+    flowRecord(flow, {
+      status: "UCP_APPROVED",
+      paymentRoute: "payment_selection_required",
+      pravaMandateId: "",
+      pravaTransactionId: "",
+      pravaChargeReference: "",
+      pravaChargeStatus: "PAYMENT_RETRY_REQUIRED",
+      pravaChargeReportedAt: null,
+      pravaSessionId: "",
+      pravaSessionApprovalUrl: "",
+      failureMessage: retryMessage,
+    })
+  );
+  const retryUrl = telegramPaymentOptionsUrl(context);
+  const exitUrl = new URL(
+    "/api/payments/telegram/options/exit",
+    TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN
+  );
+  exitUrl.searchParams.set("state", telegramPaymentOptionsToken(context));
+  return {
+    message: retryMessage,
+    retryUrl,
+    returnUrl: exitUrl.toString(),
+  };
+}
+
+async function leaveLinqPaymentCheckout(context) {
+  const flow = await linqPaymentOptionsCheckout(context);
+  const cartCleared = await clearUcpCartForCheckoutFlow(context.userId, flow);
+  await db.saveCheckoutFlow(
+    flowRecord(flow, {
+      status: "UCP_CANCELED",
+      pravaChargeStatus: "CANCELED_WITHOUT_PAYMENT",
+      failureMessage: "The buyer returned to LINQ without completing payment.",
+    })
+  );
+  await db.saveLinqHermesState(context.chatId, {
+    pendingAction: null,
+    pendingChoices: null,
+  });
+  const message = cartCleared
+    ? "Payment was not completed. No order was placed, and this cart was cleared."
+    : "Payment was not completed and no order was placed.";
+  await db.saveLinqHermesMessage(
+    context.chatId,
+    "assistant",
+    message
+  ).catch(() => null);
+  await linq.sendChatMessage({
+    chatId: context.chatId,
+    text: message,
+    idempotencyKey: `tokko-linq-prava-exit-${context.checkoutId}`,
+  }).catch(() => null);
+  return { cartCleared, message, returnUrl: linqChatReturnUrl(context.to) };
+}
+
+async function leaveTelegramPaymentCheckout(context) {
+  const flow = await telegramPaymentOptionsCheckout(context);
+  const cartCleared = await clearUcpCartForCheckoutFlow(context.userId, flow);
+  await db.saveCheckoutFlow(
+    flowRecord(flow, {
+      status: "UCP_CANCELED",
+      pravaChargeStatus: "CANCELED_WITHOUT_PAYMENT",
+      failureMessage:
+        "The buyer returned to Telegram without completing payment.",
+    })
+  );
+  return {
+    cartCleared,
+    message: cartCleared
+      ? "Payment was not completed. No order was placed, and this cart was cleared."
+      : "Payment was not completed and no order was placed.",
+    returnUrl: telegramChatReturnUrl(
+      context.botUsername,
+      "payments_checkout_exit"
+    ),
+  };
+}
+
+async function startLinqPravaPaymentOption(context, input = {}) {
+  const action = String(input.action || "");
+  const telegram = context.channel === "telegram";
+  let flow = telegram
+    ? await telegramPaymentOptionsCheckout(context)
+    : await linqPaymentOptionsCheckout(context);
+  if (flow.status !== "UCP_APPROVED") {
+    const pending = linqPendingPravaSession(flow);
+    if (!pending) {
+      throw Object.assign(
+        new Error("This checkout is not available for another Prava payment"),
+        { status: 409 }
+      );
+    }
+    const requestedPaymentMethodId = String(
+      input.paymentMethodId || ""
+    ).trim();
+    const sameCard = (
+      action !== "create_mandate"
+      || !pending.paymentMethodId
+      || !requestedPaymentMethodId
+      || pending.paymentMethodId === requestedPaymentMethodId
+    );
+    if (
+      pending.action === action
+      && sameCard
+      && await linqPravaSessionCanResume(pending)
+    ) {
+      return {
+        paymentRoute: flow.payment_route,
+        status: "PRAVA_SESSION_RESUMED",
+        resumed: true,
+        ...(pending.mandateSummary
+          ? { mandateSummary: pending.mandateSummary }
+          : {}),
+        checkoutFlow: checkoutFlow(flow),
+        nextAction: {
+          type: pending.type,
+          label: pending.label,
+          url: pending.url,
+          checkoutId: flow.id,
+        },
+      };
+    }
+    flow = await supersedeLinqPravaSession(
+      flow,
+      pending.expired
+        ? "The previous Prava session expired; a new attempt was started."
+        : "The previous Prava session was replaced with another payment choice."
+    );
+  }
+  const returnContext = telegram
+    ? {
+        channel: "telegram",
+        chatId: context.chatId,
+        botUsername: context.botUsername,
+      }
+    : {
+        channel: "linq",
+        chatId: context.chatId,
+        to: context.to,
+      };
   if (action === "direct_card") {
     return startUcpPravaCardSession({
       userId: context.userId,
       flow,
       card: null,
       returnContext,
+    });
+  }
+  if (action === "add_card") {
+    const token = hermes.signApproval({
+      userId: context.userId,
+      toolName: "create_ucp_saved_card",
+      args: { tokkoFlowId: flow.id },
+    });
+    return startUcpCardChoice(context.userId, token, {
+      ...returnContext,
+      stage: "ucp_mandate_card_setup",
     });
   }
   if (action !== "create_mandate") {
@@ -6663,10 +8104,15 @@ async function startLinqPravaPaymentOption(context, input = {}) {
       status: 409,
     });
   }
-  if (!paymentMethodId && methods.length) {
-    throw Object.assign(new Error("Choose which saved card will create the mandate"), {
-      status: 400,
-    });
+  if (!paymentMethodId) {
+    throw Object.assign(
+      new Error(
+        methods.length
+          ? "Choose which saved card will create the mandate"
+          : "Add a saved Prava card before creating this mandate"
+      ),
+      { status: methods.length ? 400 : 409 }
+    );
   }
   const token = hermes.signApproval({
     userId: context.userId,
@@ -6690,14 +8136,77 @@ async function handleLinqPravaReturn(context) {
       status: 403,
     });
   }
-  await db.saveLinqHermesState(context.chatId, {
-    pendingAction: null,
-    pendingChoices: null,
-  });
+  const pendingChoices = binding.pending_choices || null;
   let result;
   let message;
-  let paymentApproved = false;
-  if (context.stage === "ucp_mandate_setup") {
+  let followupMessage = null;
+  let clearPending = false;
+  let browserRedirectUrl = null;
+  if (context.stage === "linq_mandate_card_enrollment") {
+    if (
+      pendingChoices?.type !== "standalone_mandate_card_enrollment"
+      || String(pendingChoices.setupId || "") !== String(context.checkoutId)
+    ) {
+      throw Object.assign(new Error("No LINQ mandate card setup is waiting"), {
+        status: 409,
+      });
+    }
+    result = await completeLinqSavedCardEnrollment(
+      context.userId,
+      pendingChoices
+    );
+    browserRedirectUrl = linqMandateSetupUrl({
+      userId: context.userId,
+      chatId: context.chatId,
+      setupId: context.checkoutId,
+      to: context.to,
+      suggestedAmount: pendingChoices.mandate?.amount,
+      frequency: pendingChoices.mandate?.frequency,
+      merchantScope: pendingChoices.mandate?.merchantScope,
+      selectedCardId: result.savedCard?.id,
+    });
+    message = null;
+    clearPending = true;
+  } else if (context.stage === "linq_mandate_setup") {
+    if (
+      pendingChoices?.type !== "standalone_mandate_setup"
+      || String(pendingChoices.setupId || "") !== String(context.checkoutId)
+    ) {
+      throw Object.assign(new Error("No LINQ mandate approval is waiting"), {
+        status: 409,
+      });
+    }
+    result = await resumeLinqStandaloneMandate(context, pendingChoices);
+    message = "Prava created mandate successfully, you can continue ordering";
+    clearPending = true;
+  } else if (context.stage === "card_enrollment") {
+    if (
+      pendingChoices?.type !== "card_enrollment"
+      || String(pendingChoices.checkoutId || "") !== String(context.checkoutId)
+    ) {
+      throw Object.assign(new Error("No LINQ card enrollment is waiting"), {
+        status: 409,
+      });
+    }
+    result = await completeLinqSavedCardEnrollment(
+      context.userId,
+      pendingChoices
+    );
+    const card = result.savedCard || {};
+    message = `${card.brand || "Card"}${
+      card.last4 ? ` ending ${card.last4}` : ""
+    } was added to your saved Prava cards.`;
+    clearPending = true;
+  } else if (context.stage === "ucp_mandate_card_setup") {
+    result = await resumeLinqUcpMandateAfterCardSetup(context);
+    message = linqMandateSessionMessage(result.mandateSummary || result);
+    if (!/^https:\/\//.test(String(result.nextAction?.url || ""))) {
+      throw Object.assign(
+        new Error("Prava did not return the mandate approval URL"),
+        { status: 502 }
+      );
+    }
+  } else if (context.stage === "ucp_mandate_setup") {
     result = await resumeLinqUcpOneTimeMandate(context);
     const chargedFlow = await db.getCheckoutFlow(
       context.userId,
@@ -6708,10 +8217,11 @@ async function handleLinqPravaReturn(context) {
       chargedFlow
     );
     result = { ...result, cartCleared };
-    paymentApproved = true;
+    clearPending = true;
     message =
-      "Your one-time Prava mandate is active and was automatically used for this cart. "
-      + "Tokko is finalizing the merchant order. The order is not confirmed until the merchant returns an order confirmation.";
+      "Prava checkout was successful, but the order still awaits merchant approval. "
+      + "This cart was cleared.";
+    followupMessage = "Order creation failed at the merchant end.";
   } else if (context.stage === "ucp_card_setup") {
     result = await resumeUcpAfterCardSetup(context);
     const card = result.savedCard || {};
@@ -6731,60 +8241,85 @@ async function handleLinqPravaReturn(context) {
         checkoutFlowRow
       );
       result = { ...result, cartCleared };
-      paymentApproved = true;
+      clearPending = true;
       message =
-        "Payment approved with Prava. Tokko is finalizing the merchant order. "
-        + "The order is not confirmed until the merchant returns an order confirmation.";
+        "Prava checkout was successful, but the order still awaits merchant approval. "
+        + "This cart was cleared.";
+      followupMessage = "Order creation failed at the merchant end.";
     } else if (result.nextAction?.url) {
       message =
-        "Prava payment approval is still processing. Finish the secure approval, then Tokko will check it again automatically.";
+        "Prava payment approval is still processing. Retry from the checkout page or return to LINQ without placing an order.";
+      return {
+        ...result,
+        retryPayment: true,
+        message,
+        returnUrl: linqChatReturnUrl(context.to),
+      };
     } else {
       message = "Prava did not complete this card approval. Choose a card again to retry.";
+      return {
+        ...result,
+        retryPayment: true,
+        message,
+        returnUrl: linqChatReturnUrl(context.to),
+      };
     }
   }
-  await db.saveLinqHermesMessage(context.chatId, "assistant", message);
-  await linq.sendChatMessage({
-    chatId: context.chatId,
-    text: message,
-    idempotencyKey:
-      `tokko-linq-prava-${context.stage}-${context.checkoutId}-${result.status}`,
-  });
-  if (paymentApproved) {
-    const failureMessage = "order creation failed";
+  if (clearPending) {
+    await db.saveLinqHermesState(context.chatId, {
+      pendingAction: null,
+      pendingChoices: null,
+    });
+  }
+  if (message) {
     await db.saveLinqHermesMessage(
       context.chatId,
       "assistant",
-      failureMessage
-    );
+      message
+    ).catch(() => null);
     await linq.sendChatMessage({
       chatId: context.chatId,
-      text: failureMessage,
+      text: message,
       idempotencyKey:
-        `tokko-linq-prava-${context.stage}-${context.checkoutId}-order-creation-failed`,
-    });
+        `tokko-linq-prava-${context.stage}-${context.checkoutId}-${result.status}`,
+    }).catch(() => null);
   }
-  if (/^https:\/\//.test(String(result.nextAction?.url || ""))) {
+  if (followupMessage) {
+    await db.saveLinqHermesMessage(
+      context.chatId,
+      "assistant",
+      followupMessage
+    ).catch(() => null);
+    await linq.sendChatMessage({
+      chatId: context.chatId,
+      text: followupMessage,
+      idempotencyKey:
+        `tokko-linq-prava-${context.stage}-${context.checkoutId}-merchant-order-failed`,
+    }).catch(() => null);
+  }
+  if (
+    !browserRedirectUrl
+    && /^https:\/\//.test(String(result.nextAction?.url || ""))
+  ) {
     await linq.sendChatLink({
       chatId: context.chatId,
       url: result.nextAction.url,
       idempotencyKey:
         `tokko-linq-prava-${context.stage}-${context.checkoutId}-link`,
-    });
+    }).catch(() => null);
   }
   return {
     ...result,
     message,
+    followupMessage,
+    browserRedirectUrl,
     returnUrl: linqChatReturnUrl(context.to),
   };
 }
 
 function linqCartChoices(cart = {}) {
   const items = Array.isArray(cart?.items) ? cart.items : [];
-  const choices = items.slice(0, 7).map((item) => ({
-    action: "remove",
-    itemId: String(item.id),
-    label: `Remove ${item.productName || "product"}`,
-  }));
+  const choices = [];
   if (!items.length) return choices;
   choices.push({ action: "empty", label: "Empty Cart" });
   const merchants = [
@@ -6802,6 +8337,109 @@ function linqCartChoices(cart = {}) {
     });
   }
   return choices;
+}
+
+function normalizedShoppingItemName(value) {
+  return String(value || "")
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function shoppingItemNameMatchIndex(target, items = []) {
+  const normalizedTarget = normalizedShoppingItemName(target);
+  if (!normalizedTarget) return null;
+  const candidates = items.map((item, index) => {
+    const productName = normalizedShoppingItemName(item?.productName);
+    const fullName = normalizedShoppingItemName(
+      [item?.productName, item?.variantName].filter(Boolean).join(" ")
+    );
+    return { index, names: [...new Set([productName, fullName].filter(Boolean))] };
+  });
+  const exact = candidates.filter((candidate) =>
+    candidate.names.includes(normalizedTarget)
+  );
+  if (exact.length === 1) return exact[0].index;
+  if (exact.length > 1 || normalizedTarget.length < 3) return null;
+  const partial = candidates.filter((candidate) =>
+    candidate.names.some((name) =>
+      name.includes(normalizedTarget) || normalizedTarget.includes(name)
+    )
+  );
+  return partial.length === 1 ? partial[0].index : null;
+}
+
+function linqProductNameTarget(text) {
+  const match = String(text || "").trim().match(
+    /^(?:please\s+)?(?:add|buy|choose|select|pick|take)\s+(?:the\s+)?(.+)$/i
+  );
+  if (!match) return null;
+  return match[1]
+    .replace(/\s+to\s+(?:my\s+|the\s+)?cart\s*$/i, "")
+    .replace(/\s+please\s*$/i, "")
+    .trim() || null;
+}
+
+function linqAddSavedCardRequest(text) {
+  return /^(?:please\s+)?(?:add|create|enroll|save)\s+(?:(?:a|another|new)\s+)?(?:new\s+)?(?:saved\s+)?card(?:\s+(?:to|in)\s+(?:my\s+)?prava)?(?:\s+please)?$/i.test(
+    String(text || "").trim()
+  );
+}
+
+function linqPendingCheckoutId(binding, userId) {
+  const pending = binding?.pending_choices || {};
+  if (!["approval", "payment_options"].includes(String(pending.type || ""))) {
+    return null;
+  }
+  const direct = String(pending.checkoutId || "");
+  if (/^[0-9a-f-]{36}$/i.test(direct)) return direct;
+  for (const item of Array.isArray(pending.items) ? pending.items : []) {
+    if (!item?.token) continue;
+    try {
+      const approved = hermes.verifyApproval(String(item.token), userId);
+      const flowId = String(
+        approved.args?.tokkoFlowId || approved.args?.orderId || ""
+      );
+      if (/^[0-9a-f-]{36}$/i.test(flowId)) return flowId;
+    } catch {
+      // Ignore expired or unrelated choices and fall back to standalone enrollment.
+    }
+  }
+  return null;
+}
+
+function ucpCartRemovalTarget(text) {
+  const match = String(text || "").trim().match(
+    /^(?:please\s+)?(?:remove|delete|take\s+out)\s+(?:the\s+)?(.+)$/i
+  );
+  if (!match) return null;
+  const target = match[1]
+    .replace(/\s+from\s+(?:my\s+|the\s+)?cart\s*$/i, "")
+    .replace(/\s+please\s*$/i, "")
+    .trim();
+  return target && !/^(?:all|everything|cart|all items)$/i.test(target)
+    ? target
+    : null;
+}
+
+async function removeUcpCartItemByName(userId, target) {
+  const cart = await getActiveUcpCart(userId);
+  const items = Array.isArray(cart?.items) ? cart.items : [];
+  const index = shoppingItemNameMatchIndex(target, items);
+  if (index === null) {
+    return {
+      removed: false,
+      target: String(target || "").trim(),
+      cart,
+    };
+  }
+  const removedItem = items[index];
+  const saved = await db.saveUcpCart(userId, {
+    items: items.filter((_item, itemIndex) => itemIndex !== index),
+  });
+  return { removed: true, target, removedItem, cart: saved };
 }
 
 const LINQ_CHOICE_NUMBER_WORDS = Object.freeze({
@@ -6898,8 +8536,17 @@ function linqChoiceRequest(text, pendingChoices) {
     }
   }
   const index = linqChoiceIndex(value, pendingChoices?.type, choices.length);
-  return index !== null
-    ? { type: pendingChoices.type, item: choices[index], index }
+  if (index !== null) {
+    return { type: pendingChoices.type, item: choices[index], index };
+  }
+  const productNameTarget = pendingChoices?.type === "product"
+    ? linqProductNameTarget(value)
+    : null;
+  const productIndex = productNameTarget
+    ? shoppingItemNameMatchIndex(productNameTarget, choices)
+    : null;
+  return productIndex !== null
+    ? { type: pendingChoices.type, item: choices[productIndex], index: productIndex }
     : null;
 }
 
@@ -6912,16 +8559,55 @@ function linqApprovalRequest(userId, choice) {
   return { token, toolName: approved.toolName, args: approved.args || {} };
 }
 
-function linqContextSwitchesCart(messageText, binding, choice = null) {
+function linqResultContinuesCartContext(result = {}) {
+  const tools = Array.isArray(result?.tools) ? result.tools : [];
+  return (
+    Array.isArray(result?.productChoices)
+    || Boolean(result?.productQuery)
+    || Boolean(result?.cart || result?.cartSummary)
+    || Boolean(result?.checkoutSummary)
+    || Array.isArray(result?.cardChoices)
+    || Array.isArray(result?.mandateChoices)
+    || Boolean(result?.pendingAction?.token)
+    || Boolean(result?.nextAction)
+    || tools.some((tool) => [
+      HERMES_UCP_SEARCH_TOOL.name,
+      HERMES_UCP_CHECKOUT_TOOL.name,
+      HERMES_MANDATE_TOOL.name,
+    ].includes(tool?.name))
+  );
+}
+
+function linqContextSwitchesCart(
+  messageText,
+  binding,
+  choice = null,
+  result = undefined
+) {
   const pendingType = String(binding?.pending_choices?.type || "");
   const hasPendingCartContext = Boolean(binding?.pending_action?.token)
-    || ["cart", "checkout", "approval"].includes(pendingType);
+    || [
+      "cart",
+      "checkout",
+      "approval",
+      "card_enrollment",
+      "payment_options",
+    ].includes(pendingType);
   if (!hasPendingCartContext || choice) return false;
   const value = String(messageText || "").trim();
   if (!value) return false;
-  return !/^(?:yes|y|approve|approved|confirm|confirmed|go ahead|no|n|cancel|decline|declined|stop|cart|view cart|show cart|checkout|proceed(?: to checkout)?|buy cart|empty|empty cart|clear cart)$/i.test(
-    value
-  );
+  if (/^(?:yes|y|approve|approved|confirm|confirmed|go ahead|no|n|cancel|decline|declined|stop|cart|view cart|show cart|checkout|proceed(?: to checkout)?|buy cart|empty|empty cart|clear cart)$/i.test(value)) {
+    return false;
+  }
+  // A free-form message after an item was added may be another product search.
+  // Let Hermes classify it first; clear only when the result is unrelated to
+  // shopping. Checkout/payment decisions remain strict and clear immediately.
+  if (pendingType === "cart") {
+    return result === undefined
+      ? false
+      : !linqResultContinuesCartContext(result);
+  }
+  return true;
 }
 
 async function clearLinqCheckoutAfterFailure(userId, approvalRequest) {
@@ -6949,7 +8635,9 @@ function linqReplyText(result = {}) {
         : String(product.currency || "INR").toUpperCase();
       return `${index + 1}. ${product.productName || "Product"} — ${price} — ${product.merchantName || product.merchant || "Merchant"}`;
     }).join("\n"));
-    sections.push("Reply ADD 1 (or another number) to add it to your cart.");
+    sections.push(
+      "Reply ADD 1 (or another number), or ADD <product name>, to add it to your cart."
+    );
   }
   const cardChoices = Array.isArray(result.cardChoices)
     ? result.cardChoices
@@ -7000,7 +8688,9 @@ function linqReplyText(result = {}) {
       sections.push(actions.map((action, index) =>
         `${index + 1}. ${action.label}`
       ).join("\n"));
-      sections.push("Reply with a number, or reply CHECKOUT to proceed.");
+      sections.push(
+        "Reply with a number, reply CHECKOUT to proceed, or type REMOVE <product name>."
+      );
     }
   } else if (cart && !cartItems.length) {
     sections.push("Your cart is empty. Tell me what you want to shop for.");
@@ -7025,6 +8715,7 @@ function linqPravaNextAction(action) {
       "prava_card_approval",
       "prava_card_enrollment",
       "prava_mandate_approval",
+      "prava_mandate_options",
       "prava_payment_options",
     ].includes(action.type)
     || !/^https:\/\/[^\s]{1,2039}$/i.test(String(action.url || ""))
@@ -7129,8 +8820,8 @@ function linqUcpCheckoutResult(checkout = {}) {
       payableCheckout.nextAction?.type === "prava_payment_options";
     message = paymentOptionsAvailable
       ? mandateCount
-        ? `${merchantName} returned a final quote of ${currency} ${total}. Choose one of the active one-time mandates below, or use another payment method with Prava.`
-        : `${merchantName} returned a final quote of ${currency} ${total}. No active one-time mandate can be used for this total. Use another payment method with Prava.`
+        ? `${merchantName} returned a final quote of ${currency} ${total}. Choose one of the active one-time mandates below, use another payment method with Prava, or type ADD SAVED CARD.`
+        : `${merchantName} returned a final quote of ${currency} ${total}. No active one-time mandate can be used for this total. Use another payment method with Prava, or type ADD SAVED CARD.`
       : mandateCount || mandateCreationAvailable
       ? `${merchantName} returned a final quote of ${currency} ${total}. Choose an active one-time mandate, create a non-recurring one-time mandate, or pay directly by card.`
       : savedCardCount
@@ -7165,6 +8856,9 @@ function linqPendingChoices(result = {}) {
   if (Array.isArray(result.cardChoices) && result.cardChoices.length) {
     return {
       type: "approval",
+      ...(/^[0-9a-f-]{36}$/i.test(String(result.nextAction?.checkoutId || ""))
+        ? { checkoutId: String(result.nextAction.checkoutId) }
+        : {}),
       items: result.cardChoices.map((choice) => ({
         token: choice.token,
         selectionType: choice.type || "ucp_saved_card",
@@ -7172,6 +8866,24 @@ function linqPendingChoices(result = {}) {
         brand: choice.brand || null,
         last4: choice.last4 || null,
       })),
+    };
+  }
+  if (
+    result.cardEnrollment?.type === "card_enrollment"
+    && /^[0-9a-f-]{36}$/i.test(String(result.cardEnrollment.checkoutId || ""))
+  ) {
+    return {
+      type: "card_enrollment",
+      checkoutId: String(result.cardEnrollment.checkoutId),
+      providerPaymentMethodIdsBefore: Array.isArray(
+        result.cardEnrollment.providerPaymentMethodIdsBefore
+      )
+        ? result.cardEnrollment.providerPaymentMethodIdsBefore.map(String)
+        : [],
+      tokenizationSessionId:
+        String(result.cardEnrollment.tokenizationSessionId || "") || null,
+      expiresAt: result.cardEnrollment.expiresAt || null,
+      items: [],
     };
   }
   const checkout = result.checkoutSummary;
@@ -7186,6 +8898,16 @@ function linqPendingChoices(result = {}) {
         { action: "approve", label: "Approve Checkout" },
         { action: "cancel", label: "Do Not Place Order" },
       ],
+    };
+  }
+  if (
+    result.nextAction?.type === "prava_payment_options"
+    && /^[0-9a-f-]{36}$/i.test(String(result.nextAction.checkoutId || ""))
+  ) {
+    return {
+      type: "payment_options",
+      checkoutId: String(result.nextAction.checkoutId),
+      items: [],
     };
   }
   const cart = result.cart || result.cartSummary;
@@ -7296,6 +9018,29 @@ async function processLinqMessage(req, message, eventId) {
     to: message.to,
   };
   let binding = await db.getLinqHermesBinding(message.chatId);
+  const pendingChoiceType = String(binding?.pending_choices?.type || "");
+  const cartMayExpire = !binding?.pending_action?.token
+    && ![
+      "checkout",
+      "approval",
+      "card_enrollment",
+      "payment_options",
+    ].includes(pendingChoiceType);
+  const idleCartState = cartMayExpire
+    ? await activeUcpCartState(userId)
+    : { abandoned: false };
+  const abandonedCartCleared = idleCartState.abandoned === true;
+  if (abandonedCartCleared) {
+    await db.saveLinqHermesState(message.chatId, {
+      pendingAction: null,
+      pendingChoices: null,
+    });
+    binding = {
+      ...binding,
+      pending_action: null,
+      pending_choices: null,
+    };
+  }
   const choice = linqChoiceRequest(message.text, binding?.pending_choices);
   const approvalRequest = linqApprovalRequest(userId, choice);
   const messageText = String(message.text || "").trim();
@@ -7310,10 +9055,15 @@ async function processLinqMessage(req, message, eventId) {
     messageText
   );
   const emptyCart = /^(?:empty|empty cart|clear cart)$/i.test(messageText);
-  const contextSwitched = linqContextSwitchesCart(
+  const cartRemovalTarget = ucpCartRemovalTarget(messageText);
+  const addSavedCard = linqAddSavedCardRequest(messageText);
+  const cartContextChoice = choice || (
+    cartRemovalTarget || addSavedCard ? { type: "cart" } : null
+  );
+  let contextSwitched = linqContextSwitchesCart(
     messageText,
     binding,
-    choice
+    cartContextChoice
   );
   if (contextSwitched) {
     await db.clearUcpCart(userId);
@@ -7335,19 +9085,47 @@ async function processLinqMessage(req, message, eventId) {
       cart: publicUcpCart(cart),
       cartCleared: true,
     };
+  } else if (addSavedCard) {
+    const checkoutId = linqPendingCheckoutId(binding, userId);
+    result = checkoutId
+      ? await startLinqPravaPaymentOption({
+          userId,
+          chatId: message.chatId,
+          checkoutId,
+          to: message.to,
+        }, { action: "add_card" })
+      : await startLinqSavedCardEnrollment(userId, {
+          channel: "linq",
+          chatId: message.chatId,
+          to: message.to,
+        });
+    result = {
+      ...result,
+      message: checkoutId
+        ? "Open Prava to add and save a card. After it is saved, Tokko will continue this checkout with that card."
+        : "Open Prava to add and save a card. You will return to this LINQ chat when setup is complete.",
+    };
   } else if (choice?.type === "product" && choice.item?.choiceId) {
     const cart = await addUcpCartChoice(userId, choice.item.choiceId, 1, false);
     result = {
       message: `Added ${choice.item.productName || "that product"} to your cart.`,
       cart: publicUcpCart(cart),
     };
+  } else if (cartRemovalTarget) {
+    const removal = await removeUcpCartItemByName(userId, cartRemovalTarget);
+    result = {
+      message: removal.removed
+        ? `Removed ${removal.removedItem.productName || cartRemovalTarget} from your cart.`
+        : `I couldn't find "${cartRemovalTarget}" in your cart. Type REMOVE followed by the product name shown in the cart.`,
+      cart: publicUcpCart(removal.cart),
+    };
   } else if (showCart) {
     result = {
       message: "Here is your cart.",
-      cart: publicUcpCart(await db.getUcpCart(userId)),
+      cart: publicUcpCart(await getActiveUcpCart(userId)),
     };
   } else if (choice?.type === "cart" && choice.item?.action === "remove") {
-    const cart = await db.getUcpCart(userId);
+    const cart = await getActiveUcpCart(userId);
     const items = Array.isArray(cart.items) ? cart.items : [];
     const removedItem = items.find(
       (item) => String(item.id) === String(choice.item.itemId)
@@ -7409,8 +9187,9 @@ async function processLinqMessage(req, message, eventId) {
       );
       result = {
         ...mandateSetup,
-        message:
-          "Open Prava's secure page to approve this non-merchant-scoped one-time mandate. It is not recurring. When Prava returns here, Tokko will automatically use it for this cart.",
+        message: linqMandateSessionMessage(
+          mandateSetup.mandateSummary || mandateSetup
+        ),
       };
     } catch (error) {
       error.cartCleared = await clearLinqCheckoutAfterFailure(
@@ -7438,7 +9217,7 @@ async function processLinqMessage(req, message, eventId) {
         cartCleared,
         message:
           "Payment approved with Prava using the one-time mandate. Tokko is finalizing the merchant order. The order is not confirmed until the merchant returns an order confirmation.",
-        followupMessage: "order creation failed",
+        followupMessage: "Order creation failed at the merchant end.",
       };
     } catch (error) {
       error.cartCleared = await clearLinqCheckoutAfterFailure(
@@ -7484,6 +9263,17 @@ async function processLinqMessage(req, message, eventId) {
       throw error;
     }
   } else {
+    const activeCart = await getActiveUcpCart(userId);
+    const activeCartMerchants = [
+      ...new Set(
+        (Array.isArray(activeCart?.items) ? activeCart.items : [])
+          .map((item) => String(item?.merchant || "").trim().toLowerCase())
+          .filter(Boolean)
+      ),
+    ];
+    req.tokkoUcpCartMerchant = activeCartMerchants.length === 1
+      ? activeCartMerchants[0]
+      : null;
     const history = await db.getLinqHermesMessages(message.chatId, 23);
     const messages = history.map((entry) => ({
       role: entry.role,
@@ -7520,12 +9310,31 @@ async function processLinqMessage(req, message, eventId) {
       }
     }
   }
+  if (
+    !contextSwitched
+    && linqContextSwitchesCart(messageText, binding, cartContextChoice, result)
+  ) {
+    await db.clearUcpCart(userId);
+    await db.saveLinqHermesState(message.chatId, {
+      pendingAction: null,
+      pendingChoices: null,
+    });
+    contextSwitched = true;
+  }
   if (contextSwitched) {
     result = {
       ...result,
       cartCleared: true,
       message:
         `I cleared the unfinished cart from the previous context. ${String(result.message || "").trim()}`.trim(),
+    };
+  }
+  if (abandonedCartCleared) {
+    result = {
+      ...result,
+      cartCleared: true,
+      message:
+        `I cleared the cart because it was idle for more than 10 minutes. ${String(result.message || "").trim()}`.trim(),
     };
   }
   result = linqSecurePaymentResult(result);
@@ -8951,10 +10760,19 @@ async function runHermesBackend({
     getUserState(userId, clerkUserId),
     db.getHermesMemories(userId),
   ]);
+  const mandateTool = channel === "linq"
+    ? HERMES_MANDATE_TOOL
+    : {
+        ...HERMES_MANDATE_TOOL,
+        inputSchema: {
+          ...HERMES_MANDATE_TOOL.inputSchema,
+          required: ["amount"],
+        },
+      };
   const tools = [
     HERMES_UCP_SEARCH_TOOL,
     HERMES_UCP_CHECKOUT_TOOL,
-    HERMES_MANDATE_TOOL,
+    mandateTool,
   ];
   const selectedDeliveryCountry = String(
     state.deliveryPreference?.countryCode || ""
@@ -9059,6 +10877,14 @@ async function runHermesBackend({
       tool.name === HERMES_MANDATE_TOOL.name &&
       tool.status === "completed"
     )?.result;
+  if (mandateResult?.stage === "hosted_mandate_setup") {
+    result.cardChoices = [];
+    result.mandateSetup = mandateResult.mandate;
+    result.nextAction = mandateResult.nextAction;
+    result.message = mandateResult.mandate?.amount
+      ? "Open the secure Tokko Shopper link to confirm the mandate amount and choose or add the saved card to use."
+      : "Open the secure Tokko Shopper link to enter the mandate amount and choose or add the saved card to use.";
+  }
   if (mandateResult?.stage === "choose_card") {
     result.cardChoices = mandateResult.cardChoices || [];
     result.mandateSetup = mandateResult.mandate;
@@ -9179,6 +11005,13 @@ async function maybeVerifyHermesZeptoOtp(userId, messages) {
 
 async function executeHermesTool(req, userId, toolName, args) {
   if (toolName === HERMES_MANDATE_TOOL.name) {
+    if (req?.tokkoReturnContext?.channel === "linq") {
+      return prepareLinqMandateSetupLink(
+        userId,
+        args,
+        req.tokkoReturnContext
+      );
+    }
     return prepareTelegramMandateChoices(userId, args);
   }
   if (toolName === HERMES_UCP_SEARCH_TOOL.name) {
@@ -9186,13 +11019,16 @@ async function executeHermesTool(req, userId, toolName, args) {
       limit: 3,
       offset: 0,
       market: args?.market,
+      ...(req?.tokkoUcpCartMerchant
+        ? { merchant: req.tokkoUcpCartMerchant }
+        : {}),
       merchantResultLimit: 50,
       baseUrl: BASE_URL,
     });
     const products = (searchResult.products || []).slice(0, 3);
     return {
       ...searchResult,
-      selectedMerchant: null,
+      selectedMerchant: searchResult.selectedMerchant || null,
       sort: "lowest_native_price",
       products,
       pagination: {
@@ -9321,7 +11157,7 @@ async function addUcpCartChoice(userId, choiceId, quantity, replaceCart = false)
   const product = choice.product || {};
   const requestedMerchant = String(product.merchant || "");
   const requestedMerchantName = String(product.merchantName || requestedMerchant);
-  const cart = await db.getUcpCart(userId);
+  const cart = await getActiveUcpCart(userId);
   let items = Array.isArray(cart.items) ? [...cart.items] : [];
   const currentMerchant = String(items[0]?.merchant || "");
   if (items.length && currentMerchant && currentMerchant !== requestedMerchant) {
@@ -9412,12 +11248,305 @@ async function resumeTelegramUcpOneTimeMandate(userId, chatId) {
     ...result,
     cartCleared,
     message:
-      "Your one-time Prava mandate is active and was automatically used for this cart. "
-      + "Tokko is finalizing the merchant order. The order is not confirmed until the merchant returns an order confirmation.",
+      "Prava checkout was successful, but the order still awaits merchant approval. "
+      + "This cart was cleared.",
+    followupMessage: "Order creation failed at the merchant end.",
   };
 }
 
+const TELEGRAM_CHECKOUT_SUCCESS_MESSAGE =
+  "Prava checkout was successful, but the order still awaits merchant approval. "
+  + "This cart was cleared.";
+const TELEGRAM_MERCHANT_FAILURE_MESSAGE =
+  "Order creation failed at the merchant end.";
+
+async function telegramCheckoutSuccessResult(userId, flow, result = {}) {
+  const latestFlow = await db.getCheckoutFlow(userId, flow.id);
+  const cartCleared = await clearUcpCartForCheckoutFlow(userId, latestFlow);
+  return {
+    ...result,
+    status: result.status || "PAYMENT_APPROVED",
+    credentialIssued: true,
+    cartCleared,
+    message: TELEGRAM_CHECKOUT_SUCCESS_MESSAGE,
+    followupMessage: TELEGRAM_MERCHANT_FAILURE_MESSAGE,
+  };
+}
+
+async function resumeTelegramCheckoutFlowReturn(context, flow) {
+  const { userId, chatId, botUsername } = context;
+  if ([
+    "UCP_MANDATE_CREDENTIAL_ISSUED",
+    "UCP_PRAVA_CREDENTIAL_ISSUED",
+  ].includes(String(flow.status || ""))) {
+    return telegramCheckoutSuccessResult(userId, flow);
+  }
+  if (flow.status === "UCP_CARD_SETUP_REQUIRED") {
+    const setup = flow.price_breakdown?.pravaCardSetup || {};
+    if (
+      setup.purpose !== "mandate"
+      || setup.channel !== "telegram"
+      || String(setup.chatId || "") !== String(chatId)
+    ) {
+      throw Object.assign(
+        new Error("No Telegram mandate card setup is waiting"),
+        { status: 409 }
+      );
+    }
+    const selected = await newUcpCardAfterSetup(userId, flow);
+    const token = hermes.signApproval({
+      userId,
+      toolName: "create_ucp_one_time_mandate",
+      args: {
+        tokkoFlowId: flow.id,
+        paymentMethodId: String(selected.id),
+      },
+    });
+    const result = await startLinqUcpOneTimeMandate(userId, token, {
+      channel: "telegram",
+      chatId,
+      botUsername,
+    });
+    return {
+      ...result,
+      message: linqMandateSessionMessage(result.mandateSummary || result),
+    };
+  }
+  if (flow.status !== "UCP_PRAVA_APPROVAL_REQUIRED") {
+    throw Object.assign(
+      new Error("No Telegram Prava card approval is waiting"),
+      { status: 409 }
+    );
+  }
+  const paymentSetup = flow.price_breakdown?.channelPaymentSetup || {};
+  if (
+    paymentSetup.channel !== "telegram"
+    || String(paymentSetup.chatId || "") !== String(chatId)
+  ) {
+    throw Object.assign(
+      new Error("This Telegram payment return does not match the checkout"),
+      { status: 403 }
+    );
+  }
+  const result = await consumeUcpPravaPaymentResult(userId, flow.id);
+  if (!result.credentialIssued) {
+    if (!result.nextAction?.url) {
+      const retry = await prepareTelegramPaymentRetry(
+        {
+          channel: "telegram",
+          userId,
+          chatId: String(chatId),
+          checkoutId: flow.id,
+          botUsername,
+        },
+        new Error("Prava did not complete this card approval.")
+      );
+      return {
+        ...result,
+        retryPayment: true,
+        message:
+          "Prava did not complete this card approval. Retry with another payment method or return to Telegram without placing an order.",
+        nextAction: {
+          type: "prava_payment_options",
+          label: "Retry with another payment method",
+          url: retry.retryUrl,
+        },
+        returnUrl: retry.returnUrl,
+      };
+    }
+    return {
+      ...result,
+      message:
+        "Prava payment approval is still processing. Open the secure payment link again or retry from payment options.",
+    };
+  }
+  return telegramCheckoutSuccessResult(userId, flow, result);
+}
+
+async function resumeTelegramCheckoutCardReturn(
+  userId,
+  chatId,
+  botUsername
+) {
+  const flows = await db.getRecentCheckoutFlows(userId, 25);
+  const flow = flows.find((candidate) => {
+    if (candidate?.platform !== "ucp") return false;
+    const checkout = candidate.price_breakdown || {};
+    const cardSetup = checkout.pravaCardSetup || {};
+    const paymentSetup = checkout.channelPaymentSetup || {};
+    return (
+      candidate.status === "UCP_CARD_SETUP_REQUIRED"
+      && cardSetup.channel === "telegram"
+      && String(cardSetup.chatId || "") === String(chatId)
+    ) || (
+      candidate.status === "UCP_PRAVA_APPROVAL_REQUIRED"
+      && paymentSetup.channel === "telegram"
+      && String(paymentSetup.chatId || "") === String(chatId)
+    );
+  });
+  if (!flow) {
+    return resumeTelegramMandateAfterCard(userId, chatId);
+  }
+  return resumeTelegramCheckoutFlowReturn(
+    { userId, chatId: String(chatId), botUsername },
+    flow
+  );
+}
+
+const LINQ_MANDATE_SETUP_TTL_MS = 60 * 60 * 1_000;
+const LINQ_MANDATE_SETUP_PUBLIC_ORIGIN =
+  "https://tokko-shopper.vercel.app";
+
+function linqMandateSetupToken(context, options = {}) {
+  const now = Number(options.now ?? Date.now());
+  const ttlMs = Number(options.ttlMs ?? LINQ_MANDATE_SETUP_TTL_MS);
+  const mandate = linqMandateDraft({
+    amount: context?.suggestedAmount,
+    frequency: context?.frequency,
+    merchantScope: context?.merchantScope,
+  });
+  const selectedCardId = context?.selectedCardId === null
+    || context?.selectedCardId === undefined
+    ? null
+    : String(context.selectedCardId).trim();
+  const payload = {
+    v: 1,
+    userId: Number(context?.userId),
+    chatId: String(context?.chatId || "").trim(),
+    setupId: String(context?.setupId || "").trim(),
+    to: String(context?.to || "").trim(),
+    suggestedAmount: mandate.amount,
+    frequency: mandate.frequency,
+    merchantScope: mandate.merchantScope,
+    selectedCardId,
+    iat: now,
+    exp: now + ttlMs,
+  };
+  if (
+    !Number.isSafeInteger(payload.userId)
+    || payload.userId <= 0
+    || !/^[0-9a-f-]{36}$/i.test(payload.chatId)
+    || !/^[0-9a-f-]{36}$/i.test(payload.setupId)
+    || !/^\+[1-9]\d{6,14}$/.test(payload.to)
+    || (selectedCardId !== null
+      && !/^[A-Za-z0-9_-]{1,128}$/.test(selectedCardId))
+    || !Number.isFinite(now)
+    || !Number.isFinite(ttlMs)
+    || ttlMs <= 0
+  ) {
+    throw Object.assign(new Error("Invalid LINQ mandate setup context"), {
+      status: 400,
+    });
+  }
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`linq-mandate-setup:${encoded}`)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyLinqMandateSetupToken(token, options = {}) {
+  const value = String(token || "").trim();
+  const [encoded, suppliedSignature, extra] = value.split(".");
+  if (
+    extra !== undefined
+    || !/^[A-Za-z0-9_-]+$/.test(encoded || "")
+    || !/^[A-Za-z0-9_-]+$/.test(suppliedSignature || "")
+  ) {
+    throw Object.assign(new Error("This LINQ mandate setup link is invalid"), {
+      status: 400,
+    });
+  }
+  const expected = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`linq-mandate-setup:${encoded}`)
+    .digest();
+  let supplied;
+  try {
+    supplied = Buffer.from(suppliedSignature, "base64url");
+  } catch {
+    supplied = Buffer.alloc(0);
+  }
+  if (
+    supplied.length !== expected.length
+    || !nodeCrypto.timingSafeEqual(supplied, expected)
+  ) {
+    throw Object.assign(new Error("This LINQ mandate setup link is invalid"), {
+      status: 400,
+    });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("This LINQ mandate setup link is invalid"), {
+      status: 400,
+    });
+  }
+  const now = Number(options.now ?? Date.now());
+  let mandate;
+  try {
+    mandate = linqMandateDraft({
+      amount: payload?.suggestedAmount,
+      frequency: payload?.frequency,
+      merchantScope: payload?.merchantScope,
+    });
+  } catch {
+    mandate = null;
+  }
+  if (
+    payload?.v !== 1
+    || !mandate
+    || !Number.isSafeInteger(Number(payload.userId))
+    || Number(payload.userId) <= 0
+    || !/^[0-9a-f-]{36}$/i.test(String(payload.chatId || ""))
+    || !/^[0-9a-f-]{36}$/i.test(String(payload.setupId || ""))
+    || !/^\+[1-9]\d{6,14}$/.test(String(payload.to || ""))
+    || (payload.selectedCardId !== null
+      && payload.selectedCardId !== undefined
+      && !/^[A-Za-z0-9_-]{1,128}$/.test(String(payload.selectedCardId)))
+    || !Number.isFinite(Number(payload.iat))
+    || !Number.isFinite(Number(payload.exp))
+    || Number(payload.iat) > now + 60_000
+  ) {
+    throw Object.assign(new Error("This LINQ mandate setup link is invalid"), {
+      status: 400,
+    });
+  }
+  if (Number(payload.exp) <= now) {
+    throw Object.assign(new Error("This LINQ mandate setup link has expired"), {
+      status: 410,
+    });
+  }
+  return {
+    userId: Number(payload.userId),
+    chatId: String(payload.chatId),
+    setupId: String(payload.setupId),
+    to: String(payload.to),
+    suggestedAmount: mandate.amount,
+    frequency: mandate.frequency,
+    merchantScope: mandate.merchantScope,
+    selectedCardId: payload.selectedCardId
+      ? String(payload.selectedCardId)
+      : null,
+    issuedAt: new Date(Number(payload.iat)).toISOString(),
+    expiresAt: new Date(Number(payload.exp)).toISOString(),
+  };
+}
+
+function linqMandateSetupUrl(context, options = {}) {
+  const url = new URL(LINQ_MANDATE_SETUP_PUBLIC_ORIGIN);
+  url.pathname = "/api/payments/linq/mandate";
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set("state", linqMandateSetupToken(context, options));
+  return url.toString();
+}
+
 const LINQ_PAYMENT_OPTIONS_TTL_MS = 60 * 60 * 1_000;
+const LINQ_PAYMENT_OPTIONS_PUBLIC_ORIGIN =
+  "https://tokko-shopper.vercel.app";
 
 function linqPaymentOptionsToken(context, options = {}) {
   const now = Number(options.now ?? Date.now());
@@ -9523,32 +11652,259 @@ function verifyLinqPaymentOptionsToken(token, options = {}) {
 }
 
 function linqPaymentOptionsUrl(context, options = {}) {
-  const configuredPravaUrl = String(process.env.PRAVA_MERCHANT_URL || "");
-  const baseUrl = String(
-    options.baseUrl
-      || (BASE_URL.startsWith("https://") ? BASE_URL : null)
-      || (configuredPravaUrl.startsWith("https://")
-        ? configuredPravaUrl
-        : null)
-      || "https://tokko-drab.vercel.app"
-  );
-  let url;
-  try {
-    url = new URL(baseUrl);
-  } catch {
-    url = null;
-  }
-  if (!url || url.protocol !== "https:") {
-    throw Object.assign(new Error("The LINQ payment link requires an HTTPS URL"), {
-      status: 503,
-    });
-  }
+  const url = new URL(LINQ_PAYMENT_OPTIONS_PUBLIC_ORIGIN);
   url.pathname = "/api/payments/linq/options";
   url.search = "";
   url.hash = "";
   url.searchParams.set("state", linqPaymentOptionsToken(context, options));
   return url.toString();
 }
+
+const TELEGRAM_PAYMENT_OPTIONS_TTL_MS = 60 * 60 * 1_000;
+const TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN =
+  "https://tokko-shopper.vercel.app";
+
+function telegramPaymentOptionsToken(context, options = {}) {
+  const now = Number(options.now ?? Date.now());
+  const ttlMs = Number(options.ttlMs ?? TELEGRAM_PAYMENT_OPTIONS_TTL_MS);
+  const botUsername = String(context?.botUsername || "")
+    .trim()
+    .replace(/^@/, "");
+  const payload = {
+    v: 1,
+    userId: Number(context?.userId),
+    chatId: String(context?.chatId || "").trim(),
+    checkoutId: String(context?.checkoutId || "").trim(),
+    botUsername,
+    iat: now,
+    exp: now + ttlMs,
+  };
+  if (
+    !Number.isSafeInteger(payload.userId)
+    || payload.userId <= 0
+    || !/^-?\d{1,20}$/.test(payload.chatId)
+    || !/^[0-9a-f-]{36}$/i.test(payload.checkoutId)
+    || !telegramBotUsernameDiagnostic(
+      payload.botUsername,
+      "telegramPaymentOptionsToken.botUsername"
+    ).valid
+    || !Number.isFinite(now)
+    || !Number.isFinite(ttlMs)
+    || ttlMs <= 0
+  ) {
+    throw Object.assign(new Error("Invalid Telegram payment-options context"), {
+      status: 400,
+    });
+  }
+  const encoded = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  const signature = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`telegram-payment-options:${encoded}`)
+    .digest("base64url");
+  return `${encoded}.${signature}`;
+}
+
+function verifyTelegramPaymentOptionsToken(token, options = {}) {
+  const value = String(token || "").trim();
+  const [encoded, suppliedSignature, extra] = value.split(".");
+  if (
+    extra !== undefined
+    || !/^[A-Za-z0-9_-]+$/.test(encoded || "")
+    || !/^[A-Za-z0-9_-]+$/.test(suppliedSignature || "")
+  ) {
+    throw Object.assign(new Error("This Telegram payment link is invalid"), {
+      status: 400,
+    });
+  }
+  const expected = nodeCrypto
+    .createHmac("sha256", linqOnboardingSecret())
+    .update(`telegram-payment-options:${encoded}`)
+    .digest();
+  let supplied;
+  try {
+    supplied = Buffer.from(suppliedSignature, "base64url");
+  } catch {
+    supplied = Buffer.alloc(0);
+  }
+  if (
+    supplied.length !== expected.length
+    || !nodeCrypto.timingSafeEqual(supplied, expected)
+  ) {
+    throw Object.assign(new Error("This Telegram payment link is invalid"), {
+      status: 400,
+    });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8"));
+  } catch {
+    throw Object.assign(new Error("This Telegram payment link is invalid"), {
+      status: 400,
+    });
+  }
+  const now = Number(options.now ?? Date.now());
+  if (
+    payload?.v !== 1
+    || !Number.isSafeInteger(Number(payload.userId))
+    || Number(payload.userId) <= 0
+    || !/^-?\d{1,20}$/.test(String(payload.chatId || ""))
+    || !/^[0-9a-f-]{36}$/i.test(String(payload.checkoutId || ""))
+    || !telegramBotUsernameDiagnostic(
+      payload.botUsername,
+      "verifyTelegramPaymentOptionsToken.botUsername"
+    ).valid
+    || !Number.isFinite(Number(payload.iat))
+    || !Number.isFinite(Number(payload.exp))
+    || Number(payload.iat) > now + 60_000
+  ) {
+    throw Object.assign(new Error("This Telegram payment link is invalid"), {
+      status: 400,
+    });
+  }
+  if (Number(payload.exp) <= now) {
+    throw Object.assign(new Error("This Telegram payment link has expired"), {
+      status: 410,
+    });
+  }
+  return {
+    channel: "telegram",
+    userId: Number(payload.userId),
+    chatId: String(payload.chatId),
+    checkoutId: String(payload.checkoutId),
+    botUsername: String(payload.botUsername),
+    issuedAt: new Date(Number(payload.iat)).toISOString(),
+    expiresAt: new Date(Number(payload.exp)).toISOString(),
+  };
+}
+
+function telegramPaymentOptionsUrl(context, options = {}) {
+  const url = new URL(TELEGRAM_PAYMENT_OPTIONS_PUBLIC_ORIGIN);
+  url.pathname = "/api/payments/telegram/options";
+  url.search = "";
+  url.hash = "";
+  url.searchParams.set(
+    "state",
+    telegramPaymentOptionsToken(context, options)
+  );
+  return url.toString();
+}
+
+function telegramChatReturnUrl(botUsername, payload = null) {
+  const bot = telegramBotUsername(botUsername, {
+    source: "telegramChatReturnUrl.botUsername",
+  });
+  const url = new URL(`https://t.me/${encodeURIComponent(bot)}`);
+  if (payload) url.searchParams.set("start", String(payload));
+  return url.toString();
+}
+
+function telegramPravaBridgeUrl(state) {
+  verifyTelegramPravaReturnToken(state);
+  const url = new URL(
+    "https://telegram-hermes-bridge.vercel.app/api/prava_return"
+  );
+  url.searchParams.set("state", String(state));
+  return url.toString();
+}
+
+async function handleTelegramPravaReturn(context) {
+  const binding = await db.getTelegramHermesBinding(context.chatId);
+  if (
+    !binding
+    || Number(binding.user_id) !== Number(context.userId)
+  ) {
+    throw Object.assign(
+      new Error("This Telegram Prava return is not linked to the family"),
+      { status: 403 }
+    );
+  }
+  const flow = await db.getCheckoutFlow(
+    context.userId,
+    context.checkoutId
+  );
+  if (!flow || flow.platform !== "ucp") {
+    throw Object.assign(new Error("This checkout is no longer available"), {
+      status: 404,
+    });
+  }
+  let result;
+  if (context.stage === "ucp_mandate_setup") {
+    const setup = flow.price_breakdown?.channelMandateSetup || {};
+    if (
+      setup.channel !== "telegram"
+      || String(setup.chatId || "") !== String(context.chatId)
+      || (setup.attemptId
+        && String(setup.attemptId) !== String(context.attemptId || ""))
+    ) {
+      throw Object.assign(
+        new Error("This Prava return belongs to an older mandate attempt"),
+        { status: 409, code: "STALE_PRAVA_ATTEMPT" }
+      );
+    }
+    if (flow.status === "UCP_MANDATE_CREDENTIAL_ISSUED") {
+      result = await telegramCheckoutSuccessResult(context.userId, flow);
+    } else {
+      if (flow.status !== "UCP_MANDATE_APPROVAL_REQUIRED") {
+        throw Object.assign(
+          new Error("No Telegram mandate approval is waiting"),
+          { status: 409 }
+        );
+      }
+      const charged = await resumeLinqUcpOneTimeMandate(context);
+      result = await telegramCheckoutSuccessResult(
+        context.userId,
+        flow,
+        charged
+      );
+    }
+  } else {
+    result = await resumeTelegramCheckoutFlowReturn(context, flow);
+  }
+  const nextAction = result.nextAction || null;
+  const safeNextAction = (
+    nextAction
+    && /^https:\/\/[^\s]{1,2039}$/i.test(String(nextAction.url || ""))
+  ) ? {
+      type: String(nextAction.type || "prava_action"),
+      label: String(nextAction.label || "Continue securely with Prava")
+        .slice(0, 100),
+      url: String(nextAction.url),
+    } : null;
+  const message = String(result.message || "").trim().slice(0, 4_000);
+  const followupMessage = String(result.followupMessage || "")
+    .trim()
+    .slice(0, 4_000);
+  if (message) {
+    await db.saveTelegramHermesMessage(
+      context.chatId,
+      "assistant",
+      message
+    );
+  }
+  if (followupMessage) {
+    await db.saveTelegramHermesMessage(
+      context.chatId,
+      "assistant",
+      followupMessage
+    );
+  }
+  return {
+    deliveredBy: "telegram_bridge",
+    chatId: String(context.chatId),
+    botUsername: context.botUsername,
+    checkoutId: context.checkoutId,
+    message,
+    ...(followupMessage ? { followupMessage } : {}),
+    ...(safeNextAction ? { nextAction: safeNextAction } : {}),
+  };
+}
+
+route("POST", "/api/integrations/telegram/prava-return", async (req, res) => {
+  await requireTelegramIntegration(req);
+  const body = await parseBody(req);
+  const context = verifyTelegramPravaReturnToken(body.state);
+  return sendJson(res, 200, await handleTelegramPravaReturn(context));
+});
 
 route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   await requireTelegramIntegration(req);
@@ -9560,6 +11916,7 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
   // bot (same callback create-mandate uses).
   req.tokkoReturnContext = {
     channel: "telegram",
+    chatId,
     botUsername: telegramBotUsernameFromBody(body, {
       traceId: req.tokkoTraceId,
       route: "POST /api/integrations/telegram/hermes",
@@ -9573,25 +11930,43 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
     );
     await db.saveTelegramHermesMessage(chatId, "user", text);
     await db.saveTelegramHermesMessage(chatId, "assistant", result.message);
+    if (result.followupMessage) {
+      await db.saveTelegramHermesMessage(
+        chatId,
+        "assistant",
+        result.followupMessage
+      );
+    }
     return sendJson(res, 200, {
       ...result,
       telegram: { chatId, familyLinked: true },
     });
   }
   if (telegramCardReturnMessage(text)) {
-    const result = await resumeTelegramMandateAfterCard(Number(user.id), chatId);
-    const card = result.paymentMethod;
-    const message =
-      `${card.brand || "Card"} ending ${card.last4} was saved. `
-      + "Open the Prava approval below to activate the mandate.";
+    const result = await resumeTelegramCheckoutCardReturn(
+      Number(user.id),
+      chatId,
+      req.tokkoReturnContext.botUsername
+    );
+    const message = result.message || "Prava card setup is complete.";
     await db.saveTelegramHermesMessage(chatId, "user", text);
     await db.saveTelegramHermesMessage(chatId, "assistant", message);
+    if (result.followupMessage) {
+      await db.saveTelegramHermesMessage(
+        chatId,
+        "assistant",
+        result.followupMessage
+      );
+    }
     return sendJson(res, 200, {
       ...result,
       message,
       telegram: { chatId, familyLinked: true },
     });
   }
+  const telegramIdleCartState = typeof body.approvalToken === "string"
+    ? { abandoned: false }
+    : await activeUcpCartState(Number(user.id));
   const suppliedMessages = Array.isArray(body.messages)
     ? body.messages
     : await db.getTelegramHermesMessages(chatId, 23);
@@ -9616,14 +11991,38 @@ route("POST", "/api/integrations/telegram/hermes", async (req, res) => {
       { status: 400 }
     );
   }
-  const result = await runHermesBackend({
-    req,
-    userId: Number(user.id),
-    clerkUserId: user.clerk_user_id || null,
-    messages,
-    language: body.language || body.locale || "en-IN",
-    approvalToken,
-  });
+  const cartRemovalTarget = approvalToken ? null : ucpCartRemovalTarget(text);
+  let hermesResult;
+  if (cartRemovalTarget) {
+    const removal = await removeUcpCartItemByName(
+      Number(user.id),
+      cartRemovalTarget
+    );
+    hermesResult = {
+      message: removal.removed
+        ? `Removed ${removal.removedItem.productName || cartRemovalTarget} from your cart.`
+        : `I couldn't find "${cartRemovalTarget}" in your cart. Type REMOVE followed by the product name shown in the cart.`,
+      cartSummary: publicUcpCart(removal.cart),
+    };
+  } else {
+    hermesResult = await runHermesBackend({
+      req,
+      userId: Number(user.id),
+      clerkUserId: user.clerk_user_id || null,
+      messages,
+      language: body.language || body.locale || "en-IN",
+      approvalToken,
+      channel: "telegram",
+    });
+  }
+  const result = telegramIdleCartState.abandoned
+    ? {
+        ...hermesResult,
+        cartCleared: true,
+        message:
+          `I cleared the cart because it was idle for more than 10 minutes. ${String(hermesResult.message || "").trim()}`.trim(),
+      }
+    : hermesResult;
   if (text && !hermesOtpFromMessages([{ role: "user", content: text }])) {
     await db.saveTelegramHermesMessage(chatId, "user", text);
   }
@@ -9711,13 +12110,19 @@ route(
         chargedFlow
       );
       const message =
-        "Payment approved with Prava using the selected one-time mandate. "
-        + "Tokko is finalizing the merchant order. The order is not confirmed until the merchant returns an order confirmation.";
+        "Prava checkout was successful, but the order still awaits merchant approval. "
+        + "This cart was cleared.";
       await db.saveTelegramHermesMessage(chatId, "assistant", message);
+      await db.saveTelegramHermesMessage(
+        chatId,
+        "assistant",
+        "Order creation failed at the merchant end."
+      );
       return sendJson(res, 200, {
         ...result,
         cartCleared,
         message,
+        followupMessage: "Order creation failed at the merchant end.",
         telegram: { chatId, familyLinked: true },
       });
     }
@@ -9735,9 +12140,9 @@ route(
           botUsername,
         }
       );
-      const message =
-        "Open Prava's secure page to approve this non-merchant-scoped one-time mandate. "
-        + "When Prava returns here, Tokko will automatically use it for this cart.";
+      const message = linqMandateSessionMessage(
+        result.mandateSummary || result
+      );
       await db.saveTelegramHermesMessage(chatId, "assistant", message);
       return sendJson(res, 200, {
         ...result,
@@ -9747,6 +12152,7 @@ route(
     }
     const result = await selectUcpSavedCard(Number(user.id), body.token, {
       channel: "telegram",
+      chatId,
       botUsername,
     });
     const pravaSession = result.nextAction?.type === "prava_card_approval";
@@ -9872,11 +12278,15 @@ Object.assign(server, {
   HERMES_UCP_CHECKOUT_TOOL,
   HERMES_ZEPTO_RECONNECT_TOOL,
   MERCHANT_CONSENT_TEXT,
+  UCP_CART_IDLE_TTL_MS,
+  activeUcpCartState,
   canonicalPravaCustomerId,
   careRulesInput,
   chargeLinqUcpMandate,
+  addUcpCartChoice,
   completeLinqOnboarding,
   consumeUcpPravaPaymentResult,
+  completeLinqSavedCardEnrollment,
   createUcpCartCheckout,
   createUcpCheckoutQuote,
   createUcpCheckoutWithPayment,
@@ -9889,22 +12299,36 @@ Object.assign(server, {
   initializeApplication,
   listPravaMandatesForUser,
   linqApprovalRequest,
+  linqAddSavedCardRequest,
   linqChatReturnUrl,
   linqCartChoices,
   linqChoiceRequest,
   linqContextSwitchesCart,
+  linqMandateIntentFromSelection,
+  linqMandateSetupToken,
+  linqMandateSetupUrl,
   linqOnboardingToken,
   linqOnboardingUrl,
   linqPaymentOptionsToken,
   linqPaymentOptionsUrl,
+  telegramPaymentOptionsToken,
+  verifyTelegramPaymentOptionsToken,
+  telegramPaymentOptionsUrl,
+  telegramPravaReturnToken,
+  verifyTelegramPravaReturnToken,
+  telegramPravaBridgeUrl,
+  linqPendingPravaSession,
+  linqPendingCheckoutId,
   linqPendingChoices,
   linqPravaReturnToken,
   linqReplyLink,
   linqReplyText,
   linqSecurePaymentResult,
   linqUcpCheckoutResult,
+  linqProductNameTarget,
   linqFamilyUser,
   handleLinqPravaReturn,
+  verifyLinqMandateSetupToken,
   verifyLinqOnboardingToken,
   verifyLinqPaymentOptionsToken,
   selectLinqFamilyCandidate,
@@ -9913,20 +12337,32 @@ Object.assign(server, {
   parseBody,
   pravaReturnCallback,
   pravaPaymentHandoff,
+  prepareLinqMandateSetupLink,
   prepareTelegramMandateChoices,
   prepareLinqUcpPaymentChoices,
   renderLinqPaymentOptionsPage,
+  renderLinqMandateSetupPage,
+  renderLinqPaymentFailurePage,
+  renderLinqPravaLaunchPage,
   publicUcpCart,
+  removeUcpCartItemByName,
   readRawBody,
   savedAddressInput,
   selectUcpSavedCard,
   startUcpCardChoice,
   startLinqUcpOneTimeMandate,
+  startLinqSavedCardEnrollment,
+  startLinqStandaloneMandate,
+  startLinqStandaloneMandateCardEnrollment,
   startLinqPravaPaymentOption,
   startUcpPravaCardSession,
   startTelegramMandateChoice,
   resumeLinqUcpOneTimeMandate,
+  resumeLinqStandaloneMandate,
+  resumeLinqUcpMandateAfterCardSetup,
   resumeTelegramUcpOneTimeMandate,
+  resumeTelegramCheckoutCardReturn,
+  handleTelegramPravaReturn,
   server,
   start,
   hermesOtpFromMessages,
@@ -9939,10 +12375,15 @@ Object.assign(server, {
   telegramCardReturnMessage,
   telegramMandateReturnMessage,
   telegramMandateIntent,
+  ucpCartRemovalTarget,
   resumeTelegramMandateAfterCard,
   tokkoPaymentRoute,
   ucpSavedCardResult,
   ucpCartMatchesCheckoutFlow,
+  prepareLinqPaymentRetry,
+  leaveLinqPaymentCheckout,
+  prepareTelegramPaymentRetry,
+  leaveTelegramPaymentCheckout,
   usablePravaMandatesForAmount,
   usablePravaMandatesForMerchant,
   usableOneTimeUcpMandates,

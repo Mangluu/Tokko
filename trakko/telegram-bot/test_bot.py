@@ -182,17 +182,26 @@ class PhoneNormalizationTests(unittest.TestCase):
             "merchantGroups": [{"merchant": "oziva"}, {"merchant": "himalayawellness"}],
         }))
 
-    def test_cart_markup_can_remove_items_and_empty_cart(self):
+    def test_cart_markup_uses_typed_removal_instead_of_item_buttons(self):
         markup = bot._ucp_cart_checkout_markup({
             "items": [{"id": "42", "productName": "Neem Shampoo"}],
             "merchantGroups": [{"merchant": "himalayawellness", "merchantName": "Himalaya"}],
         })
         callbacks = [button.callback_data for row in markup.inline_keyboard for button in row]
         labels = [button.text for row in markup.inline_keyboard for button in row]
-        self.assertIn("cart:remove:42", callbacks)
+        self.assertNotIn("cart:remove:42", callbacks)
         self.assertIn("cart:empty", callbacks)
         self.assertIn("cart:checkout:himalayawellness", callbacks)
         self.assertIn("Proceed to Checkout", labels)
+        self.assertIn("remove <product name>", bot._ucp_cart_text({
+            "itemCount": 1,
+            "items": [{"id": "42", "productName": "Neem Shampoo"}],
+            "merchantGroups": [{
+                "merchant": "himalayawellness",
+                "merchantName": "Himalaya",
+                "items": [{"productName": "Neem Shampoo", "quantity": 1}],
+            }],
+        }))
 
     def test_cart_checkout_uses_live_checkout_result_without_missing_order_routes(self):
         result = bot._ucp_checkout_hermes_result({
@@ -235,6 +244,162 @@ class PhoneNormalizationTests(unittest.TestCase):
             approval_result["checkoutSummary"]["confirmationRequired"]
         )
         self.assertIn("3% forex charge", approval_result["message"])
+
+        payment_options = {
+            "type": "prava_payment_options",
+            "label": "Use another payment method with Prava",
+            "url": "https://tokko-shopper.vercel.app/api/payments/telegram/options?state=signed",
+        }
+        payment_result = bot._ucp_checkout_hermes_result({
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "547.00",
+            "paymentRoute": "mandate_selection_required",
+            "merchantHandoffUrl": "https://merchant.example/checkouts/secure-2",
+            "nextAction": payment_options,
+        })
+        self.assertEqual(payment_result["nextAction"], payment_options)
+
+        prava_approval = {
+            "type": "prava_card_approval",
+            "label": "Pay with Prava",
+            "url": "https://checkout.prava.space/session/secure-2",
+        }
+        direct_result = bot._ucp_checkout_hermes_result({
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "547.00",
+            "paymentRoute": "prava_card",
+            "merchantHandoffUrl": "https://merchant.example/checkouts/secure-2",
+            "nextAction": prava_approval,
+        })
+        self.assertEqual(direct_result["nextAction"], prava_approval)
+        self.assertIn("secure Prava payment link", direct_result["message"])
+
+    def test_proceed_to_checkout_starts_a_direct_prava_payment_session(self):
+        query = SimpleNamespace(
+            data="cart:checkout:himalayawellness",
+            answer=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=query.message,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        order_id = "11111111-1111-4111-8111-111111111111"
+        quote = {"orderId": order_id, "approvalRequired": True}
+        approval = {
+            "merchantName": "Himalaya Wellness",
+            "currency": "INR",
+            "totalAmount": "547.00",
+            "paymentRoute": "prava_card",
+            "nextAction": {
+                "type": "prava_card_approval",
+                "label": "Pay securely with Prava",
+                "url": "https://checkout.prava.space/session/direct-1",
+            },
+        }
+        family_api = AsyncMock(side_effect=[quote, approval])
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_telegram_return_context", AsyncMock(return_value={
+                "returnContext": {
+                    "channel": "telegram",
+                    "botUsername": "TokkoShopperBot",
+                },
+            })),
+            patch.object(bot, "_family_api", family_api),
+            patch.object(bot, "_send_hermes_result", AsyncMock()) as send_result,
+        ):
+            asyncio.run(bot.checkout_ucp_merchant_cart(update, context))
+
+        self.assertEqual(family_api.await_count, 2)
+        self.assertEqual(
+            family_api.await_args_list[0].args,
+            (
+                binding,
+                "POST",
+                "merchants/ucp/cart/checkout",
+                {"merchant": "himalayawellness"},
+            ),
+        )
+        self.assertEqual(
+            family_api.await_args_list[1].args,
+            (
+                binding,
+                "POST",
+                f"merchants/ucp/orders/{order_id}/decision",
+                {
+                    "proceed": True,
+                    "paymentFlow": "prava_direct_card",
+                    "returnContext": {
+                        "channel": "telegram",
+                        "botUsername": "TokkoShopperBot",
+                        "chatId": "1234",
+                    },
+                },
+            ),
+        )
+        sent_result = send_result.await_args.args[1]
+        self.assertEqual(
+            sent_result["nextAction"]["url"],
+            "https://checkout.prava.space/session/direct-1",
+        )
+        self.assertNotEqual(
+            sent_result["nextAction"].get("type"),
+            "merchant_ucp_checkout",
+        )
+
+    def test_checkout_approval_requests_the_telegram_linq_payment_policy(self):
+        query = SimpleNamespace(
+            data="ucporder:yes:11111111-1111-4111-8111-111111111111",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=query.message,
+        )
+        context = SimpleNamespace(bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        checkout = {
+            "paymentRoute": "mandate_selection_required",
+            "nextAction": {"type": "prava_payment_options", "url": "https://example.test"},
+        }
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_telegram_return_context", AsyncMock(return_value={
+                "returnContext": {
+                    "channel": "telegram",
+                    "botUsername": "TokkoShopperBot",
+                },
+            })),
+            patch.object(bot, "_family_api", AsyncMock(return_value=checkout)) as family_api,
+            patch.object(bot, "_send_hermes_result", AsyncMock()) as send_result,
+        ):
+            asyncio.run(bot.decide_ucp_order(update, context))
+
+        family_api.assert_awaited_once_with(
+            binding,
+            "POST",
+            "merchants/ucp/orders/11111111-1111-4111-8111-111111111111/decision",
+            {
+                "proceed": True,
+                "paymentFlow": "prava_mandate_selection",
+                "cardChoiceMode": "saved_or_different",
+                "returnContext": {
+                    "channel": "telegram",
+                    "botUsername": "TokkoShopperBot",
+                    "chatId": "1234",
+                },
+            },
+        )
+        send_result.assert_awaited_once()
 
     def test_shopping_message_requires_session_address_confirmation(self):
         update = SimpleNamespace(
@@ -368,6 +533,28 @@ class PhoneNormalizationTests(unittest.TestCase):
         )
         send_result.assert_awaited_once_with(update, checkout_result, binding)
         family_api.assert_not_awaited()
+
+    def test_successful_prava_return_sends_merchant_failure_as_immediate_followup(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+        asyncio.run(bot._send_hermes_result(
+            update,
+            {
+                "message": "Prava checkout was successful, but the order still awaits merchant approval. This cart was cleared.",
+                "credentialIssued": True,
+                "followupMessage": "Order creation failed at the merchant end.",
+            },
+            {"userId": 42},
+        ))
+        self.assertEqual(message.reply_text.await_count, 2)
+        sent = [call.args[0] for call in message.reply_text.await_args_list]
+        self.assertIn("Prava checkout was successful", sent[0])
+        self.assertNotIn("transaction", sent[0].lower())
+        self.assertEqual(sent[1], "Order creation failed at the merchant end.")
 
     def test_mandate_summary_only_shows_top_five(self):
         mandates = [

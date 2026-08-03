@@ -464,6 +464,17 @@ test("Hermes loads the Trakko health policy and delivery-first rules", () => {
   assert.match(prompt, /must not diagnose, prescribe/i);
   assert.match(prompt, /possible emergency signals include chest pain/i);
   assert.match(prompt, /setu is the india skin, hair, gut/i);
+  assert.match(prompt, /standalone mandate creation is separate from cart checkout/i);
+  assert.match(prompt, /open the returned secure prava approval session in the current browser/i);
+  assert.match(
+    prompt,
+    /Prava created mandate successfully, you can continue ordering/
+  );
+  assert.match(
+    prompt,
+    /in telegram, proceed to checkout is the buyer's checkout approval/i
+  );
+  assert.match(prompt, /secure prava hosted payment-session link/i);
   assert.match(prompt, /"age":63/);
   assert.match(prompt, /"gender":"male"/);
   assert.match(prompt, /"selectedDeliveryCountry":"IN"/);
