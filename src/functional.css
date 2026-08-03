@@ -106,6 +106,7 @@
 .tf-owner-card summary { color: var(--muted); font-size: 13px; cursor: pointer; }
 .tf-owner-card summary em, label span em { color: var(--faint); font-style: normal; font-weight: 400; letter-spacing: normal; text-transform: none; }
 .tf-owner-card details > .tf-phone-input { margin-top: 12px; }
+.tf-owner-card > .tf-phone-field { grid-column: 1 / -1; margin-top: 6px; }
 
 .tf-phone-input { display: grid; grid-template-columns: minmax(105px, 145px) 1fr; gap: 8px; }
 .tf-phone-input select, .tf-phone-input input { min-width: 0; }
