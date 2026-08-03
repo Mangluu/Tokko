@@ -282,6 +282,93 @@ class PhoneNormalizationTests(unittest.TestCase):
         send_result.assert_awaited_once_with(update, search_result, binding)
         family_api.assert_not_awaited()
 
+    def test_new_request_clears_cart_from_replaced_approval_context(self):
+        message = SimpleNamespace(text="find vitamin c", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        pending = {"token": "old-token", "description": "unfinished checkout"}
+        search_result = {"message": "fresh results"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "get_pending_action", AsyncMock(return_value=pending)),
+            patch.object(bot, "_address_session_confirmed", AsyncMock(return_value=True)),
+            patch.object(bot, "_clear_abandoned_cart", AsyncMock(return_value={})) as clear_cart,
+            patch.object(bot, "_keep_typing", AsyncMock()),
+            patch.object(bot, "_call_hermes", AsyncMock(return_value=search_result)) as hermes,
+            patch.object(bot, "_send_hermes_result", AsyncMock()),
+        ):
+            asyncio.run(bot.handle_message(update, context))
+        clear_cart.assert_awaited_once_with(1234, binding)
+        hermes.assert_awaited_once_with(
+            1234,
+            binding,
+            "find vitamin c",
+            telegram_bot=context.bot,
+        )
+
+    def test_start_opens_a_fresh_session_with_an_empty_cart(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            message=message,
+        )
+        context = SimpleNamespace(
+            args=[],
+            user_data={},
+            bot=SimpleNamespace(set_my_commands=AsyncMock()),
+        )
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        with (
+            patch.dict(os.environ, {"VERCEL": ""}),
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_clear_abandoned_cart", AsyncMock(return_value={})) as clear_cart,
+            patch.object(bot, "_offer_address_or_ready", AsyncMock()) as offer,
+        ):
+            result = asyncio.run(bot.start(update, context))
+        self.assertEqual(result, bot.ConversationHandler.END)
+        clear_cart.assert_awaited_once_with(1234, binding)
+        offer.assert_awaited_once_with(update, binding, "You're connected to Tokko.")
+
+    def test_mandate_return_resumes_the_same_checkout_conversation(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+        context = SimpleNamespace(
+            args=["payments_mandate_return"],
+            user_data={},
+            bot=SimpleNamespace(set_my_commands=AsyncMock()),
+        )
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        checkout_result = {
+            "message": "The new mandate was automatically used for this cart.",
+            "credentialIssued": True,
+        }
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_call_hermes", AsyncMock(return_value=checkout_result)) as hermes,
+            patch.object(bot, "_send_hermes_result", AsyncMock()) as send_result,
+            patch.object(bot, "_family_api", AsyncMock()) as family_api,
+        ):
+            result = asyncio.run(bot.start(update, context))
+
+        self.assertEqual(result, bot.ConversationHandler.END)
+        hermes.assert_awaited_once_with(
+            1234,
+            binding,
+            text="/start payments_mandate_return",
+            telegram_bot=context.bot,
+        )
+        send_result.assert_awaited_once_with(update, checkout_result, binding)
+        family_api.assert_not_awaited()
+
     def test_mandate_summary_only_shows_top_five(self):
         mandates = [
             {
@@ -450,6 +537,28 @@ class BindingPersistenceTests(unittest.TestCase):
         bot._clear_pending_ucp_cards_sync(1234)
         self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 0))
 
+    def test_clears_all_local_state_for_abandoned_shopping_context(self):
+        bot._set_pending_action_sync(1234, {
+            "token": "signed-approval-token",
+            "description": "checkout",
+            "expiresInSeconds": 600,
+        })
+        bot._set_pending_ucp_cards_sync(1234, [{
+            "token": "signed-card-choice",
+            "brand": "visa",
+            "last4": "4242",
+        }])
+        bot._set_pending_ucp_products_sync(1234, [{
+            "choiceId": "11111111-1111-4111-8111-111111111111",
+            "productName": "Vitamin C",
+        }])
+
+        bot._clear_pending_shopping_context_sync(1234)
+
+        self.assertIsNone(bot._get_pending_action_sync(1234))
+        self.assertIsNone(bot._get_pending_ucp_card_sync(1234, 0))
+        self.assertEqual(bot._get_pending_ucp_products_sync(1234), [])
+
     def test_round_trips_add_card_choice_for_mandate_setup(self):
         choices = [{
             "type": "add_card",
@@ -462,6 +571,43 @@ class BindingPersistenceTests(unittest.TestCase):
         self.assertEqual(saved["token"], choices[0]["token"])
         self.assertEqual(bot._card_choice_label(saved), choices[0]["label"])
         bot._clear_pending_ucp_cards_sync(1234)
+
+    def test_round_trips_and_renders_every_one_time_mandate_choice(self):
+        choices = [
+            {
+                "type": "ucp_mandate",
+                "label": f"Use mandate ending 00{index}",
+                "token": f"signed-mandate-{index}",
+                "mandateId": f"mdt_{index}",
+                "remaining": str(100 + index),
+                "currency": "INR",
+                "frequency": "one_time",
+                "merchantScope": "any",
+            }
+            for index in range(1, 11)
+        ]
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            effective_message=message,
+            message=message,
+        )
+
+        asyncio.run(bot._send_hermes_result(
+            update,
+            {"message": "Choose a payment method.", "cardChoices": choices},
+            {"userId": 42},
+        ))
+
+        saved_last = bot._get_pending_ucp_card_sync(1234, 9)
+        self.assertEqual(saved_last["mandateId"], "mdt_10")
+        self.assertEqual(saved_last["merchantScope"], "any")
+        rendered = message.reply_text.await_args_list[-1].kwargs["reply_markup"]
+        self.assertEqual(len(rendered.inline_keyboard), 10)
+        self.assertEqual(
+            rendered.inline_keyboard[-1][0].callback_data,
+            "ucpcard:9",
+        )
 
 
 if __name__ == "__main__":

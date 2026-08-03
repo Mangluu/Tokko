@@ -575,11 +575,36 @@ def _set_pending_ucp_cards_sync(chat_id: int, choices: list) -> None:
                 {"purpose": str(choice.get("purpose"))}
                 if choice.get("purpose") else {}
             ),
+            **(
+                {"mandateId": str(choice.get("mandateId"))}
+                if choice.get("mandateId") else {}
+            ),
+            **(
+                {"remaining": str(choice.get("remaining"))}
+                if choice.get("remaining") is not None else {}
+            ),
+            **(
+                {"currency": str(choice.get("currency"))}
+                if choice.get("currency") else {}
+            ),
+            **(
+                {"frequency": str(choice.get("frequency"))}
+                if choice.get("frequency") else {}
+            ),
+            **(
+                {"merchantScope": str(choice.get("merchantScope"))}
+                if choice.get("merchantScope") else {}
+            ),
         }
-        for choice in choices[:50]
+        for choice in choices
         if (choice.get("token") or choice.get("paymentMethodId"))
         and (
-            str(choice.get("type") or "saved_card") == "add_card"
+            str(choice.get("type") or "saved_card") in {
+                "add_card",
+                "different_card",
+                "ucp_mandate",
+                "create_ucp_one_time_mandate",
+            }
             or re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
         )
     ]
@@ -706,10 +731,28 @@ def _clear_pending_ucp_cards_sync(chat_id: int) -> None:
         conn.close()
 
 
+def _clear_pending_shopping_context_sync(chat_id: int) -> None:
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        conn.execute("DELETE FROM pending_hermes_actions WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM pending_ucp_card_choices WHERE chat_id = ?", (chat_id,))
+        conn.execute("DELETE FROM pending_ucp_product_choices WHERE chat_id = ?", (chat_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def _card_choice_label(choice: dict, selected: bool = False) -> str:
     prefix = "✓ " if selected else ""
+    if choice.get("label") and choice.get("type") in {
+        "add_card",
+        "different_card",
+        "ucp_mandate",
+        "create_ucp_one_time_mandate",
+    }:
+        return f"{prefix}{str(choice['label'])}"[:64]
     if choice.get("type") == "add_card":
-        return f"{prefix}{str(choice.get('label') or 'Add a new saved card')}"
+        return f"{prefix}Add a new saved card"
     default = "✓ " if choice.get("isDefault") and not selected else ""
     return (
         f"{prefix}{default}{str(choice.get('brand') or 'Card').title()} "
@@ -855,6 +898,12 @@ async def _family_api(
     if response.status_code >= 400:
         raise _api_error(response)
     return response.json()
+
+
+async def _clear_abandoned_cart(chat_id: int, binding: dict) -> dict:
+    result = await _family_api(binding, "DELETE", "merchants/ucp/cart")
+    await asyncio.to_thread(_clear_pending_shopping_context_sync, chat_id)
+    return result.get("cart") or {}
 
 
 async def _telegram_address_session(
@@ -1395,6 +1444,34 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                     f"Transaction: {credential.get('transactionId') or 'pending'}\n"
                     "This single-use virtual PAN is shown for testing. Tokko stored only its fingerprint."
                 )
+            elif return_payload == "payments_mandate_return":
+                try:
+                    checkout_result = await _call_hermes(
+                        chat_id,
+                        binding,
+                        text="/start payments_mandate_return",
+                        telegram_bot=context.bot,
+                    )
+                except TokkoAPIError as exc:
+                    if exc.status_code not in {404, 410}:
+                        raise
+                    checkout_result = None
+                if checkout_result is not None:
+                    await _send_hermes_result(update, checkout_result, binding)
+                    await update.message.reply_text(
+                        "You are back in the same shopping conversation.",
+                        reply_markup=MAIN_KEYBOARD,
+                    )
+                    return ConversationHandler.END
+                result = await _family_api(binding, "GET", "payment/mandates")
+                message = (
+                    "You're back from Prava.\n\n"
+                    + _mandates_text(
+                        result.get("mandates") or [],
+                        total_count=result.get("totalCount"),
+                        has_more=bool(result.get("hasMore")),
+                    )
+                )
             else:
                 result = await _family_api(binding, "GET", "payment/mandates")
                 message = (
@@ -1416,6 +1493,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
             reply_markup=MAIN_KEYBOARD,
         )
         return ConversationHandler.END
+    if binding is not None:
+        try:
+            await _clear_abandoned_cart(chat_id, binding)
+        except Exception as exc:
+            log.exception("Could not start a fresh Telegram shopping session")
+            await update.message.reply_text(
+                f"I couldn't clear the previous cart, so I did not start a session that could show stale items: {exc}"
+            )
+            return ConversationHandler.END
     context.user_data.pop("onboarding", None)
     context.user_data.pop("awaiting_tokko_address", None)
     context.user_data["delivery_address_confirmed"] = False
@@ -2520,10 +2606,15 @@ async def _send_hermes_result(
     card_choices = [
         choice for choice in (result.get("cardChoices") or [])
         if choice.get("token") and (
-            choice.get("type") == "add_card"
+            choice.get("type") in {
+                "add_card",
+                "different_card",
+                "ucp_mandate",
+                "create_ucp_one_time_mandate",
+            }
             or re.fullmatch(r"\d{4}", str(choice.get("last4") or ""))
         )
-    ][:8]
+    ]
     if card_choices:
         mandate_setup = result.get("mandateSetup") or result.get("mandate") or {}
         mandate_choice = bool(mandate_setup)
@@ -2565,7 +2656,7 @@ async def _send_hermes_result(
             (
                 "Choose a saved Prava card for this mandate, or add a new saved card:"
                 if mandate_choice
-                else "Choose a card to pay with Prava:"
+                else "Choose a Prava payment method:"
             ),
             reply_markup=InlineKeyboardMarkup(choice_buttons),
         )
@@ -2872,7 +2963,20 @@ async def checkout_ucp_merchant_cart(
         )
     except Exception as exc:
         log.exception("Could not create merchant UCP cart checkout")
-        await query.message.reply_text(f"I couldn't create that merchant checkout: {exc}")
+        cart_cleared = True
+        try:
+            await _clear_abandoned_cart(update.effective_chat.id, binding)
+        except Exception:
+            cart_cleared = False
+            log.exception("Could not clear cart after Telegram checkout failure")
+        await query.message.reply_text(
+            f"I couldn't create that merchant checkout: {exc}. "
+            + (
+                "The unfinished cart was cleared."
+                if cart_cleared
+                else "I couldn't clear the unfinished cart yet; use /start before shopping again."
+            )
+        )
 
 
 def _ucp_checkout_hermes_result(checkout: dict) -> dict:
@@ -2910,7 +3014,11 @@ def _ucp_checkout_hermes_result(checkout: dict) -> dict:
         "message": message.strip(),
         "checkoutSummary": {
             **checkout,
-            "confirmationRequired": approval_required,
+            **(
+                {"confirmationRequired": True}
+                if approval_required
+                else {}
+            ),
         },
     }
     handoff_url = str(checkout.get("merchantHandoffUrl") or "")
@@ -2948,8 +3056,17 @@ async def decide_ucp_order(
             {"proceed": proceed},
         )
         if not proceed:
+            await asyncio.to_thread(
+                _clear_pending_shopping_context_sync,
+                update.effective_chat.id,
+            )
             await query.edit_message_text(
                 "Order canceled. No payment was attempted and no merchant order was placed."
+                + (
+                    " The unfinished cart was cleared."
+                    if result.get("cartCleared")
+                    else " A newer cart, if any, was left unchanged."
+                )
             )
             return
         await query.edit_message_text(
@@ -2961,7 +3078,13 @@ async def decide_ucp_order(
             binding,
         )
     except Exception as exc:
-        await query.message.reply_text(f"I couldn't save that order choice: {exc}")
+        await asyncio.to_thread(
+            _clear_pending_shopping_context_sync,
+            update.effective_chat.id,
+        )
+        await query.message.reply_text(
+            f"I couldn't save that order choice: {exc}. The stale checkout controls were cleared."
+        )
 
 
 async def show_ucp_payment_category(
@@ -3494,7 +3617,19 @@ async def handle_hermes_confirmation(
     await query.edit_message_reply_markup(reply_markup=_selected_checkbox(label))
     await clear_pending_action(chat_id)
     if not approved:
-        await query.message.reply_text("Okay, I did not make that change.")
+        binding = await get_family_binding(chat_id)
+        if binding is not None:
+            try:
+                await _clear_abandoned_cart(chat_id, binding)
+            except Exception as exc:
+                log.exception("Could not clear declined Telegram cart context")
+                await query.message.reply_text(
+                    f"I declined the action, but couldn't clear its cart yet: {exc}"
+                )
+                return
+        await query.message.reply_text(
+            "Okay, I did not make that change. I also cleared the unfinished cart."
+        )
         return
 
     typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
@@ -3507,20 +3642,21 @@ async def handle_hermes_confirmation(
         )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
-        await set_pending_action(
-            chat_id,
-            {
-                "token": pending["token"],
-                "description": pending.get("description") or "pending action",
-                "expiresInSeconds": 600,
-            },
-        )
+        cart_cleared = True
+        try:
+            await _clear_abandoned_cart(chat_id, binding)
+        except Exception:
+            cart_cleared = False
+            log.exception("Could not clear cart after Telegram button approval failure")
         log.exception("Hermes approval failed")
-        await query.edit_message_reply_markup(
-            reply_markup=HERMES_CONFIRMATION_CHECKBOX
-        )
+        await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(
-            f"I couldn't complete that approval: {exc}. You can tap Approve again."
+            f"I couldn't complete that approval: {exc}. "
+            + (
+                "The unfinished cart was cleared."
+                if cart_cleared
+                else "I couldn't clear the unfinished cart yet; use /start before shopping again."
+            )
         )
     finally:
         typing_task.cancel()
@@ -3768,8 +3904,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if pending is not None:
         answer = _confirmation_answer(text)
         if answer is False:
-            await clear_pending_action(chat_id)
-            await update.message.reply_text("Okay, I did not make that change.")
+            try:
+                await _clear_abandoned_cart(chat_id, binding)
+            except Exception as exc:
+                log.exception("Could not clear canceled Telegram cart context")
+                await update.message.reply_text(
+                    f"I canceled the action, but couldn't clear its cart yet: {exc}"
+                )
+                return
+            await update.message.reply_text(
+                "Okay, I did not make that change. I also cleared the unfinished cart."
+            )
             return
         if answer is True:
             await clear_pending_action(chat_id)
@@ -3783,24 +3928,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 )
                 await _send_hermes_result(update, result, binding)
             except Exception as exc:
-                await set_pending_action(
-                    chat_id,
-                    {
-                        "token": pending["token"],
-                        "description": pending.get("description") or "pending action",
-                        "expiresInSeconds": 600,
-                    },
-                )
+                cart_cleared = True
+                try:
+                    await _clear_abandoned_cart(chat_id, binding)
+                except Exception:
+                    cart_cleared = False
+                    log.exception("Could not clear cart after Telegram approval failure")
                 log.exception("Hermes text approval failed")
                 await update.message.reply_text(
-                    f"I couldn't complete that approval: {exc}. Please try Yes again."
+                    f"I couldn't complete that approval: {exc}. "
+                    + (
+                        "The unfinished cart was cleared so it won't appear in your next request."
+                        if cart_cleared
+                        else "I also couldn't clear the unfinished cart yet; please use /start before shopping again."
+                    )
                 )
             finally:
                 typing_task.cancel()
             return
         # A new request replaces an unanswered approval instead of leaving a
-        # stale token that can cause the previous question to be repeated.
-        await clear_pending_action(chat_id)
+        # stale token or cart that can leak into the new shopping context.
+        try:
+            await _clear_abandoned_cart(chat_id, binding)
+        except Exception as exc:
+            log.exception("Could not clear Telegram cart during context switch")
+            await update.message.reply_text(
+                f"I couldn't switch contexts safely because the previous cart could not be cleared: {exc}"
+            )
+            return
     typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
     try:
         result = await _call_hermes(

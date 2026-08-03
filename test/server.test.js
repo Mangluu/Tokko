@@ -389,6 +389,94 @@ test("LINQ cart and checkout replies preserve Telegram action states", () => {
   assert.doesNotMatch(correctedAmount.message, /INR 53\.00/);
 });
 
+test("LINQ recognizes a new request as a cart context switch", () => {
+  const binding = {
+    pending_action: { token: "old-approval" },
+    pending_choices: { type: "checkout", items: [] },
+  };
+  assert.equal(
+    server.linqContextSwitchesCart("find vitamin c instead", binding),
+    true
+  );
+  assert.equal(server.linqContextSwitchesCart("YES", binding), false);
+  assert.equal(server.linqContextSwitchesCart("show cart", binding), false);
+  assert.equal(
+    server.linqContextSwitchesCart(
+      "choose the first option",
+      binding,
+      { type: "checkout", item: { action: "approve" } }
+    ),
+    false
+  );
+  assert.equal(
+    server.linqContextSwitchesCart("find vitamin c", {}),
+    false
+  );
+});
+
+test("checkout cleanup only matches the cart captured by that flow", () => {
+  const oldFlow = {
+    cart_snapshot: [
+      { selectionToken: "token-a", quantity: 1 },
+      { selectionToken: "token-b", quantity: 2 },
+    ],
+  };
+  assert.equal(
+    server.ucpCartMatchesCheckoutFlow({
+      items: [
+        { selectionToken: "token-b", quantity: 2 },
+        { selectionToken: "token-a", quantity: 1 },
+      ],
+    }, oldFlow),
+    true
+  );
+  assert.equal(
+    server.ucpCartMatchesCheckoutFlow({
+      items: [{ selectionToken: "new-cart-token", quantity: 1 }],
+    }, oldFlow),
+    false
+  );
+});
+
+test(
+  "a failed UCP checkout clears the cart instead of leaving stale items",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      getUcpCart: db.getUcpCart,
+      clearUcpCart: db.clearUcpCart,
+    };
+    let clearedUserId = null;
+    try {
+      db.getUcpCart = async () => ({
+        items: [
+          {
+            merchant: "merchant-a",
+            selectionToken: "token-a",
+            quantity: 1,
+          },
+          {
+            merchant: "merchant-b",
+            selectionToken: "token-b",
+            quantity: 1,
+          },
+        ],
+      });
+      db.clearUcpCart = async (userId) => {
+        clearedUserId = userId;
+        return { items: [] };
+      };
+      await assert.rejects(
+        server.createUcpCartCheckout(55),
+        /one merchant/
+      );
+      assert.equal(clearedUserId, 55);
+    } finally {
+      Object.assign(db, originals);
+    }
+  }
+);
+
 test("LINQ never exposes a merchant UCP checkout URL", () => {
   const result = server.linqUcpCheckoutResult({
     approvalRequired: false,
@@ -455,6 +543,10 @@ test("LINQ offers a saved card or a different card for Prava payment", () => {
   assert.deepEqual(server.linqApprovalRequest(55, choice), {
     token,
     toolName: "select_ucp_saved_card",
+    args: {
+      tokkoFlowId: "11111111-1111-4111-8111-111111111111",
+      paymentMethodId: "9",
+    },
   });
 
   const differentCardToken = hermes.signApproval({
@@ -540,13 +632,16 @@ test(
     const originals = {
       listCards: payments.listCards,
       listMandates: payments.listMandates,
+      createPaymentSession: payments.createPaymentSession,
       createMandateSession: payments.createMandateSession,
       chargeMandate: payments.chargeMandate,
       getUserById: db.getUserById,
       getProfile: db.getProfile,
       getPaymentCustomer: db.getPaymentCustomer,
       getPaymentMethods: db.getPaymentMethods,
+      syncPaymentMethods: db.syncPaymentMethods,
       getCheckoutFlow: db.getCheckoutFlow,
+      getLinqHermesBinding: db.getLinqHermesBinding,
       saveCheckoutFlow: db.saveCheckoutFlow,
     };
     const flowId = "11111111-1111-4111-8111-111111111111";
@@ -570,6 +665,7 @@ test(
       }],
     };
     let mandateApproved = false;
+    let paymentSessionArgs = null;
     let mandateSessionArgs = null;
     let mandateChargeArgs = null;
     let savedFlow = {
@@ -631,34 +727,92 @@ test(
         last4: "2259",
         is_default: true,
       }];
+      db.syncPaymentMethods = async () => db.getPaymentMethods();
       db.getCheckoutFlow = async () => savedFlow;
+      db.getLinqHermesBinding = async () => ({
+        user_id: 55,
+        to_phone: "+12025551234",
+      });
       db.saveCheckoutFlow = async (flow) => {
         savedFlow = persistedFlow(flow);
         return savedFlow;
       };
-      payments.listCards = async () => [];
+      payments.listCards = async () => [{
+        card_id: "card_saved_9",
+        card_brand: "visa",
+        card_last4: "2259",
+        card_exp_month: 12,
+        card_exp_year: 2030,
+        is_default: true,
+      }];
       payments.listMandates = async () => [{
         id: "mdt_existing",
         status: "active",
         state: "available",
         frequency: "one_time",
-        merchantScope: "listed",
-        merchantName: "Himalaya Wellness",
+        merchantScope: "any",
         approvedAmount: "200.00",
         remaining: "200.00",
+        currency: "INR",
+      }, {
+        id: "mdt_existing_2",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        approvedAmount: "300.00",
+        remaining: "300.00",
+        currency: "INR",
+      }, {
+        id: "mdt_existing_3",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        approvedAmount: "400.00",
+        remaining: "400.00",
+        currency: "INR",
+      }, {
+        id: "mdt_existing_4",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        approvedAmount: "500.00",
+        remaining: "500.00",
+        currency: "INR",
+      }, {
+        id: "mdt_merchant_scoped",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "listed",
+        merchantName: "Himalaya Wellness",
+        approvedAmount: "600.00",
+        remaining: "600.00",
         currency: "INR",
       }, ...(mandateApproved ? [{
         id: "mdt_new_one_time",
         status: "active",
         state: "available",
         frequency: "one_time",
-        merchantScope: "listed",
-        merchantName: "Himalaya Wellness",
+        merchantScope: "any",
         approvedAmount: "114.00",
         remaining: "114.00",
         currency: "INR",
         createdAt: "2030-01-01T00:00:00.000Z",
       }] : [])];
+      payments.createPaymentSession = async (args) => {
+        paymentSessionArgs = args;
+        return {
+          provider: "prava",
+          sessionId: "sess_payment_1",
+          approvalUrl: "https://checkout.sandbox.prava.space/s/sess_payment_1",
+          expiresAt: "2030-01-01T00:15:00.000Z",
+          amount: "114.00",
+          currency: "INR",
+        };
+      };
       payments.createMandateSession = async (args) => {
         mandateSessionArgs = args;
         return {
@@ -688,16 +842,21 @@ test(
         };
       };
 
-      const choices = await server.prepareLinqUcpPaymentChoices(55, checkout);
+      const linqContext = {
+        channel: "linq",
+        chatId,
+        to: "+12025551234",
+      };
+      const choices = await server.prepareLinqUcpPaymentChoices(
+        55,
+        checkout,
+        linqContext
+      );
       assert.equal(choices.mandateCheck.status, "one_time_mandate_available");
+      assert.equal(choices.mandateChoices.length, 4);
       assert.deepEqual(
-        choices.cardChoices.slice(0, 4).map((choice) => choice.type),
-        [
-          "ucp_mandate",
-          "create_ucp_one_time_mandate",
-          "ucp_saved_card",
-          "different_card",
-        ]
+        choices.mandateChoices.map((choice) => choice.mandateId),
+        ["mdt_existing", "mdt_existing_2", "mdt_existing_3", "mdt_existing_4"]
       );
       assert.equal(
         server.linqChoiceRequest(
@@ -706,21 +865,50 @@ test(
         ).item.selectionType,
         "ucp_mandate"
       );
-      const createChoice = choices.cardChoices[1];
-      assert.equal(
-        hermes.verifyApproval(createChoice.token, 55).toolName,
-        "create_ucp_one_time_mandate"
+      assert.deepEqual(
+        [...new Set(choices.cardChoices.map((choice) => choice.type))],
+        ["ucp_mandate"]
       );
+      assert.equal(choices.nextAction.type, "prava_payment_options");
+      const optionsUrl = new URL(choices.nextAction.url);
+      assert.equal(optionsUrl.pathname, "/api/payments/linq/options");
+      const paymentContext = server.verifyLinqPaymentOptionsToken(
+        optionsUrl.searchParams.get("state")
+      );
+      assert.equal(paymentContext.userId, 55);
+      assert.equal(paymentContext.checkoutId, flowId);
+      assert.equal(paymentContext.chatId, chatId);
+      const paymentPage = server.renderLinqPaymentOptionsPage({
+        state: optionsUrl.searchParams.get("state"),
+        flow: savedFlow,
+        cards: [{ id: "9", brand: "visa", last4: "2259" }],
+      });
+      assert.match(paymentPage, /Pay with a saved card/);
+      assert.match(paymentPage, /visa ending 2259/);
+      assert.match(paymentPage, /separate secure sessions/);
 
-      const setup = await server.startLinqUcpOneTimeMandate(
-        55,
-        createChoice.token,
-        { channel: "linq", chatId, to: "+12025551234" }
+      const direct = await server.startLinqPravaPaymentOption(paymentContext, {
+        action: "direct_card",
+      });
+      assert.equal(direct.nextAction.type, "prava_card_approval");
+      assert.equal(paymentSessionArgs.cardId, null);
+      const directCallback = new URL(paymentSessionArgs.callbackUrl);
+      assert.equal(
+        server.verifyLinqPravaReturnToken(
+          directCallback.searchParams.get("state")
+        ).stage,
+        "ucp_payment"
       );
+      savedFlow = { ...savedFlow, status: "UCP_APPROVED" };
+
+      const setup = await server.startLinqPravaPaymentOption(paymentContext, {
+        action: "create_mandate",
+        paymentMethodId: "9",
+      });
       assert.equal(setup.frequency, "one_time");
-      assert.equal(setup.merchantScope, "listed");
+      assert.equal(setup.merchantScope, "any");
       assert.equal(mandateSessionArgs.frequency, "one_time");
-      assert.equal(mandateSessionArgs.merchantScope, "listed");
+      assert.equal(mandateSessionArgs.merchantScope, "any");
       assert.equal(mandateSessionArgs.amount, "114.00");
       assert.equal(mandateSessionArgs.cardId, "card_saved_9");
       const callback = new URL(mandateSessionArgs.callbackUrl);
@@ -731,20 +919,13 @@ test(
       assert.equal(callbackContext.flow, "mandate");
 
       mandateApproved = true;
-      const ready = await server.resumeLinqUcpOneTimeMandate({
+      const charged = await server.resumeLinqUcpOneTimeMandate({
         userId: 55,
         chatId,
         checkoutId: flowId,
         to: "+12025551234",
         stage: "ucp_mandate_setup",
       });
-      assert.equal(ready.cardChoices[0].type, "ucp_mandate");
-      assert.equal(ready.cardChoices[0].mandateId, "mdt_new_one_time");
-
-      const charged = await server.chargeLinqUcpMandate(
-        55,
-        ready.cardChoices[0].token
-      );
       assert.equal(charged.status, "PAYMENT_APPROVED");
       assert.equal(charged.mandate.frequency, "one_time");
       assert.equal(mandateChargeArgs.mandateId, "mdt_new_one_time");
@@ -757,6 +938,7 @@ test(
       Object.assign(payments, {
         listCards: originals.listCards,
         listMandates: originals.listMandates,
+        createPaymentSession: originals.createPaymentSession,
         createMandateSession: originals.createMandateSession,
         chargeMandate: originals.chargeMandate,
       });
@@ -765,7 +947,9 @@ test(
         getProfile: originals.getProfile,
         getPaymentCustomer: originals.getPaymentCustomer,
         getPaymentMethods: originals.getPaymentMethods,
+        syncPaymentMethods: originals.syncPaymentMethods,
         getCheckoutFlow: originals.getCheckoutFlow,
+        getLinqHermesBinding: originals.getLinqHermesBinding,
         saveCheckoutFlow: originals.saveCheckoutFlow,
       });
     }
@@ -1004,7 +1188,183 @@ test("Telegram mandate setup validates scope and recognizes Prava card returns",
     true
   );
   assert.equal(server.telegramCardReturnMessage("payments_card_return"), false);
+  assert.equal(
+    server.telegramMandateReturnMessage("/start payments_mandate_return"),
+    true
+  );
+  assert.equal(
+    server.telegramMandateReturnMessage("payments_mandate_return"),
+    false
+  );
 });
+
+test("LINQ Prava payment-option links are signed, expiring, and public", () => {
+  const now = Date.parse("2026-08-03T12:00:00.000Z");
+  const paymentContext = {
+    userId: 55,
+    chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+    checkoutId: "11111111-1111-4111-8111-111111111111",
+    to: "+12025551234",
+  };
+  const token = server.linqPaymentOptionsToken(paymentContext, {
+    now,
+    ttlMs: 60_000,
+  });
+  assert.deepEqual(
+    {
+      ...server.verifyLinqPaymentOptionsToken(token, { now: now + 1_000 }),
+      issuedAt: undefined,
+      expiresAt: undefined,
+    },
+    { ...paymentContext, issuedAt: undefined, expiresAt: undefined }
+  );
+  assert.throws(
+    () => server.verifyLinqPaymentOptionsToken(token, { now: now + 60_001 }),
+    /expired/
+  );
+  assert.throws(
+    () => server.verifyLinqPaymentOptionsToken(`${token}x`, { now }),
+    /invalid/
+  );
+  assert.ok(server.matchRoute("GET", "/api/payments/linq/options?state=x"));
+  assert.ok(server.matchRoute(
+    "GET",
+    "/api/payments/linq/options/continue?state=x&action=direct_card"
+  ));
+  const result = server.linqUcpCheckoutResult({
+    paymentRoute: "mandate_selection_required",
+    merchantName: "Himalaya Wellness",
+    currency: "INR",
+    totalAmount: "114.00",
+    cardChoices: [],
+    nextAction: {
+      type: "prava_payment_options",
+      label: "Use another payment method with Prava",
+      url: "https://tokko.example/api/payments/linq/options?state=signed",
+    },
+  });
+  assert.match(result.message, /no active one-time mandate/i);
+  assert.equal(
+    server.linqReplyLink(result),
+    "https://tokko.example/api/payments/linq/options?state=signed"
+  );
+});
+
+test(
+  "Telegram mandate return automatically charges the newly created checkout mandate",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      getRecentCheckoutFlows: db.getRecentCheckoutFlows,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
+      getPaymentCustomer: db.getPaymentCustomer,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      getUcpCart: db.getUcpCart,
+      clearUcpCart: db.clearUcpCart,
+      listMandates: payments.listMandates,
+      chargeMandate: payments.chargeMandate,
+    };
+    const flowId = "55555555-5555-4555-8555-555555555555";
+    let flow = {
+      id: flowId,
+      user_id: 55,
+      platform: "ucp",
+      status: "UCP_MANDATE_APPROVAL_REQUIRED",
+      price_breakdown: {
+        tokkoFlowId: flowId,
+        merchantName: "Himalaya Wellness",
+        merchantUrl: "https://himalayawellness.in",
+        totalMinor: 11400,
+        totalAmount: "114.00",
+        currency: "INR",
+        channelMandateSetup: {
+          channel: "telegram",
+          chatId: "777",
+          frequency: "one_time",
+          merchantScope: "any",
+          mandateIdsBefore: ["mdt_old"],
+        },
+      },
+      cart_snapshot: [],
+    };
+    let chargeArgs = null;
+    try {
+      db.getRecentCheckoutFlows = async () => [flow];
+      db.getCheckoutFlow = async () => flow;
+      db.getPaymentCustomer = async () => ({
+        provider: "prava",
+        provider_customer_id: "tokko_family_55",
+      });
+      db.getUserById = async () => ({ id: 55, email: "family@example.com" });
+      db.getProfile = async () => ({
+        user_id: 55,
+        primary_parent_phone: "+919900112233",
+      });
+      db.getUcpCart = async () => ({ items: [] });
+      db.clearUcpCart = async () => ({ items: [] });
+      db.saveCheckoutFlow = async (saved) => {
+        flow = {
+          ...flow,
+          status: saved.status,
+          payment_route: saved.paymentRoute,
+          prava_mandate_id: saved.pravaMandateId,
+          prava_transaction_id: saved.pravaTransactionId,
+          prava_charge_reference: saved.pravaChargeReference,
+          prava_charge_status: saved.pravaChargeStatus,
+          prava_charge_amount: saved.pravaChargeAmount,
+          price_breakdown: saved.priceBreakdown,
+          cart_snapshot: saved.cartSnapshot,
+        };
+        return flow;
+      };
+      payments.listMandates = async () => [{
+        id: "mdt_new_any",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        approvedAmount: "114.00",
+        remaining: "114.00",
+        currency: "INR",
+      }];
+      payments.chargeMandate = async (args) => {
+        chargeArgs = args;
+        return {
+          mandateId: args.mandateId,
+          transactionId: "txn_telegram_return",
+          status: "awaiting_result",
+          credentials: { token: "ephemeral-test-token" },
+        };
+      };
+
+      const result = await server.resumeTelegramUcpOneTimeMandate(55, 777);
+
+      assert.equal(result.status, "PAYMENT_APPROVED");
+      assert.equal(result.credentialIssued, true);
+      assert.equal(result.mandate.id, "mdt_new_any");
+      assert.equal(chargeArgs.mandateId, "mdt_new_any");
+      assert.equal(chargeArgs.amount, "114.00");
+      assert.match(result.message, /automatically used for this cart/i);
+    } finally {
+      Object.assign(db, {
+        getRecentCheckoutFlows: originals.getRecentCheckoutFlows,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
+        getPaymentCustomer: originals.getPaymentCustomer,
+        getUserById: originals.getUserById,
+        getProfile: originals.getProfile,
+        getUcpCart: originals.getUcpCart,
+        clearUcpCart: originals.clearUcpCart,
+      });
+      Object.assign(payments, {
+        listMandates: originals.listMandates,
+        chargeMandate: originals.chargeMandate,
+      });
+    }
+  }
+);
 
 test(
   "Telegram mandate setup returns every masked saved card and an add-card choice",
@@ -1413,6 +1773,40 @@ test(
         checkoutOptions.destination.street_address,
         "12 Park Street"
       );
+
+      chargeInput = undefined;
+      payments.listMandates = async () => [
+        ...[300, 400, 500, 600].map((remaining, index) => ({
+          id: `mdt_any_${index + 1}`,
+          status: "active",
+          state: "available",
+          frequency: "one_time",
+          merchantScope: "any",
+          remaining: remaining.toFixed(2),
+          currency: "INR",
+        })),
+        {
+          id: "mdt_listed_not_offered",
+          status: "active",
+          state: "available",
+          frequency: "one_time",
+          merchantScope: "listed",
+          merchantName: "Himalaya Wellness",
+          remaining: "700.00",
+          currency: "INR",
+        },
+      ];
+      const telegramResult = await server.createUcpCheckoutWithPayment(
+        42,
+        { selectionToken: "signed-selection", quantity: 1 },
+        { channel: "telegram", botUsername: "TokkoBot" }
+      );
+      assert.equal(chargeInput, undefined);
+      assert.equal(telegramResult.paymentRoute, "payment_selection_required");
+      assert.deepEqual(
+        telegramResult.mandateChoices.map((choice) => choice.mandateId),
+        ["mdt_any_1", "mdt_any_2", "mdt_any_3", "mdt_any_4"]
+      );
     } finally {
       Object.assign(ucp, { createCheckout: originals.createCheckout });
       Object.assign(payments, {
@@ -1707,6 +2101,9 @@ test(
       );
       assert.equal(result.card, null);
       assert.equal(result.merchantHandoffUrl, null);
+      assert.ok(result.cardChoices.some(
+        (choice) => choice.type === "create_ucp_one_time_mandate"
+      ));
       // Prava session created with NO card_id — buyer enters a card on the hosted page.
       assert.equal(sessionArgs.cardId, null);
     } finally {
@@ -2065,6 +2462,7 @@ test(
     const originals = {
       getPaymentResult: payments.getPaymentResult,
       getCheckoutFlow: db.getCheckoutFlow,
+      getUcpCart: db.getUcpCart,
       getLinqHermesBinding: db.getLinqHermesBinding,
       clearUcpCart: db.clearUcpCart,
       saveCheckoutFlow: db.saveCheckoutFlow,
@@ -2104,7 +2502,10 @@ test(
           "https://checkout.prava.space/s/sess_ucp_55",
         prava_charge_amount: "101.97",
         price_breakdown: {},
-        cart_snapshot: [],
+        cart_snapshot: [{ selectionToken: "checkout-item-token", quantity: 1 }],
+      });
+      db.getUcpCart = async () => ({
+        items: [{ selectionToken: "checkout-item-token", quantity: 1 }],
       });
       db.saveCheckoutFlow = async (flow) => {
         savedFlow = flow;
@@ -2211,6 +2612,7 @@ test(
       });
       Object.assign(db, {
         getCheckoutFlow: originals.getCheckoutFlow,
+        getUcpCart: originals.getUcpCart,
         getLinqHermesBinding: originals.getLinqHermesBinding,
         clearUcpCart: originals.clearUcpCart,
         saveCheckoutFlow: originals.saveCheckoutFlow,
