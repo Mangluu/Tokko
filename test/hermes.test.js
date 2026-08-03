@@ -471,6 +471,17 @@ test("Hermes loads the Trakko health policy and delivery-first rules", () => {
   assert.doesNotMatch(prompt, /you are tokko/i);
 });
 
+test("LINQ introduces the assistant as Tokko without changing other channels", () => {
+  const prompt = hermes.systemPrompt({
+    channel: "linq",
+    responseLanguage: "en-IN",
+  });
+
+  assert.match(prompt, /you are tokko, a calm family health and wellness assistant/i);
+  assert.match(prompt, /hi, i'm tokko/i);
+  assert.doesNotMatch(prompt, /hi, i am trakko/i);
+});
+
 test("Hermes learns explicit family health facts without storing raw chat", () => {
   assert.deepEqual(
     hermes.extractExplicitMemories([

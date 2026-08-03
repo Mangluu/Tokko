@@ -812,8 +812,12 @@ test(
         email: "family@example.com",
         cardId: "card_saved_1",
         amount: "150.00",
+        currency: "USD",
+        phone: "+12025550123",
+        countryCode: "US",
         callbackUrl: "https://zepto-shop.vercel.app/?pravaCheckout=return",
         externalOrderRef: "tokko_checkout_123",
+        description: "Authorize Acme checkout with Prava.",
         purchaseContext: [{
           merchant_details: {
             name: "Zepto",
@@ -830,8 +834,13 @@ test(
       });
       assert.equal(session.sessionId, "ses_card_payment_123");
       assert.equal(session.amount, "150.00");
+      assert.equal(session.currency, "USD");
       const createBody = JSON.parse(requests[0].options.body);
       assert.deepEqual(createBody.card, { card_id: "card_saved_1" });
+      assert.equal(createBody.currency, "USD");
+      assert.equal(createBody.user_phone, "+12025550123");
+      assert.equal(createBody.user_country_code_iso2, "US");
+      assert.equal(createBody.description, "Authorize Acme checkout with Prava.");
       assert.equal(createBody.mandate_setup, undefined);
       assert.equal(createBody.integration_type, "full_checkout");
 

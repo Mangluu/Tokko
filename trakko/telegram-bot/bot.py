@@ -16,6 +16,7 @@ import logging
 import os
 import re
 import sqlite3
+import uuid
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -53,6 +54,108 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("httpcore").setLevel(logging.WARNING)
 log = logging.getLogger("telegram-hermes-bridge")
+
+TELEGRAM_BOT_USERNAME_PATTERN = re.compile(
+    r"[A-Za-z][A-Za-z0-9_]{3,30}bot",
+    re.IGNORECASE,
+)
+
+
+def _new_trace_id() -> str:
+    return uuid.uuid4().hex
+
+
+def _telegram_bot_username_diagnostic(value: object, source: str) -> dict:
+    supplied = str(value or "").strip()
+    username = supplied.lstrip("@")
+    return {
+        "source": source,
+        "present": bool(supplied),
+        "suppliedLength": len(supplied),
+        "normalizedLength": len(username),
+        "strippedLeadingAt": supplied.startswith("@"),
+        "endsWithBot": bool(re.search(r"bot$", username, re.IGNORECASE)),
+        "startsWithLetter": bool(re.match(r"[A-Za-z]", username)),
+        "allowedCharacters": bool(re.fullmatch(r"[A-Za-z0-9_]*", username)),
+        "valid": bool(TELEGRAM_BOT_USERNAME_PATTERN.fullmatch(username)),
+        "preview": re.sub(r"[^A-Za-z0-9_]", "?", username[:40]),
+    }
+
+
+async def _resolve_telegram_bot_username(
+    telegram_bot: object | None,
+    *,
+    trace_id: str,
+    required: bool,
+) -> str | None:
+    candidates: list[tuple[str, object]] = []
+    try:
+        candidates.append(
+            ("telegram.bot.username", getattr(telegram_bot, "username", None))
+        )
+    except Exception:
+        log.warning(
+            "Telegram bot username property failed trace_id=%s",
+            trace_id,
+            exc_info=True,
+        )
+    candidates.append(
+        ("env.TELEGRAM_BOT_USERNAME", os.environ.get("TELEGRAM_BOT_USERNAME"))
+    )
+
+    diagnostics = []
+    for source, value in candidates:
+        diagnostic = _telegram_bot_username_diagnostic(value, source)
+        diagnostics.append(diagnostic)
+        if diagnostic["valid"]:
+            log.info(
+                "Telegram bot username resolved trace_id=%s source=%s preview=%s "
+                "length=%s",
+                trace_id,
+                source,
+                diagnostic["preview"],
+                diagnostic["normalizedLength"],
+            )
+            return str(value).strip().lstrip("@")
+
+    get_me = getattr(telegram_bot, "get_me", None)
+    if callable(get_me):
+        try:
+            me = await get_me()
+            diagnostic = _telegram_bot_username_diagnostic(
+                getattr(me, "username", None),
+                "telegram.get_me.username",
+            )
+            diagnostics.append(diagnostic)
+            if diagnostic["valid"]:
+                log.info(
+                    "Telegram bot username resolved trace_id=%s source=%s "
+                    "preview=%s length=%s",
+                    trace_id,
+                    diagnostic["source"],
+                    diagnostic["preview"],
+                    diagnostic["normalizedLength"],
+                )
+                return str(getattr(me, "username", "")).strip().lstrip("@")
+        except Exception:
+            log.warning(
+                "Telegram getMe username lookup failed trace_id=%s",
+                trace_id,
+                exc_info=True,
+            )
+
+    log.warning(
+        "Telegram bot username unavailable trace_id=%s required=%s candidates=%s",
+        trace_id,
+        required,
+        diagnostics,
+    )
+    if required:
+        raise RuntimeError(
+            "Telegram bot username is unavailable for the payment return link "
+            f"(trace {trace_id})"
+        )
+    return None
 
 
 def _required_env(name: str) -> str:
@@ -663,10 +766,30 @@ def _api_error(response: httpx.Response) -> TokkoAPIError:
     except ValueError:
         body = {}
     message = body.get("error") if isinstance(body, dict) else None
+    trace_id = str(
+        response.headers.get("X-Tokko-Trace-Id")
+        or (body.get("traceId") if isinstance(body, dict) else "")
+        or ""
+    ).strip()
+    details = body if isinstance(body, dict) else {}
+    if trace_id:
+        details = {**details, "traceId": trace_id}
+    request = getattr(response, "request", None)
+    request_url = str(getattr(request, "url", ""))
+    log.error(
+        "Tokko API request failed trace_id=%s status=%s path=%s code=%s",
+        trace_id or "unavailable",
+        response.status_code,
+        getattr(getattr(request, "url", None), "path", request_url),
+        details.get("code") if isinstance(details, dict) else None,
+    )
+    display_message = str(message or f"Tokko returned HTTP {response.status_code}")
+    if trace_id:
+        display_message = f"{display_message} (trace {trace_id})"
     return TokkoAPIError(
         response.status_code,
-        str(message or f"Tokko returned HTTP {response.status_code}"),
-        body if isinstance(body, dict) else {},
+        display_message,
+        details,
     )
 
 
@@ -836,7 +959,9 @@ async def _call_hermes(
     binding: dict,
     text: str = "",
     approval_token: str | None = None,
+    telegram_bot: object | None = None,
 ) -> dict:
+    trace_id = _new_trace_id()
     payload = {
         "telegramChatId": chat_id,
         "familyUserId": binding["userId"],
@@ -846,12 +971,40 @@ async def _call_hermes(
         payload["text"] = text
     if approval_token:
         payload["approvalToken"] = approval_token
+    bot_username = await _resolve_telegram_bot_username(
+        telegram_bot,
+        trace_id=trace_id,
+        required=False,
+    )
+    if bot_username:
+        payload["botUsername"] = bot_username
+    endpoint = _required_env("HERMES_ENDPOINT_URL")
+    log.info(
+        "Calling Tokko Hermes trace_id=%s chat_id_suffix=%s family_user_id=%s "
+        "has_text=%s has_approval=%s bot_username_present=%s",
+        trace_id,
+        str(chat_id)[-6:],
+        binding["userId"],
+        bool(text),
+        bool(approval_token),
+        bool(bot_username),
+    )
     async with httpx.AsyncClient(timeout=HERMES_TIMEOUT) as client:
         response = await client.post(
-            _required_env("HERMES_ENDPOINT_URL"),
+            endpoint,
             json=payload,
-            headers={**_tokko_headers(), "Content-Type": "application/json"},
+            headers={
+                **_tokko_headers(),
+                "Content-Type": "application/json",
+                "X-Tokko-Trace-Id": trace_id,
+            },
         )
+    log.info(
+        "Tokko Hermes responded trace_id=%s status=%s response_trace_id=%s",
+        trace_id,
+        response.status_code,
+        response.headers.get("X-Tokko-Trace-Id") or "unavailable",
+    )
     if response.status_code >= 400:
         raise _api_error(response)
     data = response.json()
@@ -895,6 +1048,7 @@ async def _select_ucp_card(
     token: str,
     bot_username: str | None = None,
 ) -> dict:
+    trace_id = _new_trace_id()
     endpoint = _required_env("HERMES_ENDPOINT_URL").rstrip("/")
     if endpoint.endswith("/hermes"):
         endpoint = f"{endpoint}/payment-choice"
@@ -907,12 +1061,37 @@ async def _select_ucp_card(
     }
     if bot_username:
         payload["botUsername"] = bot_username
+    diagnostic = _telegram_bot_username_diagnostic(
+        bot_username,
+        "payment-choice.botUsername",
+    )
+    log.info(
+        "Calling Tokko payment choice trace_id=%s chat_id_suffix=%s "
+        "family_user_id=%s "
+        "bot_username_present=%s bot_username_valid=%s",
+        trace_id,
+        str(chat_id)[-6:],
+        binding["userId"],
+        diagnostic["present"],
+        diagnostic["valid"],
+    )
     async with httpx.AsyncClient(timeout=HERMES_TIMEOUT) as client:
         response = await client.post(
             endpoint,
             json=payload,
-            headers={**_tokko_headers(), "Content-Type": "application/json"},
+            headers={
+                **_tokko_headers(),
+                "Content-Type": "application/json",
+                "X-Tokko-Trace-Id": trace_id,
+            },
         )
+    log.info(
+        "Tokko payment choice responded trace_id=%s status=%s "
+        "response_trace_id=%s",
+        trace_id,
+        response.status_code,
+        response.headers.get("X-Tokko-Trace-Id") or "unavailable",
+    )
     if response.status_code >= 400:
         raise _api_error(response)
     data = response.json()
@@ -952,13 +1131,12 @@ async def _mandate_card_options(
 
 
 async def _telegram_return_context(context: ContextTypes.DEFAULT_TYPE) -> dict:
-    username = str(context.bot.username or os.environ.get("TELEGRAM_BOT_USERNAME") or "")
-    username = username.strip().lstrip("@")
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,30}bot", username, re.IGNORECASE):
-        me = await context.bot.get_me()
-        username = str(me.username or "").strip().lstrip("@")
-    if not re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{3,30}bot", username, re.IGNORECASE):
-        raise RuntimeError("Telegram bot username is unavailable for the payment return link")
+    trace_id = _new_trace_id()
+    username = await _resolve_telegram_bot_username(
+        context.bot,
+        trace_id=trace_id,
+        required=True,
+    )
     return {
         "returnContext": {
             "channel": "telegram",
@@ -1176,6 +1354,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
                         chat_id,
                         binding,
                         text="/start payments_card_return",
+                        telegram_bot=context.bot,
                     )
                 except TokkoAPIError as exc:
                     if exc.status_code not in {404, 410}:
@@ -3273,6 +3452,7 @@ async def show_more_products(
             update.effective_chat.id,
             binding,
             f"show up to 10 more results from my previous product search, starting at offset {offset}; use the merchant locked to my current cart",
+            telegram_bot=context.bot,
         )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
@@ -3323,6 +3503,7 @@ async def handle_hermes_confirmation(
             chat_id,
             binding,
             approval_token=pending["token"],
+            telegram_bot=context.bot,
         )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
@@ -3426,7 +3607,12 @@ async def handle_voice_message(
         )
         transcript = str(transcription.get("transcript") or "").strip()
         await update.message.reply_text(f"I heard: {transcript}")
-        result = await _call_hermes(chat_id, binding, transcript)
+        result = await _call_hermes(
+            chat_id,
+            binding,
+            transcript,
+            telegram_bot=context.bot,
+        )
         await _send_hermes_result(update, result, binding)
     except Exception as exc:
         log.exception("Telegram voice search failed")
@@ -3561,7 +3747,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         re.IGNORECASE,
     ):
         try:
-            result = await _call_hermes(chat_id, binding, text)
+            result = await _call_hermes(
+                chat_id,
+                binding,
+                text,
+                telegram_bot=context.bot,
+            )
             await _send_hermes_result(update, result, binding)
         except Exception as exc:
             await update.message.reply_text(f"I couldn't update your cart: {exc}")
@@ -3588,6 +3779,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                     chat_id,
                     binding,
                     approval_token=pending["token"],
+                    telegram_bot=context.bot,
                 )
                 await _send_hermes_result(update, result, binding)
             except Exception as exc:
@@ -3611,7 +3803,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await clear_pending_action(chat_id)
     typing_task = asyncio.create_task(_keep_typing(context.bot, chat_id))
     try:
-        result = await _call_hermes(chat_id, binding, text)
+        result = await _call_hermes(
+            chat_id,
+            binding,
+            text,
+            telegram_bot=context.bot,
+        )
     except httpx.TimeoutException:
         log.exception("Hermes call timed out")
         await update.message.reply_text(

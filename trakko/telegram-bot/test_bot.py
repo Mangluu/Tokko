@@ -9,6 +9,46 @@ import bot
 
 
 class PhoneNormalizationTests(unittest.TestCase):
+    def test_bot_username_diagnostic_explains_invalid_values(self):
+        diagnostic = bot._telegram_bot_username_diagnostic(
+            "@Tokko Shopper",
+            "env.TELEGRAM_BOT_USERNAME",
+        )
+        self.assertFalse(diagnostic["valid"])
+        self.assertFalse(diagnostic["endsWithBot"])
+        self.assertFalse(diagnostic["allowedCharacters"])
+        self.assertEqual(diagnostic["preview"], "Tokko?Shopper")
+
+    def test_bot_username_resolver_prefers_runtime_bot_username(self):
+        telegram_bot = SimpleNamespace(username="@TokkoShopperBot")
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_BOT_USERNAME": "Invalid Display Name"},
+        ):
+            username = asyncio.run(bot._resolve_telegram_bot_username(
+                telegram_bot,
+                trace_id="trace-runtime",
+                required=True,
+            ))
+        self.assertEqual(username, "TokkoShopperBot")
+
+    def test_bot_username_resolver_uses_get_me_after_invalid_env(self):
+        telegram_bot = SimpleNamespace(
+            username=None,
+            get_me=AsyncMock(return_value=SimpleNamespace(username="TokkoLiveBot")),
+        )
+        with patch.dict(
+            os.environ,
+            {"TELEGRAM_BOT_USERNAME": "Tokko display name"},
+        ):
+            username = asyncio.run(bot._resolve_telegram_bot_username(
+                telegram_bot,
+                trace_id="trace-get-me",
+                required=True,
+            ))
+        self.assertEqual(username, "TokkoLiveBot")
+        telegram_bot.get_me.assert_awaited_once()
+
     def test_normalizes_telegram_contact(self):
         self.assertEqual(bot._normalize_phone("91 98765-43210"), "+919876543210")
 
@@ -233,7 +273,12 @@ class PhoneNormalizationTests(unittest.TestCase):
             patch.object(bot, "_family_api", AsyncMock()) as family_api,
         ):
             asyncio.run(bot.handle_message(update, context))
-        hermes.assert_awaited_once_with(1234, binding, "find milk")
+        hermes.assert_awaited_once_with(
+            1234,
+            binding,
+            "find milk",
+            telegram_bot=context.bot,
+        )
         send_result.assert_awaited_once_with(update, search_result, binding)
         family_api.assert_not_awaited()
 
