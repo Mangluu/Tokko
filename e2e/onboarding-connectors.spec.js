@@ -139,3 +139,31 @@ test('Personal shopper uses the full dashboard workspace', async ({ page }) => {
   }));
   expect(Math.abs(heights.viewport - heights.shopper)).toBeLessThanOrEqual(1);
 });
+
+test('Messaging options reveal QR codes for Telegram and iMessage', async ({ page }) => {
+  await page.route('**/api/**', async (route) => {
+    const path = new URL(route.request().url()).pathname;
+    const json = (body, status = 200) => route.fulfill({
+      status,
+      contentType: 'application/json',
+      body: JSON.stringify(body),
+    });
+    if (path === '/api/me') return json({ error: 'Authentication required' }, 401);
+    return json({});
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Enter Tokko' }).click();
+  await page.getByRole('button', { name: 'Set up my family' }).click();
+
+  await page.getByRole('button', { name: /Telegram @TokkoShopperBot/ }).click();
+  let dialog = page.getByRole('dialog', { name: 'Chat on Telegram' });
+  await expect(dialog.getByRole('img', { name: 'QR code to connect with Tokko on Telegram' })).toBeVisible();
+  await expect(dialog.getByRole('link', { name: 'Open Telegram' })).toHaveAttribute('href', 'https://t.me/TokkoShopperBot');
+  await dialog.getByRole('button', { name: 'Close QR code' }).click();
+
+  await page.getByRole('button', { name: /iMessage \+1 \(628\) 303-6599/ }).click();
+  dialog = page.getByRole('dialog', { name: 'Chat on iMessage' });
+  await expect(dialog.getByRole('img', { name: 'QR code to connect with Tokko on iMessage' })).toBeVisible();
+  await expect(dialog.getByRole('link', { name: 'Open in Messages' })).toHaveAttribute('href', 'sms:+16283036599');
+});

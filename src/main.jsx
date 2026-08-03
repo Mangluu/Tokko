@@ -24,6 +24,28 @@ const MERCHANTS = [
 const COUNTRY_CODES = [['+91', 'India +91'], ['+1', 'US / Canada +1'], ['+44', 'UK +44'], ['+61', 'Australia +61'], ['+65', 'Singapore +65'], ['+971', 'UAE +971']];
 const RELATIONSHIPS = ['Mother', 'Father', 'Spouse', 'Child', 'Son', 'Daughter', 'Sibling', 'Grandparent', 'Other'];
 const CATEGORIES = [['medicines', 'Medicines'], ['wellness', 'Wellness'], ['personal_care', 'Personal care'], ['devices', 'Health devices'], ['nutrition', 'Nutrition']];
+const MESSAGING_CHANNELS = {
+  telegram: {
+    label: 'Telegram',
+    detail: '@TokkoShopperBot',
+    href: 'https://t.me/TokkoShopperBot',
+    qrSrc: '/assets/qr-telegram.svg',
+    className: 'is-telegram',
+    icon: Send,
+    action: 'Open Telegram',
+    instructions: 'Scan with your phone camera to open the Tokko bot in Telegram.',
+  },
+  imessage: {
+    label: 'iMessage',
+    detail: '+1 (628) 303-6599',
+    href: 'sms:+16283036599',
+    qrSrc: '/assets/qr-imessage.svg',
+    className: 'is-imessage',
+    icon: Smartphone,
+    action: 'Open in Messages',
+    instructions: 'Scan with your iPhone camera to start a conversation with Tokko in Messages.',
+  },
+};
 let clerkBrowserPromise = null;
 
 // ponytail: 10-digit cap fits +91 (and the longest supported codes); server E.164 validation remains the backstop.
@@ -130,18 +152,30 @@ function Status({ value }) {
 }
 
 function MessagingConnect() {
-  const [bot, setBot] = useState(null);
-  useEffect(() => { api('/api/config').then((config) => setBot(config.telegramBotUsername || null)).catch(() => {}); }, []);
-  const telegramHref = bot ? `https://t.me/${bot}` : null;
-  return <div className="tf-messaging-connect">
-    <div className="tf-messaging-head"><span className="tf-messaging-icon"><MessageCircle size={17} /></span><div><strong>Connect your messaging</strong><small>Tokko lives where your family already chats. Link a channel, then sign in to save it.</small></div></div>
-    <div className="tf-channel-list">
-      {telegramHref
-        ? <a className="tf-channel is-telegram" href={telegramHref} target="_blank" rel="noreferrer"><span className="tf-channel-icon"><Send size={18} /></span><div><strong>Telegram</strong><small>Open the Tokko bot to link your chat</small></div><ArrowRight size={16} /></a>
-        : <div className="tf-channel is-telegram" aria-disabled="true"><span className="tf-channel-icon"><Send size={18} /></span><div><strong>Telegram</strong><small>Sign in first, then link your chat</small></div><ArrowRight size={16} /></div>}
-      <div className="tf-channel is-imessage" aria-disabled="true"><span className="tf-channel-icon"><Smartphone size={18} /></span><div><strong>iMessage</strong><small>On the roadmap</small></div><span className="tf-soon-badge">Soon</span></div>
+  const [selectedChannel, setSelectedChannel] = useState(null);
+  const channel = selectedChannel ? MESSAGING_CHANNELS[selectedChannel] : null;
+  return <>
+    <div className="tf-messaging-connect">
+      <div className="tf-messaging-head"><span className="tf-messaging-icon"><MessageCircle size={17} /></span><div><strong>Connect your messaging</strong><small>Scan a code to start chatting with Tokko on the channel you already use.</small></div></div>
+      <div className="tf-channel-list">
+        {Object.entries(MESSAGING_CHANNELS).map(([key, item]) => {
+          const Icon = item.icon;
+          return <button className={`tf-channel ${item.className}`} type="button" aria-haspopup="dialog" onClick={() => setSelectedChannel(key)} key={key}><span className="tf-channel-icon"><Icon size={18} /></span><div><strong>{item.label}</strong><small>{item.detail}</small></div><ArrowRight size={16} /></button>;
+        })}
+      </div>
     </div>
-  </div>;
+    <Modal open={Boolean(channel)} onClose={() => setSelectedChannel(null)} titleId="messaging-qr-title" className={`tf-qr-modal ${channel?.className || ''}`}>
+      {channel && <>
+        <button className="tf-modal-close" type="button" onClick={() => setSelectedChannel(null)} aria-label="Close QR code"><X size={19} /></button>
+        <span className="tf-qr-channel-icon"><channel.icon size={22} /></span>
+        <h2 id="messaging-qr-title">Chat on {channel.label}</h2>
+        <p>{channel.instructions}</p>
+        <div className="tf-qr-frame"><img src={channel.qrSrc} alt={`QR code to connect with Tokko on ${channel.label}`} /></div>
+        <div className="tf-qr-destination"><small>{channel.label === 'Telegram' ? 'Bot username' : 'Message number'}</small><strong>{channel.detail}</strong></div>
+        <a className="tokko-button tokko-button-primary tf-qr-action" href={channel.href} target={channel.label === 'Telegram' ? '_blank' : undefined} rel={channel.label === 'Telegram' ? 'noreferrer' : undefined}>{channel.action} <ArrowRight size={17} /></a>
+      </>}
+    </Modal>
+  </>;
 }
 function AccountAccess({ onAuthenticated, initialEmail = '', initialStatus = '' }) {
   const pendingChallengeRef = useRef(null);
