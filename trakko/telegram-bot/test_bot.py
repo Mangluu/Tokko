@@ -83,6 +83,79 @@ class PhoneNormalizationTests(unittest.TestCase):
         self.assertIsNone(bot._valid_mandate_amount("0"))
         self.assertIsNone(bot._valid_mandate_amount("50.999"))
 
+    def test_recognizes_mandate_creation_with_or_without_an_amount(self):
+        self.assertEqual(
+            bot._telegram_mandate_creation_request("create a mandate"),
+            (True, None),
+        )
+        self.assertEqual(
+            bot._telegram_mandate_creation_request("create a 1 time mandate"),
+            (True, None),
+        )
+        self.assertEqual(
+            bot._telegram_mandate_creation_request(
+                "create a ₹750 any-merchant mandate"
+            ),
+            (True, "750.00"),
+        )
+        self.assertEqual(
+            bot._telegram_mandate_creation_request("show my active mandates"),
+            (False, None),
+        )
+
+    def test_create_mandate_without_amount_prompts_for_amount_before_hermes(self):
+        message = SimpleNamespace(text="create a mandate", reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            message=message,
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_call_hermes", AsyncMock()) as hermes,
+            patch.object(bot, "_address_session_confirmed", AsyncMock()) as address,
+        ):
+            asyncio.run(bot.handle_message(update, context))
+
+        message.reply_text.assert_awaited_once()
+        self.assertIn("maximum amount", message.reply_text.await_args.args[0])
+        self.assertIs(
+            message.reply_text.await_args.kwargs["reply_markup"],
+            bot.MANDATE_AMOUNT_INLINE_KEYBOARD,
+        )
+        hermes.assert_not_awaited()
+        address.assert_not_awaited()
+
+    def test_create_mandate_with_amount_continues_to_frequency_flow(self):
+        message = SimpleNamespace(
+            text="set up an INR 750 mandate",
+            reply_text=AsyncMock(),
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            message=message,
+        )
+        context = SimpleNamespace(user_data={}, bot=SimpleNamespace())
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_call_hermes", AsyncMock()) as hermes,
+            patch.object(bot, "_address_session_confirmed", AsyncMock()) as address,
+        ):
+            asyncio.run(bot.handle_message(update, context))
+
+        sent = message.reply_text.await_args
+        self.assertIn("₹750 per charge", sent.args[0])
+        callbacks = [
+            button.callback_data
+            for row in sent.kwargs["reply_markup"].inline_keyboard
+            for button in row
+        ]
+        self.assertIn("mandatefreq:750.00:o:a", callbacks)
+        hermes.assert_not_awaited()
+        address.assert_not_awaited()
+
     def test_understands_typed_definitive_answers(self):
         self.assertIs(bot._confirmation_answer("yes, approve"), True)
         self.assertIs(bot._confirmation_answer("Go ahead"), True)
@@ -203,6 +276,37 @@ class PhoneNormalizationTests(unittest.TestCase):
             }],
         }))
 
+    def test_empty_cart_callback_removes_inline_buttons_without_reply_keyboard(self):
+        query = SimpleNamespace(
+            data="cart:empty",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+        )
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(
+                bot,
+                "_family_api",
+                AsyncMock(return_value={"cart": {"items": [], "merchantGroups": []}}),
+            ) as family_api,
+        ):
+            asyncio.run(bot.modify_ucp_cart(update, SimpleNamespace()))
+
+        family_api.assert_awaited_once_with(
+            binding,
+            "DELETE",
+            "merchants/ucp/cart",
+        )
+        query.edit_message_text.assert_awaited_once()
+        self.assertIsNone(query.edit_message_text.await_args.kwargs["reply_markup"])
+        query.message.reply_text.assert_not_awaited()
+
     def test_cart_checkout_uses_live_checkout_result_without_missing_order_routes(self):
         result = bot._ucp_checkout_hermes_result({
             "merchantName": "Himalaya Wellness",
@@ -276,7 +380,7 @@ class PhoneNormalizationTests(unittest.TestCase):
         self.assertEqual(direct_result["nextAction"], prava_approval)
         self.assertIn("secure Prava payment link", direct_result["message"])
 
-    def test_proceed_to_checkout_starts_a_direct_prava_payment_session(self):
+    def test_proceed_to_checkout_offers_active_mandates_and_direct_prava_payment(self):
         query = SimpleNamespace(
             data="cart:checkout:himalayawellness",
             answer=AsyncMock(),
@@ -295,7 +399,14 @@ class PhoneNormalizationTests(unittest.TestCase):
             "merchantName": "Himalaya Wellness",
             "currency": "INR",
             "totalAmount": "547.00",
-            "paymentRoute": "prava_card",
+            "paymentRoute": "mandate_selection_required",
+            "cardChoices": [
+                {
+                    "type": "ucp_mandate",
+                    "id": "mandate-active-1",
+                    "label": "Use one-time Prava mandate ending 1234",
+                },
+            ],
             "nextAction": {
                 "type": "prava_card_approval",
                 "label": "Pay securely with Prava",
@@ -334,7 +445,8 @@ class PhoneNormalizationTests(unittest.TestCase):
                 f"merchants/ucp/orders/{order_id}/decision",
                 {
                     "proceed": True,
-                    "paymentFlow": "prava_direct_card",
+                    "paymentFlow": "prava_mandate_selection",
+                    "cardChoiceMode": "saved_or_different",
                     "returnContext": {
                         "channel": "telegram",
                         "botUsername": "TokkoShopperBot",
@@ -344,6 +456,7 @@ class PhoneNormalizationTests(unittest.TestCase):
             ),
         )
         sent_result = send_result.await_args.args[1]
+        self.assertEqual(sent_result["cardChoices"], approval["cardChoices"])
         self.assertEqual(
             sent_result["nextAction"]["url"],
             "https://checkout.prava.space/session/direct-1",
@@ -569,7 +682,7 @@ class PhoneNormalizationTests(unittest.TestCase):
             for index in range(1, 8)
         ]
         message = bot._mandates_text(mandates, total_count=7, has_more=True)
-        self.assertIn("Top Prava mandates: 5", message)
+        self.assertIn("Active Prava mandates: 5", message)
         self.assertIn("Merchant 5", message)
         self.assertNotIn("Merchant 6", message)
         self.assertIn("Showing 5 of 7", message)
@@ -617,6 +730,124 @@ class PhoneNormalizationTests(unittest.TestCase):
         )
         self.assertIn("Any merchant", message)
         self.assertNotIn("Tokko Health & Wellness", message)
+
+    def test_active_mandates_are_rendered_as_clickable_buttons(self):
+        mandates = [
+            {
+                "id": "mandate-active",
+                "status": "active",
+                "merchantName": "Kapiva",
+                "currency": "INR",
+                "approvedAmount": "500",
+                "remaining": "420",
+            },
+            {
+                "id": "mandate-available",
+                "status": "pending",
+                "state": "available",
+                "merchantScope": "any",
+                "currency": "INR",
+                "approvedAmount": "1000",
+                "remaining": "1000",
+            },
+            {
+                "id": "mandate-expired",
+                "status": "expired",
+                "merchantName": "Expired merchant",
+                "currency": "INR",
+                "approvedAmount": "200",
+                "remaining": "0",
+            },
+        ]
+
+        markup = bot._active_mandates_markup(mandates)
+        buttons = [row[0] for row in markup.inline_keyboard]
+
+        self.assertEqual(
+            [button.callback_data for button in buttons],
+            ["mandate:view:0", "mandate:view:1", "mandates:active"],
+        )
+        self.assertIn("Kapiva · INR 420 left", buttons[0].text)
+        self.assertIn("Any merchant · INR 1000 left", buttons[1].text)
+        self.assertNotIn("Expired merchant", " ".join(button.text for button in buttons))
+
+    def test_payments_entry_immediately_shows_active_mandate_buttons(self):
+        message = SimpleNamespace(reply_text=AsyncMock())
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=1234),
+            message=message,
+        )
+        context = SimpleNamespace(user_data={})
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        mandates_result = {
+            "mandates": [{
+                "id": "mandate-active",
+                "status": "active",
+                "merchantName": "Kapiva",
+                "currency": "INR",
+                "approvedAmount": "500",
+                "remaining": "420",
+            }],
+            "summary": {"activeCount": 1},
+            "totalCount": 1,
+            "hasMore": False,
+        }
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_family_api", AsyncMock(return_value=mandates_result)) as family_api,
+        ):
+            state = asyncio.run(bot.payments_entry(update, context))
+
+        self.assertEqual(state, bot.PAYMENT_MENU_STATE)
+        family_api.assert_awaited_once_with(binding, "GET", "payment/mandates")
+        self.assertEqual(message.reply_text.await_count, 2)
+        mandate_call = message.reply_text.await_args_list[1]
+        self.assertIn("Active Prava mandates: 1", mandate_call.args[0])
+        self.assertEqual(
+            mandate_call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+            "mandate:view:0",
+        )
+
+    def test_clicking_active_mandate_shows_current_details(self):
+        query = SimpleNamespace(
+            data="mandate:view:0",
+            answer=AsyncMock(),
+            edit_message_text=AsyncMock(),
+            message=SimpleNamespace(reply_text=AsyncMock()),
+        )
+        update = SimpleNamespace(
+            callback_query=query,
+            effective_chat=SimpleNamespace(id=1234),
+        )
+        binding = {"userId": 42, "customerId": "tokko_family_42"}
+        mandates_result = {
+            "mandates": [{
+                "id": "mandate-active",
+                "status": "active",
+                "merchantName": "Kapiva",
+                "currency": "INR",
+                "approvedAmount": "500",
+                "remaining": "420",
+                "frequency": "one_time",
+            }],
+        }
+        with (
+            patch.object(bot, "get_family_binding", AsyncMock(return_value=binding)),
+            patch.object(bot, "_family_api", AsyncMock(return_value=mandates_result)),
+        ):
+            asyncio.run(bot.view_active_mandate(
+                update,
+                SimpleNamespace(),
+            ))
+
+        details_call = query.edit_message_text.await_args
+        self.assertIn("Active Prava mandate", details_call.args[0])
+        self.assertIn("Merchant: Kapiva", details_call.args[0])
+        self.assertIn("Available: INR 420", details_call.args[0])
+        self.assertEqual(
+            details_call.kwargs["reply_markup"].inline_keyboard[0][0].callback_data,
+            "mandates:active",
+        )
 
 
 class OnboardingRedirectTests(unittest.TestCase):
@@ -828,7 +1059,7 @@ class BindingPersistenceTests(unittest.TestCase):
 
         self.assertEqual(message.reply_text.await_count, 1)
         sent = message.reply_text.await_args
-        self.assertIn("Choose a Prava payment method", sent.args[0])
+        self.assertIn("Choose one Prava payment option", sent.args[0])
         markup = sent.kwargs["reply_markup"]
         self.assertEqual(len(markup.inline_keyboard), 2)
         self.assertEqual(

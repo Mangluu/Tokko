@@ -2110,22 +2110,75 @@ def _saved_cards_text(cards: list) -> str:
     return "\n".join(rows)
 
 
+def _is_active_prava_mandate(mandate: dict) -> bool:
+    return (
+        str(mandate.get("status") or "").lower() == "active"
+        or str(mandate.get("state") or "").lower() == "available"
+    )
+
+
+def _active_prava_mandates(mandates: list) -> list:
+    return [
+        mandate
+        for mandate in mandates
+        if isinstance(mandate, dict) and _is_active_prava_mandate(mandate)
+    ]
+
+
+def _mandate_merchant_label(mandate: dict) -> str:
+    return (
+        "Any merchant"
+        if str(mandate.get("merchantScope") or "").lower() == "any"
+        else str(mandate.get("merchantName") or "Listed merchant")
+    )
+
+
+def _active_mandates_markup(mandates: list) -> InlineKeyboardMarkup:
+    active = _active_prava_mandates(mandates)[:5]
+    rows = []
+    for index, mandate in enumerate(active):
+        currency = str(mandate.get("currency") or "INR").upper()
+        remaining = str(
+            mandate.get("remaining")
+            or mandate.get("approvedAmount")
+            or "0"
+        )
+        rows.append([InlineKeyboardButton(
+            (
+                f"✓ {_mandate_merchant_label(mandate)} · "
+                f"{currency} {remaining} left"
+            )[:64],
+            callback_data=f"mandate:view:{index}",
+        )])
+    rows.append([InlineKeyboardButton(
+        "Refresh Active Mandates",
+        callback_data="mandates:active",
+    )])
+    return InlineKeyboardMarkup(rows)
+
+
 def _mandates_text(
     mandates: list,
     *,
     total_count=None,
+    active_count=None,
     has_more: bool = False,
     history: bool = False,
 ) -> str:
-    visible = list(mandates) if history else list(mandates)[:5]
+    all_mandates = list(mandates)
+    visible = (
+        all_mandates
+        if history
+        else _active_prava_mandates(all_mandates)[:5]
+    )
     if history and not visible:
         return "No Prava mandate activity was found in the last 30 days."
     if not visible:
-        return "No Prava mandates are available. Choose Create Mandate to add one."
+        return "No active Prava mandates are available. Choose Create Mandate to add one."
     heading = (
         f"Prava mandate history, last 30 days: {len(visible)}"
         if history
-        else f"Top Prava mandates: {len(visible)}"
+        else f"Active Prava mandates: {len(visible)}"
     )
     rows = [heading]
     for index, mandate in enumerate(visible, start=1):
@@ -2134,11 +2187,7 @@ def _mandates_text(
         currency = str(mandate.get("currency") or "INR")
         approved = str(mandate.get("approvedAmount") or "0")
         remaining = str(mandate.get("remaining") or approved)
-        merchant = (
-            "Any merchant"
-            if str(mandate.get("merchantScope") or "").lower() == "any"
-            else str(mandate.get("merchantName") or "Listed merchant")
-        )
+        merchant = _mandate_merchant_label(mandate)
         rows.append(
             f"{index}. {status}, {merchant}, {currency} {remaining} remaining "
             f"of {approved} per charge, {frequency}"
@@ -2155,15 +2204,55 @@ def _mandates_text(
                 rows.append(f"   activity: {str(activity_at)[:10]}")
     if not history:
         try:
-            available_total = max(len(visible), int(total_count))
+            available_total = max(
+                len(visible),
+                int(active_count if active_count is not None else total_count),
+            )
         except (TypeError, ValueError):
             available_total = len(visible)
-        if has_more or available_total > len(visible):
+        if available_total > len(visible):
             rows.append(
-                f"\nShowing {len(visible)} of {available_total}. "
+                f"\nShowing {len(visible)} of {available_total} active mandates. "
                 "Choose Show All (30 Days) for one-month history."
             )
     return "\n".join(rows)
+
+
+def _current_mandates_text(result: dict) -> str:
+    summary = result.get("summary") or {}
+    return _mandates_text(
+        result.get("mandates") or [],
+        total_count=result.get("totalCount"),
+        active_count=summary.get("activeCount"),
+        has_more=bool(result.get("hasMore")),
+    )
+
+
+async def _reply_with_current_mandates(message, result: dict) -> None:
+    mandates = result.get("mandates") or []
+    await message.reply_text(
+        _current_mandates_text(result),
+        reply_markup=_active_mandates_markup(mandates),
+    )
+
+
+def _active_mandate_details_text(mandate: dict) -> str:
+    currency = str(mandate.get("currency") or "INR").upper()
+    approved = str(mandate.get("approvedAmount") or "0")
+    remaining = str(mandate.get("remaining") or approved)
+    frequency = str(mandate.get("frequency") or "one_time").replace("_", " ")
+    lines = [
+        "Active Prava mandate",
+        "",
+        f"Merchant: {_mandate_merchant_label(mandate)}",
+        f"Available: {currency} {remaining}",
+        f"Per-charge limit: {currency} {approved}",
+        f"Frequency: {frequency}",
+    ]
+    valid_until = mandate.get("validUntil") or mandate.get("renewsAt")
+    if valid_until:
+        lines.append(f"Valid through: {str(valid_until)[:10]}")
+    return "\n".join(lines)
 
 
 async def payments_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -2179,6 +2268,15 @@ async def payments_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         "Manage your family's Prava cards and mandates. Card details are collected only on Prava's hosted page.",
         reply_markup=PAYMENT_MENU_KEYBOARD,
     )
+    try:
+        result = await _family_api(binding, "GET", "payment/mandates")
+        await _reply_with_current_mandates(update.message, result)
+    except Exception as exc:
+        log.exception("Could not load active Prava mandates in the payment menu")
+        await update.message.reply_text(
+            f"I couldn't load active mandates yet: {exc}. "
+            "Tap View Mandates or Refresh Active Mandates to retry."
+        )
     return PAYMENT_MENU_STATE
 
 
@@ -2243,14 +2341,8 @@ async def payment_menu_action(
     if action == "View Mandates":
         try:
             result = await _family_api(binding, "GET", "payment/mandates")
-            return await _show_payment_menu(
-                update,
-                _mandates_text(
-                    result.get("mandates") or [],
-                    total_count=result.get("totalCount"),
-                    has_more=bool(result.get("hasMore")),
-                ),
-            )
+            await _reply_with_current_mandates(update.message, result)
+            return PAYMENT_MENU_STATE
         except Exception as exc:
             log.exception("Prava mandate list failed")
             return await _show_payment_menu(update, f"I couldn't list mandates: {exc}")
@@ -2269,12 +2361,62 @@ async def payment_menu_action(
                 update, f"I couldn't load the last 30 days of mandate history: {exc}"
             )
     if action == "Create Mandate":
-        await update.message.reply_text(
-            "Choose the maximum amount for each charge. For a custom amount, send a message such as “create a ₹750 any-merchant mandate”.",
-            reply_markup=MANDATE_AMOUNT_INLINE_KEYBOARD,
-        )
+        await _prompt_mandate_amount(update.message)
         return ConversationHandler.END
     return await _show_payment_menu(update, "Choose a payment option from the buttons.")
+
+
+async def view_active_mandate(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    del context
+    query = update.callback_query
+    await query.answer("Refreshing active mandates...")
+    binding = await get_family_binding(update.effective_chat.id)
+    if binding is None:
+        await query.message.reply_text(
+            "Please send /start and connect your Tokko family again.",
+            reply_markup=CONTACT_KEYBOARD,
+        )
+        return
+    try:
+        result = await _family_api(binding, "GET", "payment/mandates")
+        mandates = result.get("mandates") or []
+        active = _active_prava_mandates(mandates)[:5]
+        if query.data == "mandates:active":
+            try:
+                await query.edit_message_text(
+                    _current_mandates_text(result),
+                    reply_markup=_active_mandates_markup(mandates),
+                )
+            except Exception as exc:
+                if "message is not modified" not in str(exc).lower():
+                    raise
+            return
+        index = int(query.data.rsplit(":", 1)[-1])
+        if not 0 <= index < len(active):
+            await query.edit_message_text(
+                "That mandate is no longer active. Refresh the list to continue.",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton(
+                        "Refresh Active Mandates",
+                        callback_data="mandates:active",
+                    )
+                ]]),
+            )
+            return
+        await query.edit_message_text(
+            _active_mandate_details_text(active[index]),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton(
+                    "Back to Active Mandates",
+                    callback_data="mandates:active",
+                )
+            ]]),
+        )
+    except Exception as exc:
+        log.exception("Could not refresh active Prava mandates")
+        await query.message.reply_text(f"I couldn't refresh active mandates: {exc}")
 
 
 async def mandate_card_selected(
@@ -2310,6 +2452,51 @@ def _valid_mandate_amount(value: str) -> str | None:
     if amount <= 0 or amount > 1_000_000:
         return None
     return f"{amount:.2f}"
+
+
+def _telegram_mandate_creation_request(value: str) -> tuple[bool, str | None]:
+    text = re.sub(r"\s+", " ", str(value or "").strip())
+    if not re.search(r"\bmandates?\b", text, re.IGNORECASE):
+        return False, None
+    if not re.search(
+        r"\b(?:create|make|add|new|set\s*up|setup)\b",
+        text,
+        re.IGNORECASE,
+    ):
+        return False, None
+    amount_match = next(
+        (
+            match
+            for match in re.finditer(
+                r"(?:₹|rs\.?|inr)?\s*(\d+(?:\.\d{1,2})?)",
+                text,
+                re.IGNORECASE,
+            )
+            if not re.match(r"\s*[- ]?time\b", text[match.end():], re.IGNORECASE)
+        ),
+        None,
+    )
+    amount = (
+        _valid_mandate_amount(amount_match.group(1))
+        if amount_match is not None
+        else None
+    )
+    return True, amount
+
+
+async def _prompt_mandate_amount(message) -> None:
+    await message.reply_text(
+        "Choose the maximum amount for each charge. You can select a preset below.",
+        reply_markup=MANDATE_AMOUNT_INLINE_KEYBOARD,
+    )
+
+
+async def _continue_mandate_creation_from_amount(message, amount: str) -> None:
+    display_amount = amount[:-3] if amount.endswith(".00") else amount
+    await message.reply_text(
+        f"₹{display_amount} per charge. Choose the mandate frequency and merchant scope:",
+        reply_markup=_mandate_frequency_inline_keyboard(amount),
+    )
 
 
 async def mandate_amount_selected(
@@ -2883,7 +3070,7 @@ async def modify_ucp_cart(
             message = f"Removed {removed.get('productName') or 'that item'} from your cart."
         await query.edit_message_text(
             f"{message}\n\n{_ucp_cart_text(cart)}",
-            reply_markup=_ucp_cart_checkout_markup(cart) or MAIN_KEYBOARD,
+            reply_markup=_ucp_cart_checkout_markup(cart),
         )
     except Exception as exc:
         log.exception("Could not update UCP cart")
@@ -3060,7 +3247,8 @@ async def checkout_ucp_merchant_cart(
                 f"merchants/ucp/orders/{order_id}/decision",
                 {
                     "proceed": True,
-                    "paymentFlow": "prava_direct_card",
+                    "paymentFlow": "prava_mandate_selection",
+                    "cardChoiceMode": "saved_or_different",
                     **return_context,
                 },
             )
@@ -3947,6 +4135,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         )
         return
     text = _text(update)
+    mandate_request, mandate_amount = _telegram_mandate_creation_request(text)
+    if mandate_request:
+        if mandate_amount is None:
+            await _prompt_mandate_amount(update.message)
+        else:
+            await _continue_mandate_creation_from_amount(
+                update.message,
+                mandate_amount,
+            )
+        return
     if await _awaiting_address_input(chat_id, context) or re.match(
         r"^address\s*:", text, re.IGNORECASE
     ):
@@ -4230,6 +4428,12 @@ def build_application() -> Application:
         CallbackQueryHandler(
             handle_hermes_confirmation,
             pattern=r"^hermes:(?:approve|decline)$",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            view_active_mandate,
+            pattern=r"^(?:mandates:active|mandate:view:\d+)$",
         )
     )
     app.add_handler(

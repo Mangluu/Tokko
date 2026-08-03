@@ -114,14 +114,14 @@ const HERMES_UCP_CHECKOUT_TOOL = {
 const HERMES_MANDATE_TOOL = {
   name: "prepare_payment_mandate",
   description:
-    "Prepare Prava mandate setup. In LINQ this returns one secure hosted setup link where the user confirms the amount and chooses or adds a saved card. In other channels it may return masked saved-card choices. Use this when the user asks to create, set up, or approve a payment mandate. Never choose a card on the user's behalf.",
+    "Prepare standalone Prava mandate setup. Use this when the user asks to create, set up, or approve a payment mandate for later use, separate from checkout. In LINQ, if the amount is missing, ask for it in chat and wait. Once the amount is known, return masked saved-card choices or an add-card choice; the selected choice must open Prava directly. Never send a new LINQ mandate request to Tokko Shopper and never choose a card on the user's behalf.",
   inputSchema: {
     type: "object",
     properties: {
       amount: {
         type: "string",
         description:
-          "Optional per-charge mandate cap as a positive decimal amount. If omitted, the LINQ hosted setup page asks for it.",
+          "Optional per-charge mandate cap as a positive decimal amount. If omitted in LINQ, ask the user for it in chat before continuing.",
       },
       frequency: {
         type: "string",
@@ -1349,6 +1349,36 @@ function linqMandateDraft(input = {}) {
   return {
     ...normalized,
     amount: rawAmount ? normalized.amount : null,
+  };
+}
+
+function linqMandateAmountFromText(text) {
+  const value = String(text || "").trim();
+  if (!value) return null;
+  const match = value.match(
+    /(?:₹|inr\s*|rs\.?\s*)?((?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?)(?:\s*(?:inr|rs\.?|rupees?|bucks?))?/i
+  );
+  if (!match) return null;
+  const amount = match[1].replace(/,/g, "");
+  try {
+    return telegramMandateIntent({ amount }).amount;
+  } catch {
+    return null;
+  }
+}
+
+function linqStandaloneMandateRequest(text) {
+  const value = String(text || "").trim();
+  if (!/\bmandate\b/i.test(value)) return null;
+  if (/\b(?:show|list|view|available|active|remaining|balance|status|cancel|revoke)\b/i.test(value)) {
+    return null;
+  }
+  const requested = /\b(?:create|make|start|open|prepare|new|need|want)\b/i.test(value)
+    || /\bset\s*up\b/i.test(value);
+  if (!requested) return null;
+  return {
+    requested: true,
+    amount: linqMandateAmountFromText(value),
   };
 }
 
@@ -3948,22 +3978,24 @@ async function startLinqStandaloneMandateCardEnrollment(context, mandate) {
       stage: "linq_mandate_card_enrollment",
     },
   });
+  const standaloneMandatePending = {
+    type: "standalone_mandate_card_enrollment",
+    setupId: context.setupId,
+    mandate,
+    providerPaymentMethodIdsBefore: methods
+      .map((method) => method.provider_payment_method_id)
+      .filter(Boolean),
+    tokenizationSessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+    items: [],
+  };
   await db.saveLinqHermesState(context.chatId, {
     pendingAction: null,
-    pendingChoices: {
-      type: "standalone_mandate_card_enrollment",
-      setupId: context.setupId,
-      mandate,
-      providerPaymentMethodIdsBefore: methods
-        .map((method) => method.provider_payment_method_id)
-        .filter(Boolean),
-      tokenizationSessionId: session.sessionId,
-      expiresAt: session.expiresAt,
-      items: [],
-    },
+    pendingChoices: standaloneMandatePending,
   });
   return {
     status: "CARD_SETUP_REQUIRED",
+    standaloneMandatePending,
     nextAction: {
       type: "prava_card_enrollment",
       label: "Add a new saved card securely with Prava",
@@ -4000,21 +4032,23 @@ async function startLinqStandaloneMandate(context, mandate, paymentMethodId) {
       stage: "linq_mandate_setup",
     },
   });
+  const standaloneMandatePending = {
+    type: "standalone_mandate_setup",
+    setupId: context.setupId,
+    mandate,
+    paymentMethodId: String(selected.id),
+    mandateIdsBefore: mandatesBefore.map((item) => String(item.id)),
+    sessionId: session.sessionId,
+    expiresAt: session.expiresAt,
+    items: [],
+  };
   await db.saveLinqHermesState(context.chatId, {
     pendingAction: null,
-    pendingChoices: {
-      type: "standalone_mandate_setup",
-      setupId: context.setupId,
-      mandate,
-      paymentMethodId: String(selected.id),
-      mandateIdsBefore: mandatesBefore.map((item) => String(item.id)),
-      sessionId: session.sessionId,
-      expiresAt: session.expiresAt,
-      items: [],
-    },
+    pendingChoices: standaloneMandatePending,
   });
   return {
     status: "MANDATE_APPROVAL_REQUIRED",
+    standaloneMandatePending,
     nextAction: {
       type: "prava_mandate_approval",
       label: "Continue securely with Prava",
@@ -8215,22 +8249,18 @@ async function handleLinqPravaReturn(context) {
         status: 409,
       });
     }
-    result = await completeLinqSavedCardEnrollment(
+    const enrolled = await completeLinqSavedCardEnrollment(
       context.userId,
       pendingChoices
     );
-    browserRedirectUrl = linqMandateSetupUrl({
+    result = await startLinqStandaloneMandate({
       userId: context.userId,
       chatId: context.chatId,
       setupId: context.checkoutId,
       to: context.to,
-      suggestedAmount: pendingChoices.mandate?.amount,
-      frequency: pendingChoices.mandate?.frequency,
-      merchantScope: pendingChoices.mandate?.merchantScope,
-      selectedCardId: result.savedCard?.id,
-    });
+    }, pendingChoices.mandate, enrolled.savedCard?.id);
+    browserRedirectUrl = result.nextAction?.url || null;
     message = null;
-    clearPending = true;
   } else if (context.stage === "linq_mandate_setup") {
     if (
       pendingChoices?.type !== "standalone_mandate_setup"
@@ -8914,6 +8944,17 @@ function linqUcpCheckoutResult(checkout = {}) {
 }
 
 function linqPendingChoices(result = {}) {
+  if (result.mandateAmountRequired === true) {
+    return {
+      type: "standalone_mandate_amount",
+      frequency: result.mandate?.frequency || "one_time",
+      merchantScope: result.mandate?.merchantScope || "any",
+      items: [],
+    };
+  }
+  if (result.standaloneMandatePending?.type) {
+    return result.standaloneMandatePending;
+  }
   if (Array.isArray(result.productChoices) && result.productChoices.length) {
     return {
       type: "product",
@@ -9116,6 +9157,14 @@ async function processLinqMessage(req, message, eventId) {
   const choice = linqChoiceRequest(message.text, binding?.pending_choices);
   const approvalRequest = linqApprovalRequest(userId, choice);
   const messageText = String(message.text || "").trim();
+  const pendingMandateAmount = binding?.pending_choices?.type
+    === "standalone_mandate_amount";
+  const standaloneMandateRequest = choice
+    ? null
+    : linqStandaloneMandateRequest(messageText);
+  const standaloneMandateAmount = pendingMandateAmount
+    ? linqMandateAmountFromText(messageText)
+    : standaloneMandateRequest?.amount || null;
   const affirmative = /^(?:yes|y|approve|approved|confirm|confirmed|go ahead)$/i.test(
     messageText
   );
@@ -9130,7 +9179,9 @@ async function processLinqMessage(req, message, eventId) {
   const cartRemovalTarget = ucpCartRemovalTarget(messageText);
   const addSavedCard = linqAddSavedCardRequest(messageText);
   const cartContextChoice = choice || (
-    cartRemovalTarget || addSavedCard ? { type: "cart" } : null
+    cartRemovalTarget || addSavedCard || pendingMandateAmount || standaloneMandateRequest
+      ? { type: "cart" }
+      : null
   );
   let contextSwitched = linqContextSwitchesCart(
     messageText,
@@ -9150,7 +9201,35 @@ async function processLinqMessage(req, message, eventId) {
     };
   }
   let result;
-  if (negative && binding?.pending_action?.token) {
+  if (pendingMandateAmount && negative) {
+    result = { message: "Mandate setup cancelled." };
+  } else if (
+    (pendingMandateAmount || standaloneMandateRequest)
+    && !standaloneMandateAmount
+  ) {
+    result = {
+      mandateAmountRequired: true,
+      mandate: {
+        amount: null,
+        frequency: binding?.pending_choices?.frequency || "one_time",
+        merchantScope: binding?.pending_choices?.merchantScope || "any",
+      },
+      message:
+        "What amount should this one-time Prava mandate allow? Reply with the amount in INR, for example 100.",
+    };
+  } else if (pendingMandateAmount || standaloneMandateRequest) {
+    const mandateChoices = await prepareTelegramMandateChoices(userId, {
+      amount: standaloneMandateAmount,
+      frequency: binding?.pending_choices?.frequency || "one_time",
+      merchantScope: binding?.pending_choices?.merchantScope || "any",
+    });
+    result = {
+      ...mandateChoices,
+      message: mandateChoices.cardChoices.length > 1
+        ? `Choose a saved Prava card or add a new card for the INR ${standaloneMandateAmount} mandate.`
+        : `Add a card securely with Prava for the INR ${standaloneMandateAmount} mandate.`,
+    };
+  } else if (negative && binding?.pending_action?.token) {
     const cart = await db.clearUcpCart(userId);
     result = {
       message: "Okay, I cancelled that action and cleared the unfinished cart.",
@@ -9246,6 +9325,31 @@ async function processLinqMessage(req, message, eventId) {
         }
       )
     );
+  } else if ([
+    "create_mandate_with_saved_card",
+    "create_mandate_with_new_card",
+  ].includes(approvalRequest?.toolName)) {
+    const mandate = telegramMandateIntent(approvalRequest.args);
+    const setupContext = {
+      userId,
+      chatId: message.chatId,
+      setupId: nodeCrypto.randomUUID(),
+      to: message.to,
+    };
+    const mandateSetup = approvalRequest.toolName === "create_mandate_with_saved_card"
+      ? await startLinqStandaloneMandate(
+          setupContext,
+          mandate,
+          approvalRequest.args.paymentMethodId
+        )
+      : await startLinqStandaloneMandateCardEnrollment(setupContext, mandate);
+    result = {
+      ...mandateSetup,
+      mandate,
+      message: approvalRequest.toolName === "create_mandate_with_saved_card"
+        ? `Open Prava to approve the INR ${mandate.amount} mandate with the selected saved card.`
+        : "Open Prava to add a card securely. After the card is saved, Prava will continue directly to mandate approval.",
+    };
   } else if (approvalRequest?.toolName === "create_ucp_one_time_mandate") {
     try {
       const mandateSetup = await startLinqUcpOneTimeMandate(
@@ -10949,13 +11053,14 @@ async function runHermesBackend({
       tool.name === HERMES_MANDATE_TOOL.name &&
       tool.status === "completed"
     )?.result;
-  if (mandateResult?.stage === "hosted_mandate_setup") {
-    result.cardChoices = [];
+  if (mandateResult?.stage === "choose_amount") {
+    result.mandateAmountRequired = true;
     result.mandateSetup = mandateResult.mandate;
-    result.nextAction = mandateResult.nextAction;
-    result.message = mandateResult.mandate?.amount
-      ? "Open the secure Tokko Shopper link to confirm the mandate amount and choose or add the saved card to use."
-      : "Open the secure Tokko Shopper link to enter the mandate amount and choose or add the saved card to use.";
+    result.mandate = mandateResult.mandate;
+    result.cardChoices = [];
+    result.nextAction = null;
+    result.message =
+      "What amount should this one-time Prava mandate allow? Reply with the amount in INR, for example 100.";
   }
   if (mandateResult?.stage === "choose_card") {
     result.cardChoices = mandateResult.cardChoices || [];
@@ -11078,11 +11183,15 @@ async function maybeVerifyHermesZeptoOtp(userId, messages) {
 async function executeHermesTool(req, userId, toolName, args) {
   if (toolName === HERMES_MANDATE_TOOL.name) {
     if (req?.tokkoReturnContext?.channel === "linq") {
-      return prepareLinqMandateSetupLink(
-        userId,
-        args,
-        req.tokkoReturnContext
-      );
+      const mandate = linqMandateDraft(args);
+      if (!mandate.amount) {
+        return {
+          stage: "choose_amount",
+          mandate,
+          mandateAmountRequired: true,
+        };
+      }
+      return prepareTelegramMandateChoices(userId, mandate);
     }
     return prepareTelegramMandateChoices(userId, args);
   }
@@ -12196,7 +12305,7 @@ route(
       );
       const chargedFlow = await db.getCheckoutFlow(
         Number(user.id),
-        result.checkoutFlow?.checkoutId
+        result.checkoutFlow?.id
       );
       const cartCleared = await clearUcpCartForCheckoutFlow(
         Number(user.id),
@@ -12397,7 +12506,9 @@ Object.assign(server, {
   linqCartChoices,
   linqChoiceRequest,
   linqContextSwitchesCart,
+  linqMandateAmountFromText,
   linqMandateIntentFromSelection,
+  linqStandaloneMandateRequest,
   linqMandateSetupToken,
   linqMandateSetupUrl,
   linqOnboardingToken,

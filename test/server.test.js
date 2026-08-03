@@ -2027,66 +2027,80 @@ test("LINQ Prava payment-option links are signed, expiring, and public", () => {
   );
 });
 
-test("LINQ mandate intent exposes only a signed Tokko Shopper setup page", async () => {
-  const returnContext = {
-    channel: "linq",
-    chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
-    to: "+12025551234",
-  };
-  const result = await server.executeHermesTool(
-    { tokkoReturnContext: returnContext },
-    55,
-    "prepare_payment_mandate",
-    { amount: "250", frequency: "one_time", merchantScope: "any" }
-  );
-  assert.equal(result.stage, "hosted_mandate_setup");
-  assert.equal(result.cardChoices, undefined);
-  assert.equal(result.nextAction.type, "prava_mandate_options");
-  const setupUrl = new URL(result.nextAction.url);
-  assert.equal(setupUrl.origin, "https://tokko-shopper.vercel.app");
-  assert.equal(setupUrl.pathname, "/api/payments/linq/mandate");
-  const context = server.verifyLinqMandateSetupToken(
-    setupUrl.searchParams.get("state")
-  );
-  assert.equal(context.userId, 55);
-  assert.equal(context.suggestedAmount, "250.00");
-  assert.equal(context.frequency, "one_time");
-  const page = server.renderLinqMandateSetupPage({
-    state: setupUrl.searchParams.get("state"),
-    context,
-    cards: [{ id: "9", brand: "visa", last4: "2259", isDefault: true }],
-  });
-  assert.match(page, /Confirm mandate amount/);
-  assert.match(page, /INR 250\.00/);
-  assert.match(page, /Custom amount/);
-  assert.match(page, /name="custom_amount"/);
-  assert.match(page, /visa ending 2259/);
-  assert.match(page, /Add a new saved card/);
-  assert.match(page, /api\/payments\/linq\/mandate\/continue/);
-  assert.ok(server.matchRoute("GET", "/api/payments/linq/mandate?state=x"));
-  assert.ok(server.matchRoute(
-    "GET",
-    "/api/payments/linq/mandate/continue?state=x&card=9"
-  ));
+test(
+  "LINQ mandate intent asks for a missing amount and never returns Tokko Shopper",
+  { concurrency: false },
+  async () => {
+    const originalGetMethods = db.getPaymentMethods;
+    const originalGetCustomer = db.getPaymentCustomer;
+    const returnContext = {
+      channel: "linq",
+      chatId: "8f392755-6865-4b18-880a-227f9d8b458f",
+      to: "+12025551234",
+    };
+    try {
+      db.getPaymentMethods = async () => [{
+        id: "9",
+        provider: "prava",
+        provider_payment_method_id: "card_saved_9",
+        type: "card",
+        brand: "visa",
+        last4: "2259",
+        exp_month: 12,
+        exp_year: 2030,
+        is_default: true,
+      }];
+      db.getPaymentCustomer = async () => null;
 
-  const withoutAmount = await server.executeHermesTool(
-    { tokkoReturnContext: returnContext },
-    55,
-    "prepare_payment_mandate",
-    {}
+      const result = await server.executeHermesTool(
+        { tokkoReturnContext: returnContext },
+        55,
+        "prepare_payment_mandate",
+        { amount: "250", frequency: "one_time", merchantScope: "any" }
+      );
+      assert.equal(result.stage, "choose_card");
+      assert.equal(result.mandate.amount, "250.00");
+      assert.deepEqual(
+        result.cardChoices.map((choice) => choice.type),
+        ["saved_card", "add_card"]
+      );
+      assert.equal(result.nextAction, undefined);
+      assert.doesNotMatch(JSON.stringify(result), /tokko-shopper/i);
+
+      const withoutAmount = await server.executeHermesTool(
+        { tokkoReturnContext: returnContext },
+        55,
+        "prepare_payment_mandate",
+        {}
+      );
+      assert.equal(withoutAmount.stage, "choose_amount");
+      assert.equal(withoutAmount.mandate.amount, null);
+      assert.equal(withoutAmount.mandateAmountRequired, true);
+      assert.equal(withoutAmount.nextAction, undefined);
+      assert.equal(
+        server.linqPendingChoices(withoutAmount).type,
+        "standalone_mandate_amount"
+      );
+      assert.doesNotMatch(JSON.stringify(withoutAmount), /tokko-shopper/i);
+    } finally {
+      db.getPaymentMethods = originalGetMethods;
+      db.getPaymentCustomer = originalGetCustomer;
+    }
+  }
+);
+
+test("LINQ recognizes standalone mandate wording and extracts the amount", () => {
+  assert.deepEqual(
+    server.linqStandaloneMandateRequest("create a mandate for later"),
+    { requested: true, amount: null }
   );
-  const blankContext = server.verifyLinqMandateSetupToken(
-    new URL(withoutAmount.nextAction.url).searchParams.get("state")
+  assert.deepEqual(
+    server.linqStandaloneMandateRequest("create a mandate for 100 rupee"),
+    { requested: true, amount: "100.00" }
   );
-  assert.equal(blankContext.suggestedAmount, null);
-  assert.match(
-    server.renderLinqMandateSetupPage({
-      state: "signed",
-      context: blankContext,
-      cards: [],
-    }),
-    /Mandate amount in INR/
-  );
+  assert.equal(server.linqMandateAmountFromText("₹1,250.50"), "1250.50");
+  assert.equal(server.linqMandateAmountFromText("INR 375"), "375.00");
+  assert.equal(server.linqStandaloneMandateRequest("show active mandates"), null);
 });
 
 test(
@@ -2267,24 +2281,14 @@ test(
 
       newCardSaved = true;
       const cardReturn = await server.handleLinqPravaReturn(enrollmentContext);
-      assert.equal(cardReturn.status, "CARD_SAVED");
+      assert.equal(cardReturn.status, "MANDATE_APPROVAL_REQUIRED");
       assert.equal(cardReturn.message, null);
       assert.equal(sentMessages.length, 0);
-      const resumedPage = new URL(cardReturn.browserRedirectUrl);
-      assert.equal(resumedPage.origin, "https://tokko-shopper.vercel.app");
-      const resumedContext = server.verifyLinqMandateSetupToken(
-        resumedPage.searchParams.get("state")
+      assert.equal(
+        cardReturn.browserRedirectUrl,
+        "https://checkout.sandbox.prava.space/s/sess_mandate_standalone"
       );
-      assert.equal(resumedContext.selectedCardId, "10");
-      assert.equal(resumedContext.suggestedAmount, "375.00");
-
-      await server.startLinqStandaloneMandate(
-        resumedContext,
-        server.linqMandateIntentFromSelection(resumedContext, {
-          custom_amount: "375",
-        }),
-        resumedContext.selectedCardId
-      );
+      assert.doesNotMatch(cardReturn.browserRedirectUrl, /tokko-shopper/i);
       assert.equal(mandateArgs.cardId, "card_new_10");
       assert.equal(mandateArgs.amount, "375.00");
       const mandateReturnContext = server.verifyLinqPravaReturnToken(
@@ -2780,6 +2784,159 @@ test(
       ]);
     } finally {
       Object.assign(db, originals);
+    }
+  }
+);
+
+test(
+  "Telegram mandate payment clears the matching checkout cart",
+  { concurrency: false },
+  async () => {
+    const originals = {
+      requireService: auth.requireService,
+      getTelegramHermesBinding: db.getTelegramHermesBinding,
+      saveTelegramHermesBinding: db.saveTelegramHermesBinding,
+      getUserById: db.getUserById,
+      getProfile: db.getProfile,
+      getPaymentCustomer: db.getPaymentCustomer,
+      getCheckoutFlow: db.getCheckoutFlow,
+      saveCheckoutFlow: db.saveCheckoutFlow,
+      getUcpCart: db.getUcpCart,
+      clearUcpCart: db.clearUcpCart,
+      saveTelegramHermesMessage: db.saveTelegramHermesMessage,
+      listMandates: payments.listMandates,
+      chargeMandate: payments.chargeMandate,
+    };
+    const checkoutId = "99999999-9999-4999-8999-999999999999";
+    const cartItems = [{ selectionToken: "mandate-cart-item", quantity: 1 }];
+    const flow = {
+      id: checkoutId,
+      user_id: 55,
+      platform: "ucp",
+      status: "UCP_APPROVED",
+      payment_route: "mandate_selection_required",
+      price_breakdown: {
+        checkoutId: "merchant-checkout-1",
+        merchantName: "Himalaya Wellness",
+        merchantUrl: "https://himalayawellness.in",
+        totalAmount: "100.00",
+        currency: "INR",
+      },
+      cart_snapshot: cartItems,
+    };
+    const checkoutLookups = [];
+    let cartCleared = false;
+    try {
+      auth.requireService = async () => ({ type: "service" });
+      db.getTelegramHermesBinding = async () => ({ user_id: 55 });
+      db.saveTelegramHermesBinding = async () => null;
+      db.getUserById = async () => ({ id: 55, email: "family@example.com" });
+      db.getProfile = async () => ({ primary_parent_phone: "+919876543210" });
+      db.getPaymentCustomer = async () => ({
+        provider: "prava",
+        provider_customer_id: "tokko_family_55",
+      });
+      db.getCheckoutFlow = async (_userId, id) => {
+        checkoutLookups.push(id);
+        return id === checkoutId ? flow : null;
+      };
+      db.saveCheckoutFlow = async (saved) => ({
+        ...flow,
+        status: saved.status,
+        payment_route: saved.paymentRoute,
+        prava_mandate_id: saved.pravaMandateId,
+        prava_transaction_id: saved.pravaTransactionId,
+        prava_charge_reference: saved.pravaChargeReference,
+        prava_charge_status: saved.pravaChargeStatus,
+        prava_charge_amount: saved.pravaChargeAmount,
+        price_breakdown: saved.priceBreakdown,
+        cart_snapshot: saved.cartSnapshot,
+      });
+      db.getUcpCart = async () => ({ items: cartItems });
+      db.clearUcpCart = async () => {
+        cartCleared = true;
+        return { items: [] };
+      };
+      db.saveTelegramHermesMessage = async () => null;
+      payments.listMandates = async () => [{
+        id: "mdt_active_1",
+        status: "active",
+        state: "available",
+        frequency: "one_time",
+        merchantScope: "any",
+        remaining: "100.00",
+        approvedAmount: "100.00",
+        currency: "INR",
+      }];
+      payments.chargeMandate = async () => ({
+        mandateId: "mdt_active_1",
+        transactionId: "txn_mandate_1",
+        status: "awaiting_result",
+        credentials: {
+          token: "4111111111111111",
+          dynamicCvv: "321",
+          expiryMonth: "12",
+          expiryYear: "2030",
+        },
+      });
+
+      const route = server.matchRoute(
+        "POST",
+        "/api/integrations/telegram/hermes/payment-choice"
+      );
+      const token = hermes.signApproval({
+        userId: 55,
+        toolName: "charge_ucp_mandate",
+        args: { tokkoFlowId: checkoutId, mandateId: "mdt_active_1" },
+      });
+      const response = {
+        status: null,
+        body: "",
+        writeHead(status) {
+          this.status = status;
+        },
+        end(body = "") {
+          this.body += String(body);
+        },
+      };
+      await route.handler(
+        {
+          method: "POST",
+          url: "/api/integrations/telegram/hermes/payment-choice",
+          headers: {},
+          body: {
+            telegramChatId: "777",
+            familyUserId: 55,
+            token,
+          },
+          readableEnded: true,
+        },
+        response,
+        route.params
+      );
+
+      assert.equal(response.status, 200);
+      assert.deepEqual(checkoutLookups, [checkoutId, checkoutId]);
+      assert.equal(cartCleared, true);
+      assert.equal(JSON.parse(response.body).cartCleared, true);
+    } finally {
+      Object.assign(auth, { requireService: originals.requireService });
+      Object.assign(db, {
+        getTelegramHermesBinding: originals.getTelegramHermesBinding,
+        saveTelegramHermesBinding: originals.saveTelegramHermesBinding,
+        getUserById: originals.getUserById,
+        getProfile: originals.getProfile,
+        getPaymentCustomer: originals.getPaymentCustomer,
+        getCheckoutFlow: originals.getCheckoutFlow,
+        saveCheckoutFlow: originals.saveCheckoutFlow,
+        getUcpCart: originals.getUcpCart,
+        clearUcpCart: originals.clearUcpCart,
+        saveTelegramHermesMessage: originals.saveTelegramHermesMessage,
+      });
+      Object.assign(payments, {
+        listMandates: originals.listMandates,
+        chargeMandate: originals.chargeMandate,
+      });
     }
   }
 );
